@@ -1,0 +1,32 @@
+# Binaries and build outputs
+/bin/
+/build/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Coverage and profiling
+coverage.*
+*.coverprofile
+*.cov
+*.lcov
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+*.swo
+
+# Editor/OS noise
+.vscode/
+.idea/
+.DS_Store
+
+# Environment and secrets
+.env
+.env.*

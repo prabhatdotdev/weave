@@ -1,0 +1,87 @@
+syntax = "proto3";
+
+package examples;
+
+option go_package = "github.com/prabhatdotdev/weave/examples/protobuf/proto;proto";
+
+// ============================================================================
+// Profile Service Messages
+// ============================================================================
+
+// Profile represents a user's profile information.
+message Profile {
+  string user_id = 1;
+  string bio = 2;
+  string avatar = 3;
+  string location = 4;
+  string website = 5;
+  bool verified = 6;
+}
+
+// GetProfileRequest is the request to get a profile by user ID.
+message GetProfileRequest {
+  string user_id = 1;
+}
+
+// GetProfileResponse is the response containing a profile.
+message GetProfileResponse {
+  Profile profile = 1;
+  string error = 2;
+}
+
+// ListProfilesRequest is the request to list all profiles.
+message ListProfilesRequest {}
+
+// ListProfilesResponse is the response containing all profiles.
+message ListProfilesResponse {
+  repeated Profile profiles = 1;
+}
+
+// ============================================================================
+// User Service Messages
+// ============================================================================
+
+// User represents a user in the system.
+message User {
+  string id = 1;
+  string name = 2;
+  string email = 3;
+}
+
+// EnrichedUser combines user data with profile data.
+message EnrichedUser {
+  string id = 1;
+  string name = 2;
+  string email = 3;
+  Profile profile = 4;
+}
+
+// GetUserRequest is the request to get a user by ID.
+message GetUserRequest {
+  string id = 1;
+}
+
+// GetUserResponse is the response containing a user.
+message GetUserResponse {
+  EnrichedUser user = 1;
+  string error = 2;
+}
+
+// ListUsersRequest is the request to list all users.
+message ListUsersRequest {}
+
+// ListUsersResponse is the response containing all users.
+message ListUsersResponse {
+  repeated EnrichedUser users = 1;
+}
+
+// ============================================================================
+// Event Messages (Fire-and-Forget)
+// ============================================================================
+
+// UserEvent represents an event related to user activity.
+message UserEvent {
+  string event_type = 1;
+  string user_id = 2;
+  int64 timestamp = 3;
+}
