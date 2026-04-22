@@ -1,16 +1,25 @@
 # Quick Start Guide
 
-Get up and running with Weave in 5 minutes!
+Get up and running with Weave using the current public API.
 
 ## Prerequisites
 
 - Go 1.21 or higher
-- Docker (for running RabbitMQ or Kafka)
+- Docker or Docker Compose to run RabbitMQ locally
 
 ## Installation
 
 ```bash
 go get github.com/prabhatdotdev/weave
+```
+
+Import Weave and at least one transport package:
+
+```go
+import (
+    "github.com/prabhatdotdev/weave"
+    _ "github.com/prabhatdotdev/weave/transport/amqp"
+)
 ```
 
 ## Start RabbitMQ
@@ -19,7 +28,7 @@ go get github.com/prabhatdotdev/weave
 docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3.12-management
 ```
 
-Or using Docker Compose (from repository):
+Or from the repository root:
 
 ```bash
 docker-compose up -d
@@ -39,37 +48,30 @@ import (
     "fmt"
     "log"
     "strings"
-    
-    mqservice "github.com/prabhatdotdev/weave"
+
+    "github.com/prabhatdotdev/weave"
     _ "github.com/prabhatdotdev/weave/transport/amqp"
 )
 
 func main() {
-    // Create configuration
-    config := mqservice.DefaultConfig()
-    
-    // Create broker
-    broker, err := mqservice.New("amqp", config)
+    server, err := weave.NewServer(weave.DefaultConfig())
     if err != nil {
         log.Fatal(err)
     }
-    defer broker.Close()
-    
-    // Connect
-    ctx := context.Background()
-    if err := broker.Connect(ctx); err != nil {
+
+    server.Handle("demo-queue", func(ctx context.Context, msg *weave.Message) error {
+        fmt.Printf("Received: %s\n", string(msg.Body))
+        msg.Body = []byte(strings.ToUpper(string(msg.Body)))
+        return nil
+    })
+
+    if err := server.Start(context.Background()); err != nil {
         log.Fatal(err)
     }
+    defer server.Stop()
 
-    // Define handler
-    handler := func(ctx context.Context, body []byte) ([]byte, error) {
-        fmt.Printf("Received: %s\n", string(body))
-        return []byte(strings.ToUpper(string(body))), nil
-    }
-
-    // Start listening
-    fmt.Println("Server listening on 'demo-queue'...")
-    log.Fatal(broker.Subscribe(ctx, "demo-queue", handler))
+    fmt.Println("Server listening on demo-queue...")
+    select {}
 }
 ```
 
@@ -91,29 +93,25 @@ import (
     "fmt"
     "log"
     "time"
-    
-    mqservice "github.com/prabhatdotdev/weave"
+
+    "github.com/prabhatdotdev/weave"
     _ "github.com/prabhatdotdev/weave/transport/amqp"
 )
 
 func main() {
-    // Create client broker
-    config := mqservice.DefaultConfig()
-    client, err := mqservice.New("amqp", config)
+    client, err := weave.NewClient(weave.DefaultConfig())
     if err != nil {
         log.Fatal(err)
     }
     defer client.Close()
-    
-    // Connect
+
     ctx := context.Background()
     if err := client.Connect(ctx); err != nil {
         log.Fatal(err)
     }
 
-    // Make request
-    msg := mqservice.NewMessage([]byte("hello world"))
-    response, err := client.Call(ctx, "demo-queue", msg, 5*time.Second)
+    msg := weave.NewMessage([]byte("hello world"))
+    response, err := client.Call(ctx, "demo-queue", msg, weave.WithTimeout(5*time.Second))
     if err != nil {
         log.Fatal(err)
     }
@@ -129,40 +127,35 @@ go run client.go
 ```
 
 You should see:
+
 - Server: `Received: hello world`
 - Client: `Response: HELLO WORLD`
 
 ## Switching to Kafka
 
-Want to use Kafka instead? Just change the config:
+To switch to Kafka, change the config and import the Kafka transport:
 
 ```go
 import (
-    mqservice "github.com/prabhatdotdev/weave"
+    "github.com/prabhatdotdev/weave"
     _ "github.com/prabhatdotdev/weave/transport/kafka"
 )
 
-config := &mqservice.Config{
-    Backend: "kafka",
-    Kafka: &mqservice.KafkaConfig{
-        Brokers:       []string{"localhost:9092"},
-        ConsumerGroup: "my-service",
-    },
-}
+config := weave.DefaultConfig().WithKafka(&weave.KafkaConfig{
+    Brokers:       []string{"localhost:9092"},
+    ConsumerGroup: "my-service",
+})
 
-broker, err := mqservice.New("kafka", config)
-// ... rest of the code stays the same!
+client, err := weave.NewClient(config)
 ```
 
-Your application code doesn't change - that's the power of unified abstraction!
+The application-facing `Client` and `Server` APIs stay the same.
 
 ## Next Steps
 
 ### Working with JSON
 
 ```go
-import "encoding/json"
-
 type Request struct {
     Name string `json:"name"`
 }
@@ -171,161 +164,91 @@ type Response struct {
     Greeting string `json:"greeting"`
 }
 
-handler := func(ctx context.Context, body []byte) ([]byte, error) {
+server.Handle("greeter", func(ctx context.Context, msg *weave.Message) error {
     var req Request
-    json.Unmarshal(body, &req)
-    
-    resp := Response{
-        Greeting: fmt.Sprintf("Hello, %s!", req.Name),
+    if err := json.Unmarshal(msg.Body, &req); err != nil {
+        return err
     }
-    
-    return json.Marshal(resp)
-}
+
+    body, err := json.Marshal(Response{Greeting: fmt.Sprintf("Hello, %s!", req.Name)})
+    if err != nil {
+        return err
+    }
+
+    msg.Body = body
+    return nil
+})
 ```
 
 ### Adding Timeout
 
 ```go
-// 1 second timeout
-ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-defer cancel()
-
-response, err := client.Call(ctx, "queue", request)
-if errors.Is(err, mqservice.ErrTimeout) {
-    fmt.Println("Request timed out!")
+response, err := client.Call(ctx, "greeter", request, weave.WithTimeout(1*time.Second))
+if err != nil && weave.IsTimeout(err) {
+    fmt.Println("Request timed out")
 }
 ```
 
 ### Error Handling
 
 ```go
-handler := func(ctx context.Context, body []byte) ([]byte, error) {
-    if len(body) == 0 {
-        return nil, fmt.Errorf("empty request")
-    }
-    
-    // Process...
-    return response, nil
-}
-
-// Client side
-response, err := client.Call(ctx, "queue", request)
+response, err := client.Call(ctx, "greeter", request, weave.WithTimeout(5*time.Second))
 if err != nil {
     switch {
-    case errors.Is(err, mqservice.ErrTimeout):
+    case weave.IsTimeout(err):
         log.Println("Timeout")
-    case errors.Is(err, mqservice.ErrConnectionLost):
+    case weave.IsConnectionLost(err):
         log.Println("Connection lost")
+    case weave.IsNotConnected(err):
+        log.Println("Broker is not connected")
     default:
-        log.Printf("Error: %v", err)
+        log.Printf("Call failed: %v", err)
     }
+    return
 }
+
+fmt.Printf("Response: %s\n", string(response.Body))
 ```
 
 ## Examples
 
-Check out the examples directory for more:
+Runnable examples live in the repository:
 
-- **Simple** - Basic request-response
-- **Microservices** - Multiple services with JSON
-- **Middleware** - Logging, metrics, retry logic
-- **Circuit Breaker** - Resilient service calls
+- `examples/json/`
+- `examples/protobuf/`
 
-```bash
-# Run simple example
-make run-simple
+## Production Notes
 
-# Run microservices example
-make run-microservices
-```
-
-## Common Patterns
-
-### Multiple Services
-
-```go
-// Start multiple services
-go service1.ListenAndServe("users", userHandler)
-go service2.ListenAndServe("orders", orderHandler)
-go service3.ListenAndServe("payments", paymentHandler)
-```
-
-### Concurrent Requests
-
-```go
-var wg sync.WaitGroup
-for i := 0; i < 10; i++ {
-    wg.Add(1)
-    go func() {
-        defer wg.Done()
-        ctx := context.WithTimeout(context.Background(), 5*time.Second)
-        client.Call(ctx, "queue", request)
-    }()
-}
-wg.Wait()
-```
-
-### Production Configuration
-
-```go
-config := &mqservice.Config{
-    Host:            "rabbitmq.prod.example.com",
-    Port:            5672,
-    Username:        os.Getenv("RABBITMQ_USER"),
-    Password:        os.Getenv("RABBITMQ_PASS"),
-    VHost:           "/prod",
-    ConnectionName:  "my-service-v1",
-    Heartbeat:       10 * time.Second,
-    ConnectionRetry: 5,
-    RetryDelay:      3 * time.Second,
-}
-```
+- Set `ConnectionRetry` and `RetryDelay` in `Config` to control reconnect behavior.
+- Use transport-specific config for broker details such as AMQP credentials or Kafka consumer groups.
+- Keep request timeouts explicit for RPC-style calls.
+- Treat `ErrConnectionLost` and `ErrTimeout` as explicit application decisions; Weave does not automatically replay in-flight RPCs after reconnect.
+- Design handlers and RPC endpoints to be idempotent so reconnect-triggered redelivery is safe.
 
 ## Troubleshooting
 
 ### RabbitMQ Connection Failed
 
 ```bash
-# Check if RabbitMQ is running
 docker ps | grep rabbitmq
-
-# Check logs
 docker logs rabbitmq
-
-# Restart RabbitMQ
 docker restart rabbitmq
 ```
 
 ### Timeout Issues
 
-- Increase timeout: `context.WithTimeout(ctx, 30*time.Second)`
-- Check server processing time
-- Verify network connectivity
+- Increase the per-call timeout with `weave.WithTimeout`.
+- Check handler processing time and broker health.
 
 ### Connection Lost
 
-- Check RabbitMQ health: `http://localhost:15672` (guest/guest)
-- Verify heartbeat settings
-- Check network stability
+- Check RabbitMQ health at `http://localhost:15672`.
+- Verify broker credentials and network reachability.
 
-## Help & Resources
+## Help And Resources
 
-- Full documentation: [README.md](README.md)
-- Examples: [examples/](examples/)
-- Issues: [GitHub Issues](https://github.com/prabhatdotdev/weave/issues)
-- RabbitMQ Management UI: http://localhost:15672 (guest/guest)
+- Full documentation index: [README.md](README.md)
+- API docs: https://pkg.go.dev/github.com/prabhatdotdev/weave
+- Issues: https://github.com/prabhatdotdev/weave/issues
 
-## Testing
-
-```bash
-# Run tests
-make test
-
-# With coverage
-make test-coverage
-
-# Benchmarks
-make bench
-```
-
-That's it! You're ready to build message-driven microservices with Go! 🚀
+You're ready to build message-driven services with Weave.

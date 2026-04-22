@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/IBM/sarama"
 	"github.com/google/uuid"
@@ -27,6 +28,14 @@ import (
 )
 
 const backendName = "kafka"
+
+type subscriptionRegistration struct {
+	id          uint64
+	ctx         context.Context
+	destination string
+	handler     core.Handler
+	opts        []core.SubscribeOption
+}
 
 func init() {
 	core.Register(backendName, NewBroker)
@@ -37,18 +46,56 @@ type Broker struct {
 	config      *core.Config
 	kafkaConfig *core.KafkaConfig
 
-	producer sarama.SyncProducer
-	consumer sarama.ConsumerGroup
+	producer         sarama.SyncProducer
+	consumer         sarama.ConsumerGroup
+	newSyncProducer  func([]string, *sarama.Config) (sarama.SyncProducer, error)
+	newConsumerGroup func([]string, string, *sarama.Config) (sarama.ConsumerGroup, error)
 
 	replyTopic string
 	pending    map[string]chan *core.Message
 	pendingMu  sync.RWMutex
+	subs       []subscriptionRegistration
+	subsMu     sync.RWMutex
+	nextSubID  uint64
+	runnersMu  sync.Mutex
+	runners    map[uint64]struct{}
+	watchMu    sync.Mutex
+	watching   map[sarama.ConsumerGroup]struct{}
 
-	connected bool
-	closed    bool
-	closeMu   sync.RWMutex
-	closeOnce sync.Once
-	closeChan chan struct{}
+	connected     bool
+	everConnected bool
+	recovering    bool
+	closed        bool
+	closeMu       sync.RWMutex
+	closeOnce     sync.Once
+	closeChan     chan struct{}
+}
+
+func (b *Broker) emitEvent(ctx context.Context, event core.Event) {
+	if b.config == nil {
+		return
+	}
+	if event.Backend == "" {
+		event.Backend = backendName
+	}
+	if event.Component == "" {
+		event.Component = "transport"
+	}
+	b.config.EmitEvent(ctx, event)
+}
+
+func (b *Broker) emitCounter(name string, labels map[string]string) {
+	if b.config == nil {
+		return
+	}
+	b.config.EmitCounter(name, 1, labels)
+}
+
+func (b *Broker) emitDuration(name string, value time.Duration, labels map[string]string) {
+	if b.config == nil {
+		return
+	}
+	b.config.EmitDuration(name, value, labels)
 }
 
 // NewBroker creates a new Kafka broker instance.
@@ -58,10 +105,14 @@ func NewBroker(config *core.Config) (core.MessageBroker, error) {
 	}
 
 	return &Broker{
-		config:      config,
-		kafkaConfig: config.Kafka,
-		pending:     make(map[string]chan *core.Message),
-		closeChan:   make(chan struct{}),
+		config:           config,
+		kafkaConfig:      config.Kafka,
+		newSyncProducer:  sarama.NewSyncProducer,
+		newConsumerGroup: sarama.NewConsumerGroup,
+		pending:          make(map[string]chan *core.Message),
+		runners:          make(map[uint64]struct{}),
+		watching:         make(map[sarama.ConsumerGroup]struct{}),
+		closeChan:        make(chan struct{}),
 	}, nil
 }
 
@@ -72,6 +123,8 @@ func (b *Broker) Backend() string {
 
 // Connect establishes a connection to the Kafka cluster.
 func (b *Broker) Connect(ctx context.Context) error {
+	_ = ctx
+
 	b.closeMu.Lock()
 	defer b.closeMu.Unlock()
 
@@ -82,6 +135,89 @@ func (b *Broker) Connect(ctx context.Context) error {
 		return nil
 	}
 
+	return b.connectLocked()
+}
+
+func (b *Broker) connectLocked() error {
+	start := time.Now()
+	saramaConfig := b.buildSaramaConfig()
+	retries := b.config.ConnectionRetry
+	if retries <= 0 {
+		retries = 3
+	}
+
+	var lastErr error
+	for i := 0; i <= retries; i++ {
+		producer, err := b.newSyncProducer(b.kafkaConfig.Brokers, saramaConfig)
+		if err != nil {
+			lastErr = err
+		} else {
+			var consumer sarama.ConsumerGroup
+			consumerGroup := b.kafkaConfig.ConsumerGroup
+			if consumerGroup != "" {
+				consumer, err = b.newConsumerGroup(b.kafkaConfig.Brokers, consumerGroup, saramaConfig)
+				if err != nil {
+					_ = producer.Close()
+					lastErr = err
+				} else {
+					lastErr = nil
+				}
+			} else {
+				lastErr = nil
+			}
+
+			if lastErr == nil {
+				if b.producer != nil {
+					_ = b.producer.Close()
+				}
+				if b.consumer != nil {
+					_ = b.consumer.Close()
+				}
+
+				b.producer = producer
+				b.consumer = consumer
+				b.connected = true
+				b.everConnected = true
+				b.recovering = false
+				b.emitEvent(context.Background(), core.Event{
+					Level:     core.EventLevelInfo,
+					Name:      core.EventConnect,
+					Operation: "connect",
+					Fields:    map[string]any{"outcome": "success"},
+				})
+				b.emitCounter("weave.transport.connect.success", map[string]string{"backend": backendName})
+				b.emitDuration("weave.transport.connect.duration", time.Since(start), map[string]string{"backend": backendName, "outcome": "success"})
+				return nil
+			}
+		}
+
+		if i < retries {
+			delay := b.config.RetryDelay
+			if delay == 0 {
+				delay = 2 * time.Second
+			}
+			time.Sleep(delay)
+		}
+	}
+
+	b.emitEvent(context.Background(), core.Event{
+		Level:     core.EventLevelError,
+		Name:      core.EventConnect,
+		Operation: "connect",
+		Err:       lastErr,
+		Fields:    map[string]any{"outcome": "failure"},
+	})
+	b.emitCounter("weave.transport.connect.failures", map[string]string{"backend": backendName})
+	b.emitDuration("weave.transport.connect.duration", time.Since(start), map[string]string{"backend": backendName, "outcome": "failure"})
+
+	return &core.ErrConnectionFailed{
+		Backend: backendName,
+		Address: fmt.Sprintf("%v", b.kafkaConfig.Brokers),
+		Cause:   lastErr,
+	}
+}
+
+func (b *Broker) buildSaramaConfig() *sarama.Config {
 	saramaConfig := sarama.NewConfig()
 	saramaConfig.Producer.Return.Successes = true
 	saramaConfig.Producer.RequiredAcks = sarama.RequiredAcks(b.kafkaConfig.RequiredAcks)
@@ -111,38 +247,21 @@ func (b *Broker) Connect(ctx context.Context) error {
 		}
 	}
 
-	producer, err := sarama.NewSyncProducer(b.kafkaConfig.Brokers, saramaConfig)
-	if err != nil {
-		return &core.ErrConnectionFailed{
-			Backend: backendName,
-			Address: fmt.Sprintf("%v", b.kafkaConfig.Brokers),
-			Cause:   err,
-		}
-	}
-	b.producer = producer
-
-	if b.kafkaConfig.ConsumerGroup != "" {
-		consumer, err := sarama.NewConsumerGroup(b.kafkaConfig.Brokers, b.kafkaConfig.ConsumerGroup, saramaConfig)
-		if err != nil {
-			producer.Close()
-			return &core.ErrConnectionFailed{
-				Backend: backendName,
-				Address: fmt.Sprintf("%v", b.kafkaConfig.Brokers),
-				Cause:   err,
-			}
-		}
-		b.consumer = consumer
-	}
-
-	b.connected = true
-	return nil
+	return saramaConfig
 }
 
 // IsConnected returns true if the broker is connected.
 func (b *Broker) IsConnected() bool {
 	b.closeMu.RLock()
 	defer b.closeMu.RUnlock()
-	return b.connected && !b.closed
+	return b.connected && !b.recovering && !b.closed
+}
+
+// IsRecovering returns true if the broker is actively recovering from a connection loss.
+func (b *Broker) IsRecovering() bool {
+	b.closeMu.RLock()
+	defer b.closeMu.RUnlock()
+	return b.recovering
 }
 
 // Close gracefully shuts down the Kafka connections.
@@ -152,6 +271,7 @@ func (b *Broker) Close() error {
 		b.closeMu.Lock()
 		b.closed = true
 		b.connected = false
+		b.recovering = false
 		b.closeMu.Unlock()
 
 		close(b.closeChan)
@@ -161,12 +281,22 @@ func (b *Broker) Close() error {
 			if err := b.producer.Close(); err != nil {
 				errs = append(errs, err)
 			}
+			b.producer = nil
 		}
 		if b.consumer != nil {
 			if err := b.consumer.Close(); err != nil {
 				errs = append(errs, err)
 			}
+			b.consumer = nil
 		}
+
+		b.emitEvent(context.Background(), core.Event{
+			Level:     core.EventLevelInfo,
+			Name:      core.EventDisconnect,
+			Operation: "close",
+			Fields:    map[string]any{"outcome": "success", "reason": "close"},
+		})
+		b.emitCounter("weave.transport.disconnect.events", map[string]string{"backend": backendName, "reason": "close"})
 	})
 
 	if len(errs) > 0 {
@@ -177,8 +307,8 @@ func (b *Broker) Close() error {
 
 // Publish sends a message to the specified Kafka topic.
 func (b *Broker) Publish(ctx context.Context, destination string, msg *core.Message, opts ...core.PublishOption) error {
-	if !b.IsConnected() {
-		return &core.ErrNotConnected{Backend: backendName}
+	if err := b.ensureConnected(); err != nil {
+		return err
 	}
 
 	options := core.ApplyPublishOptions(opts...)
@@ -221,8 +351,22 @@ func (b *Broker) Publish(ctx context.Context, destination string, msg *core.Mess
 		})
 	}
 
-	_, _, err := b.producer.SendMessage(kafkaMsg)
+	producer := b.currentProducer()
+	if producer == nil {
+		return &core.ErrNotConnected{Backend: backendName}
+	}
+
+	_, _, err := producer.SendMessage(kafkaMsg)
 	if err != nil {
+		b.emitEvent(ctx, core.Event{
+			Level:       core.EventLevelError,
+			Name:        core.EventPublishFailed,
+			Operation:   "publish",
+			Destination: destination,
+			Err:         err,
+		})
+		b.emitCounter("weave.transport.publish.failures", map[string]string{"backend": backendName, "destination": destination})
+		b.handleProducerLoss(producer, err)
 		return &core.ErrPublishFailed{Backend: backendName, Destination: destination, Cause: err}
 	}
 
@@ -231,8 +375,40 @@ func (b *Broker) Publish(ctx context.Context, destination string, msg *core.Mess
 
 // Subscribe registers a handler for messages from the specified Kafka topic.
 func (b *Broker) Subscribe(ctx context.Context, destination string, handler core.Handler, opts ...core.SubscribeOption) error {
-	if !b.IsConnected() {
-		return &core.ErrNotConnected{Backend: backendName}
+	if err := b.subscribe(ctx, destination, handler, true, opts...); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (b *Broker) subscribe(ctx context.Context, destination string, handler core.Handler, track bool, opts ...core.SubscribeOption) error {
+	if err := b.ensureConnected(); err != nil {
+		return err
+	}
+
+	var reg subscriptionRegistration
+	if track {
+		reg = b.registerSubscription(ctx, destination, handler, opts)
+	}
+
+	if err := b.startSubscriptionConsumer(ctx, destination, handler, opts, reg.id); err != nil {
+		if track {
+			b.unregisterSubscription(reg.id)
+		}
+		return err
+	}
+
+	return nil
+}
+
+func (b *Broker) startSubscriptionConsumer(ctx context.Context, destination string, handler core.Handler, opts []core.SubscribeOption, subID uint64) error {
+	if err := b.ensureConnected(); err != nil {
+		return err
+	}
+
+	if subID != 0 && !b.startRunner(subID) {
+		return nil
 	}
 
 	options := core.ApplySubscribeOptions(opts...)
@@ -242,11 +418,20 @@ func (b *Broker) Subscribe(ctx context.Context, destination string, handler core
 		consumerGroup = b.kafkaConfig.ConsumerGroup
 	}
 
-	if b.consumer == nil && consumerGroup == "" {
+	if b.currentConsumer() == nil && consumerGroup == "" {
+		err := fmt.Errorf("consumer group not configured")
+		b.emitEvent(ctx, core.Event{
+			Level:       core.EventLevelError,
+			Name:        core.EventSubscribeFailed,
+			Operation:   "subscribe",
+			Destination: destination,
+			Err:         err,
+		})
+		b.emitCounter("weave.transport.subscribe.failures", map[string]string{"backend": backendName, "destination": destination, "stage": "config"})
 		return &core.ErrSubscribeFailed{
 			Backend:     backendName,
 			Destination: destination,
-			Cause:       fmt.Errorf("consumer group not configured"),
+			Cause:       err,
 		}
 	}
 
@@ -255,9 +440,12 @@ func (b *Broker) Subscribe(ctx context.Context, destination string, handler core
 		closeChan: b.closeChan,
 		pending:   b.pending,
 		pendingMu: &b.pendingMu,
+		config:    b.config,
+		policy:    options.HandlerErrorPolicy,
 	}
 
 	go func() {
+		defer b.stopRunner(subID)
 		for {
 			select {
 			case <-b.closeChan:
@@ -265,8 +453,43 @@ func (b *Broker) Subscribe(ctx context.Context, destination string, handler core
 			case <-ctx.Done():
 				return
 			default:
-				if err := b.consumer.Consume(ctx, []string{destination}, cgHandler); err != nil {
-					fmt.Printf("[kafka] Consumer error: %v\n", err)
+				consumer := b.currentConsumer()
+				if consumer == nil {
+					if err := b.ensureConnected(); err != nil {
+						b.emitEvent(ctx, core.Event{
+							Level:       core.EventLevelWarn,
+							Name:        core.EventConnect,
+							Operation:   "reconnect",
+							Destination: destination,
+							Err:         err,
+							Fields:      map[string]any{"outcome": "failure"},
+						})
+						b.emitCounter("weave.transport.connect.failures", map[string]string{"backend": backendName, "stage": "reconnect"})
+						time.Sleep(200 * time.Millisecond)
+						continue
+					}
+					consumer = b.currentConsumer()
+					if consumer == nil {
+						time.Sleep(200 * time.Millisecond)
+						continue
+					}
+				}
+
+				b.watchConsumerErrors(ctx, destination, consumer)
+
+				if err := consumer.Consume(ctx, []string{destination}, cgHandler); err != nil {
+					b.emitEvent(ctx, core.Event{
+						Level:       core.EventLevelError,
+						Name:        core.EventSubscribeFailed,
+						Operation:   "consume",
+						Destination: destination,
+						Err:         err,
+					})
+					b.emitCounter("weave.transport.subscribe.failures", map[string]string{"backend": backendName, "destination": destination, "stage": "consume"})
+					if ctx.Err() != nil || b.isClosed() {
+						return
+					}
+					b.handleConsumerLoss(consumer, err)
 				}
 			}
 		}
@@ -277,13 +500,13 @@ func (b *Broker) Subscribe(ctx context.Context, destination string, handler core
 
 // Call implements request-response pattern using correlation IDs and reply topics.
 func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message, opts ...core.PublishOption) (*core.Message, error) {
-	if !b.IsConnected() {
-		return nil, &core.ErrNotConnected{Backend: backendName}
+	if err := b.ensureConnected(); err != nil {
+		return nil, err
 	}
 
 	options := core.ApplyPublishOptions(opts...)
 
-	if err := b.ensureReplyConsumer(ctx); err != nil {
+	if err := b.ensureReplyConsumer(); err != nil {
 		return nil, err
 	}
 
@@ -301,7 +524,6 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 		b.pendingMu.Lock()
 		delete(b.pending, corrID)
 		b.pendingMu.Unlock()
-		close(respChan)
 	}()
 
 	if options.Timeout > 0 {
@@ -309,9 +531,10 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 		ctx, cancel = context.WithTimeout(ctx, options.Timeout)
 		defer cancel()
 	}
+	callStart := time.Now()
 
 	msg.CorrelationID = corrID
-	msg.ReplyTo = b.replyTopic
+	msg.ReplyTo = b.currentReplyTopic()
 
 	if err := b.Publish(ctx, destination, msg, opts...); err != nil {
 		return nil, err
@@ -319,35 +542,341 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 
 	select {
 	case <-ctx.Done():
+		b.emitEvent(ctx, core.Event{
+			Level:       core.EventLevelWarn,
+			Name:        core.EventTimeout,
+			Operation:   "call",
+			Destination: destination,
+			Fields: map[string]any{
+				"timeout": options.Timeout.String(),
+			},
+		})
+		b.emitCounter("weave.transport.call.timeouts", map[string]string{"backend": backendName, "destination": destination})
+		b.emitDuration("weave.transport.call.duration", time.Since(callStart), map[string]string{"backend": backendName, "destination": destination, "outcome": "timeout"})
 		return nil, &core.ErrTimeout{Operation: "Call", Duration: options.Timeout.String()}
 	case response := <-respChan:
 		if response == nil {
 			return nil, &core.ErrConnectionLost{Backend: backendName}
 		}
+		b.emitDuration("weave.transport.call.duration", time.Since(callStart), map[string]string{"backend": backendName, "destination": destination, "outcome": "success"})
 		return response, nil
 	}
 }
 
-func (b *Broker) ensureReplyConsumer(ctx context.Context) error {
+func (b *Broker) ensureReplyConsumer() error {
+	b.closeMu.Lock()
 	if b.replyTopic != "" {
+		b.closeMu.Unlock()
 		return nil
 	}
 
-	b.replyTopic = fmt.Sprintf("reply-%s-%s", b.kafkaConfig.ClientID, uuid.New().String()[:8])
+	replyTopic := fmt.Sprintf("reply-%s-%s", b.kafkaConfig.ClientID, uuid.New().String()[:8])
+	b.replyTopic = replyTopic
+	b.closeMu.Unlock()
 
-	return b.Subscribe(ctx, b.replyTopic, func(ctx context.Context, msg *core.Message) error {
+	return b.subscribe(context.Background(), replyTopic, func(ctx context.Context, msg *core.Message) error {
 		return nil
-	})
+	}, false)
 }
 
 func (b *Broker) cancelAllPending() {
 	b.pendingMu.Lock()
 	defer b.pendingMu.Unlock()
 
-	for _, ch := range b.pending {
+	for key, ch := range b.pending {
 		close(ch)
+		delete(b.pending, key)
 	}
-	b.pending = make(map[string]chan *core.Message)
+}
+
+func (b *Broker) ensureConnected() error {
+	b.closeMu.Lock()
+
+	if b.closed {
+		b.closeMu.Unlock()
+		return core.ErrClosed
+	}
+
+	if b.connected {
+		b.closeMu.Unlock()
+		return nil
+	}
+
+	if !b.everConnected {
+		b.closeMu.Unlock()
+		return &core.ErrNotConnected{Backend: backendName}
+	}
+
+	// Emit reconnect started event
+	b.emitEvent(context.Background(), core.Event{
+		Level:     core.EventLevelInfo,
+		Name:      "reconnect_started",
+		Operation: "ensure_connected",
+	})
+	b.emitCounter("weave.transport.reconnect.started", map[string]string{"backend": backendName})
+
+	err := b.connectLocked()
+	b.closeMu.Unlock()
+	if err != nil {
+		b.emitEvent(context.Background(), core.Event{
+			Level:     core.EventLevelError,
+			Name:      "reconnect_failed",
+			Operation: "ensure_connected",
+			Err:       err,
+		})
+		b.emitCounter("weave.transport.reconnect.attempt_failures", map[string]string{"backend": backendName})
+		return err
+	}
+
+	b.emitEvent(context.Background(), core.Event{
+		Level:     core.EventLevelInfo,
+		Name:      "reconnect_succeeded",
+		Operation: "ensure_connected",
+	})
+	b.emitCounter("weave.transport.reconnect.succeeded", map[string]string{"backend": backendName})
+
+	b.restoreTrackedSubscriptions()
+	return nil
+}
+
+func (b *Broker) handleConnectionLoss(cause error) {
+	b.handleConnectionLossFor(nil, nil, cause)
+}
+
+func (b *Broker) handleProducerLoss(producer sarama.SyncProducer, cause error) {
+	b.handleConnectionLossFor(producer, nil, cause)
+}
+
+func (b *Broker) handleConsumerLoss(consumer sarama.ConsumerGroup, cause error) {
+	b.handleConnectionLossFor(nil, consumer, cause)
+}
+
+func (b *Broker) handleConnectionLossFor(expectedProducer sarama.SyncProducer, expectedConsumer sarama.ConsumerGroup, cause error) {
+	b.closeMu.Lock()
+	if b.closed {
+		b.closeMu.Unlock()
+		return
+	}
+	if expectedProducer != nil && b.producer != expectedProducer {
+		b.closeMu.Unlock()
+		return
+	}
+	if expectedConsumer != nil && b.consumer != expectedConsumer {
+		b.closeMu.Unlock()
+		return
+	}
+	if !b.connected && b.recovering {
+		b.closeMu.Unlock()
+		return
+	}
+	b.connected = false
+	b.recovering = true
+	b.replyTopic = ""
+	producer := b.producer
+	consumer := b.consumer
+	b.producer = nil
+	b.consumer = nil
+	b.watchMu.Lock()
+	delete(b.watching, consumer)
+	b.watchMu.Unlock()
+	b.closeMu.Unlock()
+
+	if producer != nil {
+		_ = producer.Close()
+	}
+	if consumer != nil {
+		_ = consumer.Close()
+	}
+
+	b.cancelAllPending()
+	b.emitEvent(context.Background(), core.Event{
+		Level:     core.EventLevelWarn,
+		Name:      core.EventDisconnect,
+		Operation: "connection_lost",
+		Err:       cause,
+		Fields:    map[string]any{"outcome": "failure"},
+	})
+	b.emitCounter("weave.transport.disconnect.events", map[string]string{"backend": backendName, "reason": "connection_lost"})
+}
+
+func (b *Broker) registerSubscription(ctx context.Context, destination string, handler core.Handler, opts []core.SubscribeOption) subscriptionRegistration {
+	b.subsMu.Lock()
+	defer b.subsMu.Unlock()
+	b.nextSubID++
+	reg := subscriptionRegistration{
+		id:          b.nextSubID,
+		ctx:         ctx,
+		destination: destination,
+		handler:     handler,
+		opts:        append([]core.SubscribeOption(nil), opts...),
+	}
+	b.subs = append(b.subs, reg)
+	return reg
+}
+
+func (b *Broker) unregisterSubscription(id uint64) {
+	if id == 0 {
+		return
+	}
+	b.subsMu.Lock()
+	defer b.subsMu.Unlock()
+	for i, sub := range b.subs {
+		if sub.id == id {
+			b.subs = append(b.subs[:i], b.subs[i+1:]...)
+			return
+		}
+	}
+}
+
+func (b *Broker) restoreTrackedSubscriptions() {
+	b.subsMu.RLock()
+	subscriptions := append([]subscriptionRegistration(nil), b.subs...)
+	b.subsMu.RUnlock()
+
+	if len(subscriptions) > 0 {
+		b.emitEvent(context.Background(), core.Event{
+			Level:     core.EventLevelInfo,
+			Name:      "subscription_restore_started",
+			Operation: "restore_subscriptions",
+			Fields: map[string]any{
+				"subscription_count": len(subscriptions),
+			},
+		})
+	}
+
+	for _, sub := range subscriptions {
+		if sub.ctx.Err() != nil {
+			continue
+		}
+		err := b.startSubscriptionConsumer(sub.ctx, sub.destination, sub.handler, sub.opts, sub.id)
+		if err != nil {
+			b.emitEvent(context.Background(), core.Event{
+				Level:       core.EventLevelError,
+				Name:        "subscription_restore_failed",
+				Operation:   "restore_subscriptions",
+				Destination: sub.destination,
+				Err:         err,
+			})
+			b.emitCounter("weave.transport.subscription.restore.failures", map[string]string{"backend": backendName, "destination": sub.destination})
+		} else {
+			b.emitCounter("weave.transport.subscription.restore.success", map[string]string{"backend": backendName, "destination": sub.destination})
+		}
+	}
+
+	if len(subscriptions) > 0 {
+		b.emitEvent(context.Background(), core.Event{
+			Level:     core.EventLevelInfo,
+			Name:      "subscription_restore_completed",
+			Operation: "restore_subscriptions",
+			Fields: map[string]any{
+				"subscription_count": len(subscriptions),
+			},
+		})
+	}
+}
+
+func (b *Broker) startRunner(id uint64) bool {
+	if id == 0 {
+		return true
+	}
+	b.runnersMu.Lock()
+	defer b.runnersMu.Unlock()
+	if b.runners == nil {
+		b.runners = make(map[uint64]struct{})
+	}
+	if _, exists := b.runners[id]; exists {
+		return false
+	}
+	b.runners[id] = struct{}{}
+	return true
+}
+
+func (b *Broker) stopRunner(id uint64) {
+	if id == 0 {
+		return
+	}
+	b.runnersMu.Lock()
+	defer b.runnersMu.Unlock()
+	delete(b.runners, id)
+}
+func (b *Broker) currentProducer() sarama.SyncProducer {
+	b.closeMu.RLock()
+	defer b.closeMu.RUnlock()
+	return b.producer
+}
+
+func (b *Broker) currentConsumer() sarama.ConsumerGroup {
+	b.closeMu.RLock()
+	defer b.closeMu.RUnlock()
+	return b.consumer
+}
+
+func (b *Broker) currentReplyTopic() string {
+	b.closeMu.RLock()
+	defer b.closeMu.RUnlock()
+	return b.replyTopic
+}
+
+func (b *Broker) isClosed() bool {
+	b.closeMu.RLock()
+	defer b.closeMu.RUnlock()
+	return b.closed
+}
+
+func (b *Broker) watchConsumerErrors(ctx context.Context, destination string, consumer sarama.ConsumerGroup) {
+	b.watchMu.Lock()
+	if b.watching == nil {
+		b.watching = make(map[sarama.ConsumerGroup]struct{})
+	}
+	if _, exists := b.watching[consumer]; exists {
+		b.watchMu.Unlock()
+		return
+	}
+	b.watching[consumer] = struct{}{}
+	b.watchMu.Unlock()
+
+	errCh := consumer.Errors()
+	if errCh == nil {
+		b.watchMu.Lock()
+		delete(b.watching, consumer)
+		b.watchMu.Unlock()
+		return
+	}
+
+	go func() {
+		defer func() {
+			b.watchMu.Lock()
+			delete(b.watching, consumer)
+			b.watchMu.Unlock()
+		}()
+
+		for {
+			select {
+			case <-b.closeChan:
+				return
+			case <-ctx.Done():
+				return
+			case err, ok := <-errCh:
+				if !ok {
+					return
+				}
+				if err == nil {
+					continue
+				}
+				b.emitEvent(ctx, core.Event{
+					Level:       core.EventLevelError,
+					Name:        core.EventSubscribeFailed,
+					Operation:   "consumer_errors",
+					Destination: destination,
+					Err:         err,
+				})
+				b.emitCounter("weave.transport.subscribe.failures", map[string]string{"backend": backendName, "destination": destination, "stage": "consumer_errors"})
+				if !b.isClosed() {
+					b.handleConsumerLoss(consumer, err)
+				}
+			}
+		}
+	}()
 }
 
 type consumerGroupHandler struct {
@@ -355,6 +884,24 @@ type consumerGroupHandler struct {
 	closeChan chan struct{}
 	pending   map[string]chan *core.Message
 	pendingMu *sync.RWMutex
+	config    *core.Config
+	policy    core.HandlerErrorPolicy
+}
+
+func (h *consumerGroupHandler) emitSubscribeFailure(destination string, err error) {
+	if h.config == nil {
+		return
+	}
+	h.config.EmitEvent(context.Background(), core.Event{
+		Level:       core.EventLevelError,
+		Name:        core.EventSubscribeFailed,
+		Backend:     backendName,
+		Component:   "transport",
+		Operation:   "handler",
+		Destination: destination,
+		Err:         err,
+	})
+	h.config.EmitCounter("weave.transport.subscribe.failures", 1, map[string]string{"backend": backendName, "destination": destination, "stage": "handler"})
 }
 
 func (h *consumerGroupHandler) Setup(sarama.ConsumerGroupSession) error {
@@ -414,7 +961,10 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 
 			err := h.handler(ctx, msg)
 			if err != nil {
-				fmt.Printf("[kafka] Handler error: %v\n", err)
+				h.emitSubscribeFailure(kafkaMsg.Topic, err)
+				if h.policy == core.HandlerErrorRetry {
+					continue
+				}
 			}
 
 			session.MarkMessage(kafkaMsg, "")

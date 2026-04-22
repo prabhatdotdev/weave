@@ -1,15 +1,46 @@
-# Protocol Buffers Support
+# Protocol Buffers
 
-AMQP Service Starter now supports Protocol Buffers for type-safe, efficient message serialization with multithreaded, non-blocking handlers.
+## Official Strategy
 
-## Features
+Weave treats **Protocol Buffers as a payload format**, not as a runtime abstraction.
 
-- ✅ **Type-Safe Handlers** - Strongly typed request/response handlers using Go generics
-- ✅ **Worker Pools** - Configurable worker threads for concurrent request processing
-- ✅ **Non-Blocking** - Handlers execute in separate goroutines via worker pools
-- ✅ **Protocol Buffers** - Efficient binary serialization with protobuf
-- ✅ **Method Routing** - Register multiple handlers on a single queue
-- ✅ **Error Handling** - Structured error responses with success/failure status
+This repository **intentionally does not** implement:
+- Dedicated `ProtobufService` or typed protobuf runtime
+- Typed handler registry APIs (`RegisterHandler`, etc.)
+- Typed RPC helper (`CallProtobuf`, etc.)
+- Code generation or schema-aware message dispatch
+
+This repository **does** provide:
+- A built-in `codec.Protobuf` implementation
+- `codec.MarshalMessage(...)` and `codec.UnmarshalMessage(...)`
+- Generic runtime helpers such as `Client.PublishWithCodec(...)` and `Client.CallWithCodec(...)`
+
+This design keeps Weave lightweight, transport-agnostic, and easy to extend. If you need a more specialized protobuf framework, consider combining Weave with a dedicated protobuf service library.
+
+## Supported Pattern
+
+- Encode protobuf messages with `codec.Protobuf` or `proto.Marshal`.
+- Send the bytes in `Message.Body`, or let `codec.MarshalMessage(...)` build the message for you.
+- Use `Client.PublishWithCodec(...)` / `CallWithCodec(...)` and the matching `Server` helpers when you want runtime-level convenience.
+- Unmarshal `msg.Body` or `response.Body` with `codec.UnmarshalMessage(...)` or `proto.Unmarshal`.
+
+The protobuf examples in [examples/protobuf](../examples/protobuf) follow this pattern.
+
+## Why This Design?
+
+**Keeping Weave simple and transport-agnostic:**
+
+- Weave is meant to be a thin abstraction over message brokers, not a code-generation framework.
+- Not every team uses Protocol Buffers; some prefer JSON, MessagePack, or other formats.
+- Typed runtime APIs (like `ProtobufService`) require code generation and lock users into a specific schema approach.
+- Manual serialization is explicit and doesn't hide implicit conversions or validation.
+
+**Benefits of this approach:**
+
+- You control serialization and know exactly what's on the wire.
+- Weave remains compatible with any Go struct-like type, not just protobuf.
+- You can use different message formats (protobuf, JSON, custom) in the same application.
+- Less maintenance burden on the Weave project and fewer breaking changes to adopt.
 
 ## Quick Start
 
@@ -35,29 +66,17 @@ message UserResponse {
 
 ### 2. Generate Go Code
 
-**Using buf (no protoc installation needed - recommended):**
-```bash
-make proto-gen-buf
-```
+Generate Go code from your `.proto` files with `protoc` or your preferred protobuf toolchain.
 
-**Or using Docker (zero local installation):**
-```bash
-make proto-gen-docker
-```
+Example:
 
-**Or using go generate (auto-installs plugins):**
-```bash
-make proto-gen-go
-```
-
-**Or manually with protoc (requires protoc installed):**
 ```bash
 protoc --go_out=. --go_opt=paths=source_relative proto/service.proto
 ```
 
-See the proto files in the examples directory for method definitions.
+See [examples/protobuf/proto](../examples/protobuf/proto) for working protobuf definitions used by the examples.
 
-### 3. Create a Service with Handlers
+### 3. Create a Server with Protobuf Handlers
 
 ```go
 package main
@@ -67,47 +86,50 @@ import (
     "log"
     
     mqservice "github.com/prabhatdotdev/weave"
+    pb "github.com/prabhatdotdev/weave/examples/protobuf/proto"
     _ "github.com/prabhatdotdev/weave/transport/amqp"
-    pb "github.com/prabhatdotdev/weave/proto"
+    "google.golang.org/protobuf/proto"
 )
 
 func main() {
     config := mqservice.DefaultConfig()
     
-    // Create service with 10 default worker threads
-    service, err := mqservice.NewProtobufService(config, 10)
+    server, err := mqservice.NewServer(config)
     if err != nil {
         log.Fatal(err)
     }
-    defer service.Close()
+    defer server.Stop()
     
-    // Define typed handler
-    handler := func(ctx context.Context, req *pb.UserRequest) (*pb.UserResponse, error) {
-        log.Printf("Processing user: %s", req.UserId)
-        
-        return &pb.UserResponse{
+    server.Handle("users.get", func(ctx context.Context, msg *mqservice.Message) error {
+        var req pb.UserRequest
+        if err := proto.Unmarshal(msg.Body, &req); err != nil {
+            return err
+        }
+
+        resp := &pb.UserResponse{
             UserId: req.UserId,
             Name:   "John Doe",
             Email:  "john@example.com",
             Status: "active",
-        }, nil
-    }
+        }
+
+        if msg.ReplyTo == "" {
+            return nil
+        }
+
+        body, err := proto.Marshal(resp)
+        if err != nil {
+            return err
+        }
+
+        reply := mqservice.NewMessage(body)
+        reply.ContentType = "application/x-protobuf"
+        reply.CorrelationID = msg.CorrelationID
+
+        return server.Publish(ctx, msg.ReplyTo, reply)
+    })
     
-    // Register handler with 5 worker threads
-    err = mqservice.RegisterHandler(
-        service,
-        "user.get",                                    // Method name
-        handler,                                       // Handler function
-        func() *pb.UserRequest { return &pb.UserRequest{} },   // Request factory
-        func() *pb.UserResponse { return &pb.UserResponse{} }, // Response factory
-        5,                                             // Worker threads
-    )
-    if err != nil {
-        log.Fatal(err)
-    }
-    
-    // Start listening
-    log.Fatal(service.ListenAndServeProtobuf("user-service"))
+    log.Fatal(server.Start(context.Background()))
 }
 ```
 
@@ -123,16 +145,21 @@ import (
     
     mqservice "github.com/prabhatdotdev/weave"
     _ "github.com/prabhatdotdev/weave/transport/amqp"
-    pb "github.com/prabhatdotdev/weave/proto"
+    pb "github.com/prabhatdotdev/weave/examples/protobuf/proto"
+    "google.golang.org/protobuf/proto"
 )
 
 func main() {
     config := mqservice.DefaultConfig()
-    client, err := mqservice.NewProtobufService(config, 10)
+    client, err := mqservice.NewClient(config)
     if err != nil {
         log.Fatal(err)
     }
     defer client.Close()
+
+    if err := client.Connect(context.Background()); err != nil {
+        log.Fatal(err)
+    }
     
     ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
     defer cancel()
@@ -142,216 +169,47 @@ func main() {
         Action: "get",
     }
     
-    resp, err := mqservice.CallProtobuf(
-        client,
+    body, err := proto.Marshal(req)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    response, err := client.Call(
         ctx,
-        "user-service",                              // Queue name
-        "user.get",                                  // Method name
-        req,                                         // Request
-        func() *pb.UserResponse { return &pb.UserResponse{} }, // Response factory
+        "users.get",
+        mqservice.NewMessage(body).WithContentType("application/x-protobuf"),
+        mqservice.WithTimeout(5*time.Second),
     )
     
     if err != nil {
         log.Fatal(err)
     }
     
+    var resp pb.UserResponse
+    if err := proto.Unmarshal(response.Body, &resp); err != nil {
+        log.Fatal(err)
+    }
+
     log.Printf("User: %s (%s)", resp.Name, resp.Email)
 }
 ```
 
-## Architecture
+## Reply Pattern
 
-### Request/Response Flow
+Request-reply remains the same as JSON usage:
 
-```
-Client                  AMQP Queue              Service
-  |                         |                      |
-  |-- 1. Proto Request ---->|                      |
-  |    (with method)        |                      |
-  |                         |-- 2. Dispatch ------>|
-  |                         |                      |- 3. Worker Pool
-  |                         |                      |   (5 threads)
-  |                         |                      |   - Thread 1: Processing
-  |                         |                      |   - Thread 2: Available
-  |                         |                      |   - Thread 3: Processing
-  |                         |                      |   - Thread 4: Available
-  |                         |                      |   - Thread 5: Processing
-  |                         |                      |
-  |                         |<-- 4. Proto Response-|
-  |<-- 5. Return Response --|                      |
-```
+- client uses `Call()`
+- server handler reads protobuf from `msg.Body`
+- server publishes response bytes to `msg.ReplyTo`
+- response keeps the original `CorrelationID`
 
-### Worker Pool Model
+This is the pattern used in [examples/protobuf/client](../examples/protobuf/client) and [examples/protobuf/user-service](../examples/protobuf/user-service).
 
-Each registered handler has its own worker pool:
+## Multiple Handlers
 
-- **Non-blocking**: Requests are submitted to a worker pool queue
-- **Concurrent**: Multiple workers process requests in parallel
-- **Configurable**: Set worker count per handler
-- **Isolated**: Each handler has independent worker pool
+With the current implementation, protobuf handlers are registered the same way as any other handler: one destination per `server.Handle(...)` call.
 
-### Message Structure
-
-All messages use a generic wrapper:
-
-```protobuf
-message Request {
-  string request_id = 1;     // Correlation ID
-  string method = 2;         // Handler method name
-  bytes payload = 3;         // Serialized request message
-  map<string, string> metadata = 4;
-  int64 timestamp = 5;
-}
-
-message Response {
-  string request_id = 1;     // Same as request
-  bool success = 2;          // Success/failure flag
-  bytes payload = 3;         // Serialized response or error
-  string error_message = 4;  // Error details if failed
-  map<string, string> metadata = 5;
-  int64 timestamp = 6;
-}
-```
-
-## Advanced Usage
-
-### Multiple Handlers on Same Queue
-
-```go
-// Register multiple handlers
-mqservice.RegisterHandler(service, "user.get", getUserHandler, ...)
-mqservice.RegisterHandler(service, "user.create", createUserHandler, ...)
-mqservice.RegisterHandler(service, "user.update", updateUserHandler, ...)
-
-// All handled by the same queue
-service.ListenAndServeProtobuf("user-service")
-```
-
-### Concurrent Request Processing
-
-```go
-// Make 100 concurrent requests
-for i := 0; i < 100; i++ {
-    go func(id int) {
-        req := &pb.UserRequest{UserId: fmt.Sprintf("user-%d", id)}
-        resp, err := mqservice.CallProtobuf(client, ctx, "user-service", "user.get", req, ...)
-        // Process response...
-    }(i)
-}
-```
-
-### Custom Worker Pool Sizes
-
-```go
-// Different worker counts for different handlers
-mqservice.RegisterHandler(service, "user.get", handler, ..., 10)    // 10 workers
-mqservice.RegisterHandler(service, "user.create", handler, ..., 5)  // 5 workers
-mqservice.RegisterHandler(service, "order.process", handler, ..., 20) // 20 workers
-```
-
-### Error Handling
-
-```go
-handler := func(ctx context.Context, req *pb.UserRequest) (*pb.UserResponse, error) {
-    if req.UserId == "" {
-        return nil, fmt.Errorf("user_id is required")
-    }
-    
-    // Errors are automatically wrapped in Response.error_message
-    return response, nil
-}
-
-// Client side
-resp, err := mqservice.CallProtobuf(...)
-if err != nil {
-    // Network errors, timeouts, or handler errors
-    log.Printf("Error: %v", err)
-}
-```
-
-### Workflow Orchestration
-
-```go
-// Chain multiple service calls
-userResp, _ := mqservice.CallProtobuf(client, ctx, "user-service", "user.get", userReq, ...)
-
-orderReq := &pb.OrderRequest{
-    UserId: userResp.UserId,
-    Items:  []string{"item1", "item2"},
-}
-orderResp, _ := mqservice.CallProtobuf(client, ctx, "order-service", "order.create", orderReq, ...)
-
-paymentReq := &pb.PaymentRequest{
-    OrderId: orderResp.OrderId,
-    Amount:  orderResp.TotalAmount,
-}
-paymentResp, _ := mqservice.CallProtobuf(client, ctx, "payment-service", "payment.process", paymentReq, ...)
-```
-
-## Performance Considerations
-
-### Worker Pool Sizing
-
-- **CPU-bound**: Workers = CPU cores
-- **I/O-bound**: Workers = 2-3x CPU cores
-- **Mixed workload**: Start with 10, tune based on metrics
-
-### Benchmarking
-
-```bash
-# Run protobuf example with load testing
-make run-protobuf
-
-# The example tests:
-# - 10 concurrent user requests
-# - Full workflow (user -> order -> payment)
-# - 20 concurrent mixed requests
-```
-
-### Monitoring
-
-Track these metrics per handler:
-- Active workers
-- Queue depth
-- Processing time
-- Success/failure rate
-- Worker utilization
-
-## Complete Example
-
-See [examples/protobuf/main.go](examples/protobuf/main.go) for a complete example with:
-- 3 services (User, Order, Payment)
-- Multithreaded handlers (5-8 workers each)
-- Concurrent request testing
-- Workflow orchestration
-- Performance measurement
-
-Run it:
-
-```bash
-make run-protobuf
-```
-
-## Comparison: JSON vs Protobuf
-
-| Feature | JSON | Protobuf |
-|---------|------|----------|
-| Type Safety | ❌ Runtime | ✅ Compile-time |
-| Size | Larger | Smaller (binary) |
-| Speed | Slower | Faster |
-| Schema | Implicit | Explicit (.proto) |
-| Versioning | Manual | Built-in |
-| Worker Pools | ❌ | ✅ |
-| Method Routing | Manual | Built-in |
-
-## Migration from JSON
-
-1. Define .proto files for your messages
-2. Generate Go code: `make proto-gen`
-3. Replace `NewService` with `NewProtobufService`
-4. Replace handlers with typed handlers
-5. Use `RegisterHandler` instead of `ListenAndServe`
-6. Use `CallProtobuf` instead of `Call`
+If you need method-based routing on a single destination, implement that dispatch inside your handler code. See [MULTIPLE_HANDLERS.md](MULTIPLE_HANDLERS.md).
 
 ## Troubleshooting
 
@@ -368,35 +226,24 @@ apt-get install protobuf-compiler
 go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
 ```
 
-### Handler Not Found
-
-```text
-Error: no handler registered for method: user.get
-```
+### Handler Does Not Understand Payload
 
 Make sure:
-1. Handler is registered before `ListenAndServeProtobuf`
-2. Method name matches in registration and client call
-3. Handler registration succeeded (check error)
 
-### Worker Pool Exhaustion
-
-If requests are timing out under load:
-1. Increase worker count in `RegisterHandler`
-2. Increase default workers in `NewProtobufService`
-3. Monitor queue depth and processing time
+1. Client and server use the same protobuf schema.
+2. The handler unmarshals into the correct message type.
+3. The correct destination is used in `Call()` or `Publish()`.
 
 ## Best Practices
 
-1. **One Service Per Queue**: Don't mix JSON and Protobuf on same queue
+1. **One Payload Contract Per Destination**: Keep payload format and schema consistent per destination.
 2. **Version Your Proto**: Use package versioning for compatibility
-3. **Tune Workers**: Start conservative, increase based on metrics
-4. **Use Context**: Always pass context for timeout/cancellation
-5. **Handle Errors**: Return errors from handlers, check on client
-6. **Monitor Performance**: Track latency, throughput, worker utilization
+3. **Use Context**: Always pass context for timeout and cancellation.
+4. **Handle Errors**: Return handler errors and check client-side `Call()` failures.
+5. **Set ContentType**: Use `application/x-protobuf` when it helps downstream consumers and debugging.
 
 ## Additional Resources
 
 - [Protocol Buffers Documentation](https://protobuf.dev/)
-- [Example Code](examples/protobuf/)
+- [Example Code](../examples/protobuf/)
 - [Main README](README.md)

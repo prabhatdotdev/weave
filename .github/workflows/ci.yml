@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+      - 'release/**'
+  pull_request:
+    branches:
+      - master
+      - 'release/**'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Test Vet Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run tests with race detector
+        run: make test-verbose
+
+      - name: Enforce critical package coverage
+        env:
+          COVERAGE_MIN: "75.0"
+        run: make test-coverage-check
+
+      - name: Run vet
+        run: go vet ./...
+
+      - name: Build all packages
+        run: go build ./...

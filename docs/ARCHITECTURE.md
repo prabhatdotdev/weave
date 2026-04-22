@@ -44,13 +44,12 @@ This design allows applications to:
 │  Transport Layer (transport/)                        │
 │  • AMQP implementation                              │
 │  • Kafka implementation                             │
-│  • Future: NATS, Redis, Kinesis, etc.              │
 └─────────────────────────────────────────────────────┘
                        │
                        ▼
 ┌─────────────────────────────────────────────────────┐
 │  Message Queue (External)                            │
-│  RabbitMQ / Kafka / NATS / etc.                     │
+│  RabbitMQ / Kafka                                   │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -277,7 +276,7 @@ weave/
 │       └── kafka.go          # Kafka implementation
 │
 ├── codec/                      # Message encoding/decoding
-│   └── codec.go              # JSON codec
+│   └── codec.go              # JSON + protobuf codecs
 │
 └── testkit/                    # Testing utilities
     └── mock.go               # Mock broker for tests
@@ -432,11 +431,8 @@ type Config struct {
     RetryDelay      time.Duration // Delay between retries
     
     // Backend-specific configs (only relevant one is used)
-    AMQP     *AMQPConfig
-    Kafka    *KafkaConfig
-    Kinesis  *KinesisConfig
-    NATS     *NATSConfig
-    Redis    *RedisConfig
+    AMQP  *AMQPConfig
+    Kafka *KafkaConfig
 }
 ```
 
@@ -1074,27 +1070,23 @@ func (m *Metrics) Publish(client *weave.Client, dest string, msg *weave.Message)
 
 ### Custom Codecs
 
-Extend `codec/` for custom serialization:
+Weave now ships built-in `codec.JSON` and `codec.Protobuf` implementations. Extend `codec/` for additional serialization formats:
 
 ```go
 package codec
 
-type ProtobufCodec struct{}
+type MessagePackCodec struct{}
 
-func (c *ProtobufCodec) Encode(v interface{}) ([]byte, error) {
-    msg, ok := v.(proto.Message)
-    if !ok {
-        return nil, errors.New("not a protobuf message")
-    }
-    return proto.Marshal(msg)
+func (c *MessagePackCodec) Encode(v interface{}) ([]byte, error) {
+    return msgpack.Marshal(v)
 }
 
-func (c *ProtobufCodec) Decode(data []byte, v interface{}) error {
-    msg, ok := v.(proto.Message)
-    if !ok {
-        return errors.New("not a protobuf message")
-    }
-    return proto.Unmarshal(data, msg)
+func (c *MessagePackCodec) Decode(data []byte, v interface{}) error {
+    return msgpack.Unmarshal(data, v)
+}
+
+func (c *MessagePackCodec) ContentType() string {
+    return "application/msgpack"
 }
 ```
 
@@ -1272,7 +1264,7 @@ func publishEncrypted(client *weave.Client, dest string, data []byte, key []byte
 ## Future Enhancements
 
 - **Circuit breaker integration** - Built-in circuit breaker support
-- **Observability hooks** - OpenTelemetry integration
+- **Observability helpers** - Additional OpenTelemetry helper package
 - **Dead letter queue support** - Automatic DLQ handling
 - **Message schema validation** - JSON Schema / Protobuf validation
 - **Streaming support** - Large message streaming
@@ -1286,4 +1278,4 @@ func publishEncrypted(client *weave.Client, dest string, data []byte, key []byte
 - [Server Tutorial](SERVER.md) - Build message handlers
 - [Client Tutorial](CLIENT.md) - Send messages and RPC
 - [Transport Configuration](TRANSPORTS.md) - Configure transports
-- [API Reference](API.md) - Complete API docs
+- [API Guide](API.md) - Public API overview and pkg.go.dev links

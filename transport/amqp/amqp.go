@@ -29,6 +29,76 @@ import (
 
 const backendName = "amqp"
 
+type amqpConnection interface {
+	Channel() (amqpChannel, error)
+	NotifyClose(chan *amqplib.Error) chan *amqplib.Error
+	Close() error
+}
+
+type amqpChannel interface {
+	PublishWithContext(context.Context, string, string, bool, bool, amqplib.Publishing) error
+	QueueDeclare(string, bool, bool, bool, bool, amqplib.Table) (amqplib.Queue, error)
+	QueueBind(string, string, string, bool, amqplib.Table) error
+	Qos(int, int, bool) error
+	Consume(string, string, bool, bool, bool, bool, amqplib.Table) (<-chan amqplib.Delivery, error)
+	Close() error
+}
+
+type amqpConnectionAdapter struct {
+	conn *amqplib.Connection
+}
+
+func (a *amqpConnectionAdapter) Channel() (amqpChannel, error) {
+	channel, err := a.conn.Channel()
+	if err != nil {
+		return nil, err
+	}
+	return &amqpChannelAdapter{channel: channel}, nil
+}
+
+func (a *amqpConnectionAdapter) NotifyClose(ch chan *amqplib.Error) chan *amqplib.Error {
+	return a.conn.NotifyClose(ch)
+}
+
+func (a *amqpConnectionAdapter) Close() error {
+	return a.conn.Close()
+}
+
+type amqpChannelAdapter struct {
+	channel *amqplib.Channel
+}
+
+func (a *amqpChannelAdapter) PublishWithContext(ctx context.Context, exchange, key string, mandatory, immediate bool, msg amqplib.Publishing) error {
+	return a.channel.PublishWithContext(ctx, exchange, key, mandatory, immediate, msg)
+}
+
+func (a *amqpChannelAdapter) QueueDeclare(name string, durable, autoDelete, exclusive, noWait bool, args amqplib.Table) (amqplib.Queue, error) {
+	return a.channel.QueueDeclare(name, durable, autoDelete, exclusive, noWait, args)
+}
+
+func (a *amqpChannelAdapter) QueueBind(name, key, exchange string, noWait bool, args amqplib.Table) error {
+	return a.channel.QueueBind(name, key, exchange, noWait, args)
+}
+
+func (a *amqpChannelAdapter) Qos(prefetchCount, prefetchSize int, global bool) error {
+	return a.channel.Qos(prefetchCount, prefetchSize, global)
+}
+
+func (a *amqpChannelAdapter) Consume(queue, consumer string, autoAck, exclusive, noLocal, noWait bool, args amqplib.Table) (<-chan amqplib.Delivery, error) {
+	return a.channel.Consume(queue, consumer, autoAck, exclusive, noLocal, noWait, args)
+}
+
+func (a *amqpChannelAdapter) Close() error {
+	return a.channel.Close()
+}
+
+type subscriptionRegistration struct {
+	ctx         context.Context
+	destination string
+	handler     core.Handler
+	opts        []core.SubscribeOption
+}
+
 func init() {
 	core.Register(backendName, NewBroker)
 }
@@ -37,18 +107,50 @@ func init() {
 type Broker struct {
 	config     *core.Config
 	amqpConfig *core.AMQPConfig
-	conn       *amqplib.Connection
-	channel    *amqplib.Channel
+	conn       amqpConnection
+	channel    amqpChannel
+	dial       func(string, amqplib.Config) (amqpConnection, error)
 
-	replyQueue string
-	pending    map[string]chan *amqplib.Delivery
-	pendingMu  sync.RWMutex
+	replyQueue        string
+	replyConsumerStop chan struct{}
+	pending           map[string]chan *amqplib.Delivery
+	pendingMu         sync.RWMutex
+	subs              []subscriptionRegistration
+	subsMu            sync.RWMutex
 
-	connected bool
-	closed    bool
-	closeMu   sync.RWMutex
-	closeOnce sync.Once
-	closeChan chan struct{}
+	connected  bool
+	recovering bool
+	closed     bool
+	closeMu    sync.RWMutex
+	closeOnce  sync.Once
+	closeChan  chan struct{}
+}
+
+func (b *Broker) emitEvent(ctx context.Context, event core.Event) {
+	if b.config == nil {
+		return
+	}
+	if event.Backend == "" {
+		event.Backend = backendName
+	}
+	if event.Component == "" {
+		event.Component = "transport"
+	}
+	b.config.EmitEvent(ctx, event)
+}
+
+func (b *Broker) emitCounter(name string, labels map[string]string) {
+	if b.config == nil {
+		return
+	}
+	b.config.EmitCounter(name, 1, labels)
+}
+
+func (b *Broker) emitDuration(name string, value time.Duration, labels map[string]string) {
+	if b.config == nil {
+		return
+	}
+	b.config.EmitDuration(name, value, labels)
 }
 
 // NewBroker creates a new AMQP broker instance.
@@ -82,8 +184,15 @@ func NewBroker(config *core.Config) (core.MessageBroker, error) {
 	return &Broker{
 		config:     config,
 		amqpConfig: config.AMQP,
-		pending:    make(map[string]chan *amqplib.Delivery),
-		closeChan:  make(chan struct{}),
+		dial: func(connString string, config amqplib.Config) (amqpConnection, error) {
+			conn, err := amqplib.DialConfig(connString, config)
+			if err != nil {
+				return nil, err
+			}
+			return &amqpConnectionAdapter{conn: conn}, nil
+		},
+		pending:   make(map[string]chan *amqplib.Delivery),
+		closeChan: make(chan struct{}),
 	}, nil
 }
 
@@ -107,13 +216,12 @@ func (b *Broker) Connect(ctx context.Context) error {
 	if err := b.connect(); err != nil {
 		return err
 	}
-
-	b.connected = true
 	return nil
 }
 
 func (b *Broker) connect() error {
-	var conn *amqplib.Connection
+	start := time.Now()
+	var conn amqpConnection
 	var err error
 
 	connString := b.connectionString()
@@ -123,7 +231,7 @@ func (b *Broker) connect() error {
 	}
 
 	for i := 0; i <= retries; i++ {
-		conn, err = amqplib.DialConfig(connString, amqplib.Config{
+		conn, err = b.dial(connString, amqplib.Config{
 			Heartbeat: b.amqpConfig.Heartbeat,
 			Properties: amqplib.Table{
 				"connection_name": b.config.ConnectionName,
@@ -141,7 +249,19 @@ func (b *Broker) connect() error {
 		}
 	}
 
-	if err != nil {
+	if err != nil || conn == nil {
+		b.emitEvent(context.Background(), core.Event{
+			Level:     core.EventLevelError,
+			Name:      core.EventConnect,
+			Operation: "connect",
+			Err:       err,
+			Fields: map[string]any{
+				"address": fmt.Sprintf("%s:%d", b.amqpConfig.Host, b.amqpConfig.Port),
+				"outcome": "failure",
+			},
+		})
+		b.emitCounter("weave.transport.connect.failures", map[string]string{"backend": backendName})
+		b.emitDuration("weave.transport.connect.duration", time.Since(start), map[string]string{"backend": backendName, "outcome": "failure"})
 		return &core.ErrConnectionFailed{
 			Backend: backendName,
 			Address: fmt.Sprintf("%s:%d", b.amqpConfig.Host, b.amqpConfig.Port),
@@ -151,14 +271,33 @@ func (b *Broker) connect() error {
 
 	channel, err := conn.Channel()
 	if err != nil {
+		b.emitEvent(context.Background(), core.Event{
+			Level:     core.EventLevelError,
+			Name:      core.EventConnect,
+			Operation: "connect",
+			Err:       err,
+			Fields:    map[string]any{"outcome": "failure", "stage": "open_channel"},
+		})
+		b.emitCounter("weave.transport.connect.failures", map[string]string{"backend": backendName})
+		b.emitDuration("weave.transport.connect.duration", time.Since(start), map[string]string{"backend": backendName, "outcome": "failure"})
 		conn.Close()
 		return fmt.Errorf("failed to open channel: %w", err)
 	}
 
 	b.conn = conn
 	b.channel = channel
+	b.connected = true
+	b.replyQueue = ""
+	b.emitEvent(context.Background(), core.Event{
+		Level:     core.EventLevelInfo,
+		Name:      core.EventConnect,
+		Operation: "connect",
+		Fields:    map[string]any{"outcome": "success"},
+	})
+	b.emitCounter("weave.transport.connect.success", map[string]string{"backend": backendName})
+	b.emitDuration("weave.transport.connect.duration", time.Since(start), map[string]string{"backend": backendName, "outcome": "success"})
 
-	go b.monitorConnection()
+	go b.monitorConnection(conn)
 
 	return nil
 }
@@ -173,26 +312,215 @@ func (b *Broker) connectionString() string {
 	)
 }
 
-func (b *Broker) monitorConnection() {
+func (b *Broker) monitorConnection(conn amqpConnection) {
+	notifyClose := conn.NotifyClose(make(chan *amqplib.Error, 1))
+
 	select {
-	case connErr := <-b.conn.NotifyClose(make(chan *amqplib.Error)):
-		b.closeMu.Lock()
-		if !b.closed {
-			b.connected = false
-			fmt.Printf("[amqp] Connection lost: %v\n", connErr)
-			b.cancelAllPending()
+	case connErr, ok := <-notifyClose:
+		if !ok {
+			return
 		}
-		b.closeMu.Unlock()
+		if b.handleConnectionLoss(conn, connErr) {
+			b.emitEvent(context.Background(), core.Event{
+				Level:     core.EventLevelWarn,
+				Name:      core.EventDisconnect,
+				Operation: "connection_lost",
+				Err:       connErr,
+				Fields:    map[string]any{"outcome": "failure"},
+			})
+			b.emitCounter("weave.transport.disconnect.events", map[string]string{"backend": backendName, "reason": "connection_lost"})
+			b.reconnectLoop()
+		}
 	case <-b.closeChan:
 		return
 	}
+}
+
+func (b *Broker) handleConnectionLoss(conn amqpConnection, connErr *amqplib.Error) bool {
+	b.closeMu.Lock()
+	if b.closed || b.conn != conn {
+		b.closeMu.Unlock()
+		return false
+	}
+	b.stopReplyConsumerLocked()
+	b.connected = false
+	b.recovering = true
+	b.conn = nil
+	b.channel = nil
+	b.replyQueue = ""
+	b.closeMu.Unlock()
+
+	b.cancelAllPending()
+
+	// Emit connection loss event
+	b.emitEvent(context.Background(), core.Event{
+		Level:     core.EventLevelWarn,
+		Name:      core.EventDisconnect,
+		Operation: "handle_connection_loss",
+		Err:       connErr,
+	})
+	b.emitCounter("weave.transport.reconnect.disconnect_triggered", map[string]string{"backend": backendName})
+
+	return true
+}
+
+func (b *Broker) reconnectLoop() {
+	// Emit reconnect started event
+	b.emitEvent(context.Background(), core.Event{
+		Level:     core.EventLevelInfo,
+		Name:      "reconnect_started",
+		Operation: "reconnect_loop",
+	})
+	b.emitCounter("weave.transport.reconnect.started", map[string]string{"backend": backendName})
+
+	attempt := 0
+	for {
+		b.closeMu.RLock()
+		if b.closed || b.connected {
+			b.closeMu.RUnlock()
+			return
+		}
+		b.closeMu.RUnlock()
+
+		attempt++
+		b.closeMu.Lock()
+		if b.closed || b.connected {
+			b.closeMu.Unlock()
+			return
+		}
+
+		// Emit reconnect attempt event
+		b.emitEvent(context.Background(), core.Event{
+			Level:     core.EventLevelDebug,
+			Name:      "reconnect_attempt",
+			Operation: "connect",
+			Fields: map[string]any{
+				"attempt": attempt,
+			},
+		})
+
+		err := b.connect()
+		b.closeMu.Unlock()
+		if err == nil {
+			if restoreErr := b.restoreSubscriptions(); restoreErr != nil {
+				b.emitEvent(context.Background(), core.Event{
+					Level:       core.EventLevelError,
+					Name:        core.EventSubscribeFailed,
+					Operation:   "restore_subscriptions",
+					Destination: "*",
+					Err:         restoreErr,
+				})
+				b.emitCounter("weave.transport.subscribe.failures", map[string]string{"backend": backendName, "stage": "restore"})
+				b.closeMu.RLock()
+				conn := b.conn
+				b.closeMu.RUnlock()
+				if conn != nil {
+					b.handleConnectionLoss(conn, nil)
+				}
+				continue
+			}
+			b.closeMu.Lock()
+			b.recovering = false
+			b.closeMu.Unlock()
+
+			// Emit reconnect success event
+			b.emitEvent(context.Background(), core.Event{
+				Level:     core.EventLevelInfo,
+				Name:      "reconnect_succeeded",
+				Operation: "reconnect_loop",
+				Fields: map[string]any{
+					"attempts": attempt,
+				},
+			})
+			b.emitCounter("weave.transport.reconnect.succeeded", map[string]string{"backend": backendName})
+			return
+		}
+
+		// Emit reconnect attempt failure event
+		b.emitEvent(context.Background(), core.Event{
+			Level:     core.EventLevelWarn,
+			Name:      "reconnect_attempt_failed",
+			Operation: "connect",
+			Err:       err,
+			Fields: map[string]any{
+				"attempt": attempt,
+			},
+		})
+		b.emitCounter("weave.transport.reconnect.attempt_failures", map[string]string{"backend": backendName})
+
+		delay := b.config.RetryDelay
+		if delay == 0 {
+			delay = 2 * time.Second
+		}
+
+		select {
+		case <-time.After(delay):
+		case <-b.closeChan:
+			return
+		}
+	}
+}
+
+func (b *Broker) restoreSubscriptions() error {
+	b.subsMu.RLock()
+	subscriptions := append([]subscriptionRegistration(nil), b.subs...)
+	b.subsMu.RUnlock()
+
+	if len(subscriptions) > 0 {
+		b.emitEvent(context.Background(), core.Event{
+			Level:     core.EventLevelInfo,
+			Name:      "subscription_restore_started",
+			Operation: "restore_subscriptions",
+			Fields: map[string]any{
+				"subscription_count": len(subscriptions),
+			},
+		})
+	}
+
+	for _, sub := range subscriptions {
+		if sub.ctx.Err() != nil {
+			continue
+		}
+		if err := b.subscribe(sub.ctx, sub.destination, sub.handler, false, true, sub.opts...); err != nil {
+			b.emitEvent(context.Background(), core.Event{
+				Level:       core.EventLevelError,
+				Name:        "subscription_restore_failed",
+				Operation:   "restore_subscriptions",
+				Destination: sub.destination,
+				Err:         err,
+			})
+			b.emitCounter("weave.transport.subscription.restore.failures", map[string]string{"backend": backendName, "destination": sub.destination})
+			return err
+		}
+		b.emitCounter("weave.transport.subscription.restore.success", map[string]string{"backend": backendName, "destination": sub.destination})
+	}
+
+	if len(subscriptions) > 0 {
+		b.emitEvent(context.Background(), core.Event{
+			Level:     core.EventLevelInfo,
+			Name:      "subscription_restore_completed",
+			Operation: "restore_subscriptions",
+			Fields: map[string]any{
+				"subscription_count": len(subscriptions),
+			},
+		})
+	}
+
+	return nil
 }
 
 // IsConnected returns true if the broker is connected.
 func (b *Broker) IsConnected() bool {
 	b.closeMu.RLock()
 	defer b.closeMu.RUnlock()
-	return b.connected && !b.closed
+	return b.connected && !b.recovering && !b.closed
+}
+
+// IsRecovering returns true if the broker is actively recovering from a connection loss.
+func (b *Broker) IsRecovering() bool {
+	b.closeMu.RLock()
+	defer b.closeMu.RUnlock()
+	return b.recovering
 }
 
 // Close gracefully shuts down the broker connection.
@@ -200,8 +528,10 @@ func (b *Broker) Close() error {
 	var err error
 	b.closeOnce.Do(func() {
 		b.closeMu.Lock()
+		b.stopReplyConsumerLocked()
 		b.closed = true
 		b.connected = false
+		b.recovering = false
 		b.closeMu.Unlock()
 
 		close(b.closeChan)
@@ -217,14 +547,23 @@ func (b *Broker) Close() error {
 				err = e
 			}
 		}
+
+		b.emitEvent(context.Background(), core.Event{
+			Level:     core.EventLevelInfo,
+			Name:      core.EventDisconnect,
+			Operation: "close",
+			Fields:    map[string]any{"outcome": "success", "reason": "close"},
+		})
+		b.emitCounter("weave.transport.disconnect.events", map[string]string{"backend": backendName, "reason": "close"})
 	})
 	return err
 }
 
 // Publish sends a message to the specified queue.
 func (b *Broker) Publish(ctx context.Context, destination string, msg *core.Message, opts ...core.PublishOption) error {
-	if !b.IsConnected() {
-		return &core.ErrNotConnected{Backend: backendName}
+	channel, err := b.currentChannel(false)
+	if err != nil {
+		return err
 	}
 
 	options := core.ApplyPublishOptions(opts...)
@@ -262,8 +601,16 @@ func (b *Broker) Publish(ctx context.Context, destination string, msg *core.Mess
 		routingKey = msg.Subject
 	}
 
-	err := b.channel.PublishWithContext(ctx, exchange, routingKey, options.Mandatory, options.Immediate, publishing)
+	err = channel.PublishWithContext(ctx, exchange, routingKey, options.Mandatory, options.Immediate, publishing)
 	if err != nil {
+		b.emitEvent(ctx, core.Event{
+			Level:       core.EventLevelError,
+			Name:        core.EventPublishFailed,
+			Operation:   "publish",
+			Destination: destination,
+			Err:         err,
+		})
+		b.emitCounter("weave.transport.publish.failures", map[string]string{"backend": backendName, "destination": destination})
 		return &core.ErrPublishFailed{Backend: backendName, Destination: destination, Cause: err}
 	}
 
@@ -272,13 +619,22 @@ func (b *Broker) Publish(ctx context.Context, destination string, msg *core.Mess
 
 // Subscribe registers a handler for messages from the specified queue.
 func (b *Broker) Subscribe(ctx context.Context, destination string, handler core.Handler, opts ...core.SubscribeOption) error {
-	if !b.IsConnected() {
-		return &core.ErrNotConnected{Backend: backendName}
+	if err := b.subscribe(ctx, destination, handler, true, false, opts...); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (b *Broker) subscribe(ctx context.Context, destination string, handler core.Handler, track bool, allowRecovering bool, opts ...core.SubscribeOption) error {
+	channel, err := b.currentChannel(allowRecovering)
+	if err != nil {
+		return err
 	}
 
 	options := core.ApplySubscribeOptions(opts...)
 
-	q, err := b.channel.QueueDeclare(
+	q, err := channel.QueueDeclare(
 		destination,
 		b.amqpConfig.QueueDurable,
 		b.amqpConfig.QueueAutoDelete,
@@ -287,6 +643,14 @@ func (b *Broker) Subscribe(ctx context.Context, destination string, handler core
 		nil,
 	)
 	if err != nil {
+		b.emitEvent(ctx, core.Event{
+			Level:       core.EventLevelError,
+			Name:        core.EventSubscribeFailed,
+			Operation:   "queue_declare",
+			Destination: destination,
+			Err:         err,
+		})
+		b.emitCounter("weave.transport.subscribe.failures", map[string]string{"backend": backendName, "destination": destination, "stage": "queue_declare"})
 		return &core.ErrSubscribeFailed{Backend: backendName, Destination: destination, Cause: err}
 	}
 
@@ -295,7 +659,15 @@ func (b *Broker) Subscribe(ctx context.Context, destination string, handler core
 		if routingKey == "" {
 			routingKey = destination
 		}
-		if err := b.channel.QueueBind(q.Name, routingKey, options.Exchange, false, nil); err != nil {
+		if err := channel.QueueBind(q.Name, routingKey, options.Exchange, false, nil); err != nil {
+			b.emitEvent(ctx, core.Event{
+				Level:       core.EventLevelError,
+				Name:        core.EventSubscribeFailed,
+				Operation:   "queue_bind",
+				Destination: destination,
+				Err:         err,
+			})
+			b.emitCounter("weave.transport.subscribe.failures", map[string]string{"backend": backendName, "destination": destination, "stage": "queue_bind"})
 			return &core.ErrSubscribeFailed{Backend: backendName, Destination: destination, Cause: err}
 		}
 	}
@@ -304,13 +676,35 @@ func (b *Broker) Subscribe(ctx context.Context, destination string, handler core
 	if prefetch == 0 {
 		prefetch = 1
 	}
-	if err := b.channel.Qos(prefetch, 0, false); err != nil {
+	if err := channel.Qos(prefetch, 0, false); err != nil {
+		b.emitEvent(ctx, core.Event{
+			Level:       core.EventLevelError,
+			Name:        core.EventSubscribeFailed,
+			Operation:   "qos",
+			Destination: destination,
+			Err:         err,
+		})
+		b.emitCounter("weave.transport.subscribe.failures", map[string]string{"backend": backendName, "destination": destination, "stage": "qos"})
 		return fmt.Errorf("failed to set QoS: %w", err)
 	}
 
-	msgs, err := b.channel.Consume(q.Name, options.ConsumerTag, options.AutoAck, options.Exclusive, false, false, nil)
+	msgs, err := channel.Consume(q.Name, options.ConsumerTag, options.AutoAck, options.Exclusive, false, false, nil)
 	if err != nil {
+		b.emitEvent(ctx, core.Event{
+			Level:       core.EventLevelError,
+			Name:        core.EventSubscribeFailed,
+			Operation:   "consume",
+			Destination: destination,
+			Err:         err,
+		})
+		b.emitCounter("weave.transport.subscribe.failures", map[string]string{"backend": backendName, "destination": destination, "stage": "consume"})
 		return &core.ErrSubscribeFailed{Backend: backendName, Destination: destination, Cause: err}
+	}
+
+	if track {
+		b.subsMu.Lock()
+		b.subs = append(b.subs, subscriptionRegistration{ctx: ctx, destination: destination, handler: handler, opts: append([]core.SubscribeOption(nil), opts...)})
+		b.subsMu.Unlock()
 	}
 
 	go func() {
@@ -324,7 +718,7 @@ func (b *Broker) Subscribe(ctx context.Context, destination string, handler core
 				if !ok {
 					return
 				}
-				go b.handleMessage(ctx, msg, handler, options.AutoAck)
+				go b.handleMessage(ctx, msg, handler, options.AutoAck, options.HandlerErrorPolicy)
 			}
 		}
 	}()
@@ -332,10 +726,16 @@ func (b *Broker) Subscribe(ctx context.Context, destination string, handler core
 	return nil
 }
 
-func (b *Broker) handleMessage(ctx context.Context, msg amqplib.Delivery, handler core.Handler, autoAck bool) {
+func (b *Broker) handleMessage(ctx context.Context, msg amqplib.Delivery, handler core.Handler, autoAck bool, policy core.HandlerErrorPolicy) {
 	defer func() {
 		if r := recover(); r != nil {
-			fmt.Printf("[amqp] Panic in handler: %v\n", r)
+			b.emitEvent(ctx, core.Event{
+				Level:     core.EventLevelError,
+				Name:      core.EventSubscribeFailed,
+				Operation: "handler_panic",
+				Err:       fmt.Errorf("panic: %v", r),
+			})
+			b.emitCounter("weave.transport.subscribe.failures", map[string]string{"backend": backendName, "stage": "handler_panic"})
 			if !autoAck {
 				msg.Nack(false, false)
 			}
@@ -364,7 +764,8 @@ func (b *Broker) handleMessage(ctx context.Context, msg amqplib.Delivery, handle
 
 	if !autoAck {
 		if err != nil {
-			msg.Nack(false, true)
+			requeue := policy == core.HandlerErrorRetry
+			msg.Nack(false, requeue)
 		} else {
 			msg.Ack(false)
 		}
@@ -373,13 +774,14 @@ func (b *Broker) handleMessage(ctx context.Context, msg amqplib.Delivery, handle
 
 // Call implements the request-response pattern.
 func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message, opts ...core.PublishOption) (*core.Message, error) {
-	if !b.IsConnected() {
-		return nil, &core.ErrNotConnected{Backend: backendName}
+	channel, err := b.currentChannel(false)
+	if err != nil {
+		return nil, err
 	}
 
 	options := core.ApplyPublishOptions(opts...)
 
-	if err := b.ensureReplyQueue(); err != nil {
+	if err := b.ensureReplyQueue(channel); err != nil {
 		return nil, err
 	}
 
@@ -397,7 +799,6 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 		b.pendingMu.Lock()
 		delete(b.pending, corrID)
 		b.pendingMu.Unlock()
-		close(respChan)
 	}()
 
 	if options.Timeout > 0 {
@@ -405,31 +806,52 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 		ctx, cancel = context.WithTimeout(ctx, options.Timeout)
 		defer cancel()
 	}
+	callStart := time.Now()
 
 	exchange := options.Exchange
 	if exchange == "" {
 		exchange = b.amqpConfig.Exchange
 	}
 
-	err := b.channel.PublishWithContext(ctx, exchange, destination, false, false,
+	err = channel.PublishWithContext(ctx, exchange, destination, false, false,
 		amqplib.Publishing{
 			ContentType:   msg.ContentType,
 			CorrelationId: corrID,
-			ReplyTo:       b.replyQueue,
+			ReplyTo:       b.currentReplyQueue(),
 			Body:          msg.Body,
 		},
 	)
 	if err != nil {
+		b.emitEvent(ctx, core.Event{
+			Level:       core.EventLevelError,
+			Name:        core.EventPublishFailed,
+			Operation:   "call_publish",
+			Destination: destination,
+			Err:         err,
+		})
+		b.emitCounter("weave.transport.publish.failures", map[string]string{"backend": backendName, "destination": destination})
 		return nil, &core.ErrPublishFailed{Backend: backendName, Destination: destination, Cause: err}
 	}
 
 	select {
 	case <-ctx.Done():
+		b.emitEvent(ctx, core.Event{
+			Level:       core.EventLevelWarn,
+			Name:        core.EventTimeout,
+			Operation:   "call",
+			Destination: destination,
+			Fields: map[string]any{
+				"timeout": options.Timeout.String(),
+			},
+		})
+		b.emitCounter("weave.transport.call.timeouts", map[string]string{"backend": backendName, "destination": destination})
+		b.emitDuration("weave.transport.call.duration", time.Since(callStart), map[string]string{"backend": backendName, "destination": destination, "outcome": "timeout"})
 		return nil, &core.ErrTimeout{Operation: "Call", Duration: options.Timeout.String()}
 	case response := <-respChan:
 		if response == nil {
 			return nil, &core.ErrConnectionLost{Backend: backendName}
 		}
+		b.emitDuration("weave.transport.call.duration", time.Since(callStart), map[string]string{"backend": backendName, "destination": destination, "outcome": "success"})
 		return &core.Message{
 			Body:          response.Body,
 			CorrelationID: response.CorrelationId,
@@ -439,37 +861,58 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 	}
 }
 
-func (b *Broker) ensureReplyQueue() error {
+func (b *Broker) ensureReplyQueue(channel amqpChannel) error {
+	b.closeMu.RLock()
 	if b.replyQueue != "" {
+		b.closeMu.RUnlock()
 		return nil
 	}
+	b.closeMu.RUnlock()
 
-	q, err := b.channel.QueueDeclare("", false, true, true, false, nil)
+	q, err := channel.QueueDeclare("", false, true, true, false, nil)
 	if err != nil {
 		return fmt.Errorf("failed to declare reply queue: %w", err)
 	}
 
-	b.replyQueue = q.Name
-
-	msgs, err := b.channel.Consume(q.Name, "", true, false, false, false, nil)
+	msgs, err := channel.Consume(q.Name, "", true, false, false, false, nil)
 	if err != nil {
 		return fmt.Errorf("failed to consume reply queue: %w", err)
 	}
 
-	go b.handleResponses(msgs)
+	stop := make(chan struct{})
+	b.closeMu.Lock()
+	if b.replyQueue != "" {
+		b.closeMu.Unlock()
+		close(stop)
+		return nil
+	}
+	b.replyQueue = q.Name
+	b.replyConsumerStop = stop
+	b.closeMu.Unlock()
+
+	go b.handleResponses(msgs, stop)
 
 	return nil
 }
 
-func (b *Broker) handleResponses(msgs <-chan amqplib.Delivery) {
-	for msg := range msgs {
-		corrID := msg.CorrelationId
-		b.pendingMu.RLock()
-		respChan, exists := b.pending[corrID]
-		b.pendingMu.RUnlock()
+func (b *Broker) handleResponses(msgs <-chan amqplib.Delivery, stop <-chan struct{}) {
+	for {
+		select {
+		case <-stop:
+			return
+		case msg, ok := <-msgs:
+			if !ok {
+				return
+			}
 
-		if exists {
-			respChan <- &msg
+			corrID := msg.CorrelationId
+			b.pendingMu.RLock()
+			respChan, exists := b.pending[corrID]
+			b.pendingMu.RUnlock()
+
+			if exists {
+				respChan <- &msg
+			}
 		}
 	}
 }
@@ -478,8 +921,32 @@ func (b *Broker) cancelAllPending() {
 	b.pendingMu.Lock()
 	defer b.pendingMu.Unlock()
 
-	for _, ch := range b.pending {
+	for key, ch := range b.pending {
 		close(ch)
+		delete(b.pending, key)
 	}
-	b.pending = make(map[string]chan *amqplib.Delivery)
+}
+
+func (b *Broker) currentChannel(allowRecovering bool) (amqpChannel, error) {
+	b.closeMu.RLock()
+	defer b.closeMu.RUnlock()
+
+	if b.closed || (!allowRecovering && b.recovering) || !b.connected || b.channel == nil {
+		return nil, &core.ErrNotConnected{Backend: backendName}
+	}
+
+	return b.channel, nil
+}
+
+func (b *Broker) currentReplyQueue() string {
+	b.closeMu.RLock()
+	defer b.closeMu.RUnlock()
+	return b.replyQueue
+}
+
+func (b *Broker) stopReplyConsumerLocked() {
+	if b.replyConsumerStop != nil {
+		close(b.replyConsumerStop)
+		b.replyConsumerStop = nil
+	}
 }

@@ -15,7 +15,15 @@
 // Package codec provides encoding and decoding utilities for message payloads.
 package codec
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"reflect"
+
+	"github.com/prabhatdotdev/weave/core"
+	"google.golang.org/protobuf/proto"
+)
 
 // Codec defines the interface for message encoding and decoding.
 type Codec interface {
@@ -29,6 +37,9 @@ type jsonCodec struct{}
 
 // JSON is the default JSON codec.
 var JSON Codec = &jsonCodec{}
+
+// Protobuf encodes payloads using Protocol Buffers.
+var Protobuf Codec = &protobufCodec{}
 
 func (c *jsonCodec) Encode(v any) ([]byte, error) {
 	return json.Marshal(v)
@@ -50,4 +61,77 @@ func EncodeJSON(v any) ([]byte, error) {
 // DecodeJSON is a convenience function for JSON decoding.
 func DecodeJSON(data []byte, v any) error {
 	return JSON.Decode(data, v)
+}
+
+// protobufCodec implements Codec for Protocol Buffers payloads.
+type protobufCodec struct{}
+
+func (c *protobufCodec) Encode(v any) ([]byte, error) {
+	msg, ok := v.(proto.Message)
+	if !ok || isNilValue(msg) {
+		return nil, fmt.Errorf("codec: expected proto.Message, got %T", v)
+	}
+	return proto.Marshal(msg)
+}
+
+func (c *protobufCodec) Decode(data []byte, v any) error {
+	msg, ok := v.(proto.Message)
+	if !ok || isNilValue(msg) {
+		return fmt.Errorf("codec: expected proto.Message, got %T", v)
+	}
+	return proto.Unmarshal(data, msg)
+}
+
+func (c *protobufCodec) ContentType() string {
+	return "application/x-protobuf"
+}
+
+// EncodeProtobuf is a convenience function for protobuf encoding.
+func EncodeProtobuf(v proto.Message) ([]byte, error) {
+	return Protobuf.Encode(v)
+}
+
+// DecodeProtobuf is a convenience function for protobuf decoding.
+func DecodeProtobuf(data []byte, v proto.Message) error {
+	return Protobuf.Decode(data, v)
+}
+
+// MarshalMessage encodes a value into a weave message and sets the content type.
+func MarshalMessage(c Codec, v any) (*core.Message, error) {
+	if c == nil {
+		return nil, errors.New("codec: nil codec")
+	}
+
+	body, err := c.Encode(v)
+	if err != nil {
+		return nil, err
+	}
+
+	return core.NewMessage(body).WithContentType(c.ContentType()), nil
+}
+
+// UnmarshalMessage decodes a weave message body into the provided value.
+func UnmarshalMessage(c Codec, msg *core.Message, v any) error {
+	if c == nil {
+		return errors.New("codec: nil codec")
+	}
+	if msg == nil {
+		return errors.New("codec: nil message")
+	}
+
+	return c.Decode(msg.Body, v)
+}
+
+func isNilValue(v any) bool {
+	if v == nil {
+		return true
+	}
+
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return rv.IsNil()
+	default:
+		return false
+	}
 }

@@ -23,12 +23,21 @@ type Config struct {
 	ConnectionRetry int
 	RetryDelay      time.Duration
 
-	AMQP     *AMQPConfig
-	Kafka    *KafkaConfig
-	Kinesis  *KinesisConfig
-	ActiveMQ *ActiveMQConfig
-	NATS     *NATSConfig
-	Redis    *RedisConfig
+	// Logger receives structured runtime and transport events.
+	Logger EventLogger
+	// EventHook receives structured runtime and transport events.
+	EventHook EventHook
+	// Metrics receives basic counters and duration measurements.
+	Metrics MetricsHook
+	// Tracing receives span lifecycle callbacks for high-level runtime operations.
+	Tracing TracingHook
+	// HealthReporter receives runtime health snapshots.
+	HealthReporter HealthReporter
+	// HealthHook receives runtime health snapshots as a callback.
+	HealthHook HealthHook
+
+	AMQP  *AMQPConfig
+	Kafka *KafkaConfig
 
 	// Shorthand for AMQP
 	Host     string
@@ -68,53 +77,6 @@ type KafkaConfig struct {
 	SessionTimeout    time.Duration
 	HeartbeatInterval time.Duration
 	SASL              *SASLConfig
-}
-
-// KinesisConfig holds AWS Kinesis-specific configuration.
-type KinesisConfig struct {
-	Region             string
-	AccessKeyID        string
-	SecretAccessKey    string
-	SessionToken       string
-	Endpoint           string
-	StreamName         string
-	ShardIteratorType  string
-	ConsumerName       string
-	CheckpointInterval time.Duration
-}
-
-// ActiveMQConfig holds ActiveMQ-specific configuration.
-type ActiveMQConfig struct {
-	BrokerURL string
-	Username  string
-	Password  string
-	TLS       *TLSConfig
-	UseTopics bool
-}
-
-// NATSConfig holds NATS-specific configuration.
-type NATSConfig struct {
-	Servers         []string
-	Username        string
-	Password        string
-	Token           string
-	TLS             *TLSConfig
-	MaxReconnects   int
-	ReconnectWait   time.Duration
-	JetStream       bool
-	StreamName      string
-	ConsumerDurable string
-}
-
-// RedisConfig holds Redis Streams-specific configuration.
-type RedisConfig struct {
-	Addr          string
-	Password      string
-	DB            int
-	TLS           *TLSConfig
-	ConsumerGroup string
-	ConsumerName  string
-	MaxLen        int64
 }
 
 // TLSConfig holds TLS/SSL configuration.
@@ -166,23 +128,6 @@ func DefaultKafkaConfig() *KafkaConfig {
 		AutoOffsetReset:   "latest",
 		SessionTimeout:    10 * time.Second,
 		HeartbeatInterval: 3 * time.Second,
-	}
-}
-
-// DefaultNATSConfig returns default NATS configuration.
-func DefaultNATSConfig() *NATSConfig {
-	return &NATSConfig{
-		Servers:       []string{"nats://localhost:4222"},
-		MaxReconnects: -1,
-		ReconnectWait: 2 * time.Second,
-	}
-}
-
-// DefaultRedisConfig returns default Redis configuration.
-func DefaultRedisConfig() *RedisConfig {
-	return &RedisConfig{
-		Addr: "localhost:6379",
-		DB:   0,
 	}
 }
 

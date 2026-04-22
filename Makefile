@@ -1,4 +1,4 @@
-.PHONY: help test test-verbose test-coverage bench lint fmt vet build rabbitmq-start rabbitmq-stop kafka-start kafka-stop clean install-deps
+.PHONY: help test test-verbose test-coverage test-coverage-check test-recovery bench lint fmt vet build rabbitmq-start rabbitmq-stop kafka-start kafka-stop clean install-deps
 
 help: ## Show this help message
 	@echo 'Usage: make [target]'
@@ -18,11 +18,17 @@ test: ## Run tests
 test-verbose: ## Run tests with verbose output
 	@go test -v -race -cover ./...
 
-test-coverage: ## Run tests with coverage report
-	@echo "Running tests with coverage..."
-	@go test -v -race -coverprofile=coverage.out ./...
-	@go tool cover -html=coverage.out -o coverage.html
-	@echo "Coverage report generated: coverage.html"
+test-coverage: ## Run coverage for critical packages and generate report
+	@echo "Running coverage for critical packages..."
+	@./scripts/check_coverage.sh
+
+test-coverage-check: ## Enforce minimum coverage for critical packages
+	@echo "Checking critical package coverage threshold..."
+	@./scripts/check_coverage.sh
+test-recovery: ## Run recovery-focused tests for connection loss and reconnect scenarios
+	@echo "Running recovery tests..."
+	@go test -v -run "Recovery|recovery|Reconnect|reconnect" ./transport/amqp ./transport/kafka
+	@echo "✅ Recovery tests passed"
 
 bench: ## Run benchmarks
 	@echo "Running benchmarks..."
@@ -75,5 +81,5 @@ kafka-logs: ## Show Kafka logs
 
 clean: ## Clean build artifacts and test files
 	@echo "Cleaning..."
-	@rm -f coverage.out coverage.html
+	@rm -f coverage.out coverage.html coverage.critical.out coverage.critical.html
 	@go clean

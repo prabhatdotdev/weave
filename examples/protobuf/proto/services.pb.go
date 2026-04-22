@@ -783,7 +783,7 @@ func listProfilesResponseDescriptor() *descpb.DescriptorProto {
 	return &descpb.DescriptorProto{
 		Name: proto.String("ListProfilesResponse"),
 		Field: []*descpb.FieldDescriptorProto{
-			field("profiles", 1, descpb.FieldDescriptorProto_TYPE_MESSAGE, ".examples.Profile").WithLabel(descpb.FieldDescriptorProto_LABEL_REPEATED),
+			fieldWithLabel("profiles", 1, descpb.FieldDescriptorProto_TYPE_MESSAGE, ".examples.Profile", descpb.FieldDescriptorProto_LABEL_REPEATED),
 		},
 	}
 }
@@ -840,7 +840,7 @@ func listUsersResponseDescriptor() *descpb.DescriptorProto {
 	return &descpb.DescriptorProto{
 		Name: proto.String("ListUsersResponse"),
 		Field: []*descpb.FieldDescriptorProto{
-			field("users", 1, descpb.FieldDescriptorProto_TYPE_MESSAGE, ".examples.EnrichedUser").WithLabel(descpb.FieldDescriptorProto_LABEL_REPEATED),
+			fieldWithLabel("users", 1, descpb.FieldDescriptorProto_TYPE_MESSAGE, ".examples.EnrichedUser", descpb.FieldDescriptorProto_LABEL_REPEATED),
 		},
 	}
 }
@@ -869,7 +869,158 @@ func field(name string, number int32, typ descpb.FieldDescriptorProto_Type, type
 	return f
 }
 
+func fieldWithLabel(name string, number int32, typ descpb.FieldDescriptorProto_Type, typeName string, label descpb.FieldDescriptorProto_Label) *descpb.FieldDescriptorProto {
+	f := field(name, number, typ, typeName)
+	f.Label = label.Enum()
+	return f
+}
+
 func init() {
+	file_proto_services_proto_msgTypes[0].Exporter = func(v interface{}, i int) interface{} {
+		switch v := v.(*Profile); i {
+		case 0:
+			return &v.state
+		case 1:
+			return &v.sizeCache
+		case 2:
+			return &v.unknownFields
+		default:
+			return nil
+		}
+	}
+	file_proto_services_proto_msgTypes[1].Exporter = func(v interface{}, i int) interface{} {
+		switch v := v.(*GetProfileRequest); i {
+		case 0:
+			return &v.state
+		case 1:
+			return &v.sizeCache
+		case 2:
+			return &v.unknownFields
+		default:
+			return nil
+		}
+	}
+	file_proto_services_proto_msgTypes[2].Exporter = func(v interface{}, i int) interface{} {
+		switch v := v.(*GetProfileResponse); i {
+		case 0:
+			return &v.state
+		case 1:
+			return &v.sizeCache
+		case 2:
+			return &v.unknownFields
+		default:
+			return nil
+		}
+	}
+	file_proto_services_proto_msgTypes[3].Exporter = func(v interface{}, i int) interface{} {
+		switch v := v.(*ListProfilesRequest); i {
+		case 0:
+			return &v.state
+		case 1:
+			return &v.sizeCache
+		case 2:
+			return &v.unknownFields
+		default:
+			return nil
+		}
+	}
+	file_proto_services_proto_msgTypes[4].Exporter = func(v interface{}, i int) interface{} {
+		switch v := v.(*ListProfilesResponse); i {
+		case 0:
+			return &v.state
+		case 1:
+			return &v.sizeCache
+		case 2:
+			return &v.unknownFields
+		default:
+			return nil
+		}
+	}
+	file_proto_services_proto_msgTypes[5].Exporter = func(v interface{}, i int) interface{} {
+		switch v := v.(*User); i {
+		case 0:
+			return &v.state
+		case 1:
+			return &v.sizeCache
+		case 2:
+			return &v.unknownFields
+		default:
+			return nil
+		}
+	}
+	file_proto_services_proto_msgTypes[6].Exporter = func(v interface{}, i int) interface{} {
+		switch v := v.(*EnrichedUser); i {
+		case 0:
+			return &v.state
+		case 1:
+			return &v.sizeCache
+		case 2:
+			return &v.unknownFields
+		default:
+			return nil
+		}
+	}
+	file_proto_services_proto_msgTypes[7].Exporter = func(v interface{}, i int) interface{} {
+		switch v := v.(*GetUserRequest); i {
+		case 0:
+			return &v.state
+		case 1:
+			return &v.sizeCache
+		case 2:
+			return &v.unknownFields
+		default:
+			return nil
+		}
+	}
+	file_proto_services_proto_msgTypes[8].Exporter = func(v interface{}, i int) interface{} {
+		switch v := v.(*GetUserResponse); i {
+		case 0:
+			return &v.state
+		case 1:
+			return &v.sizeCache
+		case 2:
+			return &v.unknownFields
+		default:
+			return nil
+		}
+	}
+	file_proto_services_proto_msgTypes[9].Exporter = func(v interface{}, i int) interface{} {
+		switch v := v.(*ListUsersRequest); i {
+		case 0:
+			return &v.state
+		case 1:
+			return &v.sizeCache
+		case 2:
+			return &v.unknownFields
+		default:
+			return nil
+		}
+	}
+	file_proto_services_proto_msgTypes[10].Exporter = func(v interface{}, i int) interface{} {
+		switch v := v.(*ListUsersResponse); i {
+		case 0:
+			return &v.state
+		case 1:
+			return &v.sizeCache
+		case 2:
+			return &v.unknownFields
+		default:
+			return nil
+		}
+	}
+	file_proto_services_proto_msgTypes[11].Exporter = func(v interface{}, i int) interface{} {
+		switch v := v.(*UserEvent); i {
+		case 0:
+			return &v.state
+		case 1:
+			return &v.sizeCache
+		case 2:
+			return &v.unknownFields
+		default:
+			return nil
+		}
+	}
+
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
@@ -888,18 +1039,4 @@ func init() {
 	file_proto_services_proto_rawDesc = nil
 	file_proto_services_proto_goTypes = nil
 	file_proto_services_proto_depIdxs = nil
-	for i := range file_proto_services_proto_msgTypes {
-		file_proto_services_proto_msgTypes[i].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*protoimpl.MessageState); i {
-			case 0:
-				return &v.state
-			case 1:
-				return &v.sizeCache
-			case 2:
-				return &v.unknownFields
-			default:
-				return nil
-			}
-		}
-	}
 }

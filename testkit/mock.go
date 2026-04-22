@@ -77,6 +77,12 @@ func (m *MockBroker) IsConnected() bool {
 	return m.connected && !m.closed
 }
 
+func (m *MockBroker) IsRecovering() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return false // Mock broker never recovers
+}
+
 func (m *MockBroker) Publish(ctx context.Context, destination string, msg *core.Message, opts ...core.PublishOption) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

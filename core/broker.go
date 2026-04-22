@@ -28,6 +28,10 @@ type Connector interface {
 	// IsConnected returns true if the broker connection is active.
 	IsConnected() bool
 
+	// IsRecovering returns true if the broker is actively recovering from a connection loss.
+	// When recovering is true, publish/call/subscribe operations will fail.
+	IsRecovering() bool
+
 	// Backend returns the name of the backend (e.g., "amqp", "kafka").
 	Backend() string
 }

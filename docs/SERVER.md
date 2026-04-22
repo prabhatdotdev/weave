@@ -824,5 +824,5 @@ func main() {
 
 - [Client Tutorial](CLIENT.md) - Learn how to send messages and make RPC calls
 - [Transport Configuration](TRANSPORTS.md) - Configure AMQP, Kafka, and more
-- [Testing Guide](TESTING.md) - Best practices for testing
-- [API Reference](API.md) - Complete API documentation
+- [Testing Servers](SERVER.md#testing-servers) - Best practices for testing server code
+- [API Guide](API.md) - Public API overview and pkg.go.dev links

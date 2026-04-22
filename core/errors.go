@@ -56,6 +56,19 @@ func (e *ErrTimeout) Error() string {
 	return fmt.Sprintf("operation %s timed out after %s", e.Operation, e.Duration)
 }
 
+// ErrCircuitOpen is returned when RPC retries are blocked by an open circuit breaker.
+type ErrCircuitOpen struct {
+	Operation  string
+	RetryAfter string
+}
+
+func (e *ErrCircuitOpen) Error() string {
+	if e.RetryAfter != "" {
+		return fmt.Sprintf("operation %s blocked by open circuit breaker; retry after %s", e.Operation, e.RetryAfter)
+	}
+	return fmt.Sprintf("operation %s blocked by open circuit breaker", e.Operation)
+}
+
 // ErrUnknownBackend is returned when an unknown backend is requested.
 type ErrUnknownBackend struct {
 	Backend string
@@ -150,6 +163,12 @@ func IsConnectionLost(err error) bool {
 // IsTimeout returns true if the error indicates a timeout.
 func IsTimeout(err error) bool {
 	var e *ErrTimeout
+	return errors.As(err, &e)
+}
+
+// IsCircuitOpen returns true if the error indicates an open circuit breaker.
+func IsCircuitOpen(err error) bool {
+	var e *ErrCircuitOpen
 	return errors.As(err, &e)
 }
 

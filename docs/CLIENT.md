@@ -535,6 +535,14 @@ client.Connect(ctx)
 // ... use client ...
 ```
 
+Recovery semantics are transport-specific:
+
+- AMQP reconnects in the background after a detected loss, but calls made during that reconnect window still fail fast until the channel is restored.
+- Kafka reconnects on demand after a prior successful `Connect()`.
+- Pending RPC waits fail with `ErrConnectionLost`; retrying them is an application decision, not an automatic behavior.
+
+See [TRANSPORTS.md](TRANSPORTS.md) for the detailed recovery contract.
+
 ---
 
 ## Configuration
@@ -1090,5 +1098,5 @@ func main() {
 
 - [Server Tutorial](SERVER.md) - Build message handlers
 - [Transport Configuration](TRANSPORTS.md) - Configure AMQP, Kafka
-- [Testing Guide](TESTING.md) - Best practices for testing
-- [API Reference](API.md) - Complete API documentation
+- [Testing Clients](CLIENT.md#testing-clients) - Best practices for testing client code
+- [API Guide](API.md) - Public API overview and pkg.go.dev links

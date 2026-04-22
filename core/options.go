@@ -16,6 +16,16 @@ package core
 
 import "time"
 
+// HandlerErrorPolicy controls what happens when a handler returns an error.
+type HandlerErrorPolicy string
+
+const (
+	// HandlerErrorNoRetry does not request transport-level retries.
+	HandlerErrorNoRetry HandlerErrorPolicy = "no_retry"
+	// HandlerErrorRetry requests transport-level retry behavior where supported.
+	HandlerErrorRetry HandlerErrorPolicy = "retry"
+)
+
 // SubscribeOptions holds configuration for subscription operations.
 type SubscribeOptions struct {
 	AutoAck            bool
@@ -27,6 +37,7 @@ type SubscribeOptions struct {
 	RoutingKey         string
 	ConsumerGroup      string
 	StartFromBeginning bool
+	HandlerErrorPolicy HandlerErrorPolicy
 }
 
 // SubscribeOption is a functional option for configuring subscriptions.
@@ -69,6 +80,16 @@ func WithConsumerGroup(group string) SubscribeOption {
 // WithStartFromBeginning starts consuming from the earliest offset.
 func WithStartFromBeginning() SubscribeOption {
 	return func(o *SubscribeOptions) { o.StartFromBeginning = true }
+}
+
+// WithHandlerErrorRetry requests transport-level retry when a handler returns an error.
+func WithHandlerErrorRetry() SubscribeOption {
+	return func(o *SubscribeOptions) { o.HandlerErrorPolicy = HandlerErrorRetry }
+}
+
+// WithHandlerErrorNoRetry disables transport-level retry when a handler returns an error.
+func WithHandlerErrorNoRetry() SubscribeOption {
+	return func(o *SubscribeOptions) { o.HandlerErrorPolicy = HandlerErrorNoRetry }
 }
 
 // PublishOptions holds configuration for publish operations.
@@ -129,7 +150,7 @@ func WithExpiration(ttl string) PublishOption {
 
 // ApplySubscribeOptions applies all functional options and returns the result.
 func ApplySubscribeOptions(opts ...SubscribeOption) *SubscribeOptions {
-	options := &SubscribeOptions{}
+	options := &SubscribeOptions{HandlerErrorPolicy: HandlerErrorNoRetry}
 	for _, opt := range opts {
 		opt(options)
 	}

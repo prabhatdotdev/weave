@@ -39,6 +39,7 @@ import (
 	"fmt"
 	"sync"
 
+	payloadcodec "github.com/prabhatdotdev/weave/codec"
 	"github.com/prabhatdotdev/weave/core"
 )
 
@@ -113,13 +114,32 @@ func (s *Server) Handle(destination string, handler core.Handler) *Server {
 
 // Start connects to the broker and begins consuming messages.
 // All registered handlers will start receiving messages.
-func (s *Server) Start(ctx context.Context) error {
+func (s *Server) Start(ctx context.Context) (err error) {
+	ctx, span := s.config.StartSpan(ctx, core.TraceSpanStart{
+		Name:      "weave.runtime.server.start",
+		Backend:   s.broker.Backend(),
+		Component: "runtime",
+		Operation: "server_start",
+		Attributes: map[string]string{
+			"role": "server",
+		},
+	})
+	defer func() {
+		span.Finish(core.TraceSpanFinish{
+			Err: err,
+			Attributes: map[string]string{
+				"role":    "server",
+				"outcome": traceOutcome(err),
+			},
+		})
+	}()
+
 	s.mu.Lock()
 	if s.started {
 		s.mu.Unlock()
-		return fmt.Errorf("server already started")
+		err = fmt.Errorf("server already started")
+		return err
 	}
-	s.started = true
 	handlers := make(map[string]core.Handler, len(s.handlers))
 	for k, v := range s.handlers {
 		handlers[k] = v
@@ -127,15 +147,67 @@ func (s *Server) Start(ctx context.Context) error {
 	s.mu.Unlock()
 
 	if !s.broker.IsConnected() {
-		if err := s.broker.Connect(ctx); err != nil {
+		if err = s.broker.Connect(ctx); err != nil {
+			if s.config != nil {
+				s.config.EmitEvent(ctx, core.Event{
+					Level:     core.EventLevelError,
+					Name:      core.EventConnect,
+					Backend:   s.broker.Backend(),
+					Component: "runtime",
+					Operation: "server_start",
+					Err:       err,
+					Fields:    map[string]any{"outcome": "failure"},
+				})
+				s.config.EmitCounter("weave.runtime.connect.failures", 1, map[string]string{"backend": s.broker.Backend(), "role": "server"})
+				s.config.EmitHealth(ctx, s.HealthReportWithStatus(core.HealthStatusUnhealthy, map[string]any{
+					"operation": "server_start",
+					"error":     err.Error(),
+				}))
+			}
 			return err
+		}
+		if s.config != nil {
+			s.config.EmitEvent(ctx, core.Event{
+				Level:     core.EventLevelInfo,
+				Name:      core.EventConnect,
+				Backend:   s.broker.Backend(),
+				Component: "runtime",
+				Operation: "server_start",
+				Fields:    map[string]any{"outcome": "success"},
+			})
+			s.config.EmitCounter("weave.runtime.connect.success", 1, map[string]string{"backend": s.broker.Backend(), "role": "server"})
+			s.config.EmitHealth(ctx, s.HealthReport())
 		}
 	}
 
 	for dest, handler := range handlers {
-		if err := s.broker.Subscribe(ctx, dest, handler); err != nil {
+		if err = s.broker.Subscribe(ctx, dest, handler); err != nil {
+			if s.config != nil {
+				s.config.EmitEvent(ctx, core.Event{
+					Level:       core.EventLevelError,
+					Name:        core.EventSubscribeFailed,
+					Backend:     s.broker.Backend(),
+					Component:   "runtime",
+					Operation:   "server_subscribe",
+					Destination: dest,
+					Err:         err,
+				})
+				s.config.EmitCounter("weave.runtime.subscribe.failures", 1, map[string]string{"backend": s.broker.Backend(), "destination": dest, "role": "server"})
+				s.config.EmitHealth(ctx, s.HealthReportWithStatus(core.HealthStatusDegraded, map[string]any{
+					"operation":   "server_subscribe",
+					"destination": dest,
+					"error":       err.Error(),
+				}))
+			}
 			return err
 		}
+	}
+
+	s.mu.Lock()
+	s.started = true
+	s.mu.Unlock()
+	if s.config != nil {
+		s.config.EmitHealth(ctx, s.HealthReport())
 	}
 
 	return nil
@@ -143,22 +215,138 @@ func (s *Server) Start(ctx context.Context) error {
 
 // Publish sends a message to a destination.
 // This allows servers to also act as clients when needed.
-func (s *Server) Publish(ctx context.Context, destination string, msg *core.Message, opts ...core.PublishOption) error {
-	return s.broker.Publish(ctx, destination, msg, opts...)
+func (s *Server) Publish(ctx context.Context, destination string, msg *core.Message, opts ...core.PublishOption) (err error) {
+	ctx, span := s.config.StartSpan(ctx, core.TraceSpanStart{
+		Name:          "weave.runtime.server.publish",
+		Backend:       s.broker.Backend(),
+		Component:     "runtime",
+		Operation:     "server_publish",
+		Destination:   destination,
+		CorrelationID: correlationID(msg),
+		Attributes: map[string]string{
+			"role": "server",
+		},
+	})
+	defer func() {
+		span.Finish(core.TraceSpanFinish{
+			Err: err,
+			Attributes: map[string]string{
+				"role":        "server",
+				"destination": destination,
+				"outcome":     traceOutcome(err),
+			},
+		})
+	}()
+
+	err = s.broker.Publish(ctx, destination, msg, opts...)
+	return err
+}
+
+// PublishWithCodec encodes a payload into a message using the provided codec and publishes it.
+func (s *Server) PublishWithCodec(ctx context.Context, destination string, payload any, codec payloadcodec.Codec, opts ...core.PublishOption) error {
+	msg, err := payloadcodec.MarshalMessage(codec, payload)
+	if err != nil {
+		return err
+	}
+	return s.Publish(ctx, destination, msg, opts...)
 }
 
 // Call performs a request-reply operation.
 // This allows servers to also act as clients when needed.
-func (s *Server) Call(ctx context.Context, destination string, msg *core.Message, opts ...core.PublishOption) (*core.Message, error) {
-	return s.broker.Call(ctx, destination, msg, opts...)
+func (s *Server) Call(ctx context.Context, destination string, msg *core.Message, opts ...core.PublishOption) (response *core.Message, err error) {
+	ctx, span := s.config.StartSpan(ctx, core.TraceSpanStart{
+		Name:          "weave.runtime.server.call",
+		Backend:       s.broker.Backend(),
+		Component:     "runtime",
+		Operation:     "server_call",
+		Destination:   destination,
+		CorrelationID: correlationID(msg),
+		Attributes: map[string]string{
+			"role": "server",
+		},
+	})
+	defer func() {
+		span.Finish(core.TraceSpanFinish{
+			Err: err,
+			Attributes: map[string]string{
+				"role":        "server",
+				"destination": destination,
+				"outcome":     callOutcome(err),
+			},
+		})
+	}()
+
+	response, err = s.broker.Call(ctx, destination, msg, opts...)
+	return response, err
+}
+
+// CallWithCodec encodes a request, performs the RPC call, and decodes the response with the same codec.
+//
+// Pass a nil response if you only want the encoded response message returned.
+func (s *Server) CallWithCodec(ctx context.Context, destination string, request any, response any, codec payloadcodec.Codec, opts ...core.PublishOption) (*core.Message, error) {
+	msg, err := payloadcodec.MarshalMessage(codec, request)
+	if err != nil {
+		return nil, err
+	}
+
+	reply, err := s.Call(ctx, destination, msg, opts...)
+	if err != nil {
+		return nil, err
+	}
+	if response == nil {
+		return reply, nil
+	}
+
+	if err := payloadcodec.UnmarshalMessage(codec, reply, response); err != nil {
+		return nil, err
+	}
+
+	return reply, nil
+}
+
+// CallWithPolicy performs an RPC-style call with retry, backoff, and optional
+// circuit-breaking behavior.
+func (s *Server) CallWithPolicy(ctx context.Context, destination string, msg *core.Message, policy CallPolicy, opts ...core.PublishOption) (*core.Message, error) {
+	return CallWithPolicy(ctx, s.broker, destination, msg, policy, opts...)
 }
 
 // Stop gracefully stops the server and closes the broker connection.
 func (s *Server) Stop() error {
 	var err error
+	ctx, span := s.config.StartSpan(context.Background(), core.TraceSpanStart{
+		Name:      "weave.runtime.server.stop",
+		Backend:   s.broker.Backend(),
+		Component: "runtime",
+		Operation: "server_stop",
+		Attributes: map[string]string{
+			"role": "server",
+		},
+	})
+	defer func() {
+		span.Finish(core.TraceSpanFinish{
+			Err: err,
+			Attributes: map[string]string{
+				"role":    "server",
+				"outcome": traceOutcome(err),
+			},
+		})
+	}()
+
 	s.closeOnce.Do(func() {
 		s.cancel()
 		err = s.broker.Close()
+		if s.config != nil {
+			s.config.EmitEvent(ctx, core.Event{
+				Level:     core.EventLevelInfo,
+				Name:      core.EventDisconnect,
+				Backend:   s.broker.Backend(),
+				Component: "runtime",
+				Operation: "server_stop",
+				Fields:    map[string]any{"outcome": "success", "reason": "close"},
+			})
+			s.config.EmitCounter("weave.runtime.disconnect.events", 1, map[string]string{"backend": s.broker.Backend(), "role": "server"})
+			s.config.EmitHealth(ctx, s.HealthReport())
+		}
 	})
 	return err
 }
@@ -171,6 +359,35 @@ func (s *Server) Broker() core.MessageBroker {
 // Config returns the server configuration.
 func (s *Server) Config() *core.Config {
 	return s.config
+}
+
+// HealthReport returns the current server health snapshot.
+func (s *Server) HealthReport() core.HealthReport {
+	recovering := s.broker.IsRecovering()
+	status := core.HealthStatusDegraded
+	if s.IsStarted() && s.broker.IsConnected() {
+		status = core.HealthStatusHealthy
+	} else if recovering {
+		status = core.HealthStatusDegraded
+	} else if !s.broker.IsConnected() {
+		status = core.HealthStatusUnhealthy
+	}
+	return s.HealthReportWithStatus(status, map[string]any{
+		"recovering": recovering,
+	})
+}
+
+// HealthReportWithStatus returns the current server health snapshot with an
+// explicit status and additional details.
+func (s *Server) HealthReportWithStatus(status core.HealthStatus, details map[string]any) core.HealthReport {
+	return core.HealthReport{
+		Status:    status,
+		Backend:   s.broker.Backend(),
+		Component: "runtime.server",
+		Connected: s.broker.IsConnected(),
+		Started:   s.IsStarted(),
+		Details:   cloneHealthDetails(details),
+	}
 }
 
 // IsStarted returns true if the server has been started.

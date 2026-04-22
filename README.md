@@ -4,19 +4,47 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Go Report Card](https://goreportcard.com/badge/github.com/prabhatdotdev/weave)](https://goreportcard.com/report/github.com/prabhatdotdev/weave)
 
-A unified abstraction layer for building message-driven microservices across multiple message queue backends. Switch between RabbitMQ, Kafka, and more without changing your application code.
+A unified abstraction layer for building message-driven microservices across message queue backends. Today, the implemented transports are RabbitMQ/AMQP and Apache Kafka.
 
-## Features
+## Feature Status
 
-- 🔌 **Multi-Backend** - Single API for AMQP (RabbitMQ), Apache Kafka, and more
+| Feature | Status | Details |
+|---------|--------|---------|
+| Client & Server abstractions | ✅ Stable | Documented API with automated unit and integration-style coverage |
+| AMQP (RabbitMQ) transport | ✅ Stable | Covered by automated transport, reconnect, and race-detector tests |
+| Kafka transport | ✅ Stable | Covered by automated transport, reconnect, and race-detector tests |
+| Connection retry (basic) | ✅ Stable | Implemented for both backends |
+| Observability hooks | ✅ Stable | Logging, metrics, and tracing extension points |
+| Request-reply RPC | ✅ Stable | Core feature |
+| Timeout support | ✅ Stable | Context-based |
+| Testing utilities | ✅ Stable | Mock broker available |
+| Connection recovery & reconnect | ✅ Stable | Recovery paths are covered by automated reconnect tests; semantics differ by backend |
+| Protobuf integration | ✅ Stable | Built-in protobuf codec and codec-aware helpers; no typed APIs |
+| Dead-letter handling | ✅ Stable | Standard dead-letter envelope helpers are implemented; broker-native routing remains backend-specific |
+| Worker pool abstractions | 📋 Planned | Future enhancement |
+| Schema validation helpers | 📋 Planned | Future enhancement |
+| Tracing integration | ✅ Stable | Hook-based span integration with adapter examples |
+| Health check endpoints | 📋 Planned | Future enhancement |
+| Additional backends (NATS, Redis, etc.) | 📋 Reserved | Design-phase only, not under development |
+
+**Status Legend:**
+- ✅ Stable: Implemented, documented, and covered by automated validation for the currently supported surface
+- 🔶 In Progress: Partially implemented, testing in progress
+- 📋 Planned: Designed but not yet implemented
+- 📦 Reserved: Considered for future work but not yet designed
+
+## Features (Stable)
+
+- 🔌 **Multi-Backend** - Single API for AMQP (RabbitMQ) and Apache Kafka
 - 🖥️ **Client & Server** - Dedicated abstractions for both client and server roles
 - 🚀 **Simple API** - REST-like request-response pattern over any message queue
 - ⏱️ **Timeout Support** - Context-based timeout handling for all requests
-- 🔄 **Connection Management** - Automatic connection retry and monitoring
-- 🎯 **Type-Safe** - Works with any data format (JSON, Protocol Buffers, etc.)
+- 📊 **Connection Management** - Automatic connection retry (basic) and monitoring
+- 🎯 **Flexible Payloads** - Works with JSON, Protocol Buffers, and other payload formats via `Message.Body`
 - 🧪 **Testable** - Built-in mock broker for unit testing
 - 📊 **Concurrent** - Handles multiple concurrent requests efficiently
-- 🔌 **Production Ready** - Proper error handling, cleanup, and resource management
+- 🧰 **Extensible** - Registry-based transport design for adding future backends
+- 🔍 **Observability** - Structured logging, metrics, and tracing hooks
 
 ## Installation
 
@@ -30,7 +58,7 @@ Import the transport(s) you need:
 import (
     "github.com/prabhatdotdev/weave"
     
-    // Import one or more transports
+    // Import one or more implemented transports
     _ "github.com/prabhatdotdev/weave/transport/amqp"   // RabbitMQ
     _ "github.com/prabhatdotdev/weave/transport/kafka"  // Apache Kafka
 )
@@ -42,6 +70,8 @@ Weave provides two high-level abstractions:
 
 - **Client** - For sending messages and making RPC calls (no subscriptions)
 - **Server** - For subscribing to queues/topics and handling incoming messages
+
+Payload format is intentionally transport-agnostic. Weave now ships built-in JSON and Protocol Buffers codecs, plus helpers like `weave.MarshalMessage(...)`, `weave.UnmarshalMessage(...)`, `Client.PublishWithCodec(...)`, and `Client.CallWithCodec(...)` so you can keep serialization concerns out of most call sites.
 
 ### Client Example (Sending Messages / RPC)
 
@@ -186,7 +216,7 @@ weave/
 │   ├── client.go      # Client (publish, call only)
 │   └── service.go     # Server (subscribe, handle)
 ├── codec/             # Message encoding/decoding
-│   └── codec.go       # JSON codec
+│   └── codec.go       # JSON + protobuf codecs
 └── testkit/           # Testing utilities
     └── mock.go        # Mock broker for testing
 ```
@@ -257,6 +287,43 @@ func GetUser(caller weave.Caller, userID string) (*User, error) {
 ```
 
 ## Configuration
+
+### Observability Hooks
+
+Weave emits structured runtime and transport events through optional hooks on `Config`.
+
+```go
+type Config struct {
+    Logger    weave.EventLogger
+    EventHook weave.EventHook
+    Metrics   weave.MetricsHook
+    Tracing   weave.TracingHook
+}
+```
+
+Standard event names include:
+
+- `weave.EventConnect`
+- `weave.EventDisconnect`
+- `weave.EventPublishFailed`
+- `weave.EventSubscribeFailed`
+- `weave.EventTimeout`
+
+Use `Logger` when you want a consistent structured logging sink, `EventHook` for lightweight callbacks, and `Metrics` to bridge counters/durations into your monitoring system.
+Use `Tracing` to start spans for high-level `Client` and `Server` operations and bridge them into OpenTelemetry or another tracing backend.
+
+For production wiring examples with `slog`, Prometheus-style metrics, and OpenTelemetry adapters, see [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md).
+
+### Transport Capabilities
+
+Each backend provides different guarantees. See [Transport Capability Matrix](docs/TRANSPORT_MATRIX.md) for detailed comparison of:
+
+- Message ordering and delivery guarantees
+- Dead-letter and error handling
+- Consumer group and partition behavior
+- Connection recovery semantics
+
+Choose your backend based on whether you need AMQP's simplicity and priority support or Kafka's horizontal scaling and topic retention.
 
 ### AMQP (RabbitMQ)
 

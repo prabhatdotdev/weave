@@ -1,8 +1,24 @@
 # Transport Configuration Guide
 
-This guide covers configuration for all supported message queue transports. The `Backend` field in `Config` selects which transport implementation to use.
+This guide covers the transports currently implemented in this repository. The `Backend` field in `Config` selects which transport implementation to use.
 
-## AMQP (RabbitMQ)
+## Implemented Transports
+
+- `amqp` - RabbitMQ / AMQP 0.9.1
+- `kafka` - Apache Kafka
+
+## Future Transports
+
+The following transports are planned but not currently implemented:
+
+- `kinesis` - AWS Kinesis
+- `nats` - NATS Streaming
+- `activemq` - Apache ActiveMQ
+- `redis` - Redis Streams
+
+**Note:** If you would like to implement a new backend, see [ADDING_BACKENDS.md](ADDING_BACKENDS.md) for the implementation guide and requirements.
+
+---
 
 ### Basic Configuration
 
@@ -18,7 +34,7 @@ config := &mqservice.Config{
     },
 }
 
-broker, err := mqservice.New("amqp", config)
+broker, err := mqservice.New(config)
 if err != nil {
     log.Fatal(err)
 }
@@ -99,7 +115,7 @@ config := &mqservice.Config{
     },
 }
 
-broker, err := mqservice.New("kafka", config)
+broker, err := mqservice.New(config)
 ```
 
 ### Full Configuration
@@ -181,215 +197,19 @@ config := mqservice.DefaultKafkaConfig()
 
 ---
 
-## AWS Kinesis
+## Planned Transports
 
-### Basic Configuration
+Kinesis, NATS, ActiveMQ, and Redis are roadmap transports only. They are not implemented in this repository and are not part of the current `Config` backend surface.
 
-```go
-import _ "github.com/prabhatdotdev/weave/transport/kinesis"
-
-config := &mqservice.Config{
-    Backend: "kinesis",
-    Kinesis: &mqservice.KinesisConfig{
-        Region:     "us-east-1",
-        StreamName: "my-stream",
-    },
-}
-```
-
-### Full Configuration
-
-```go
-config := &mqservice.Config{
-    Backend: "kinesis",
-    
-    Kinesis: &mqservice.KinesisConfig{
-        Region:          "us-west-2",
-        AccessKeyID:     "AKIAIOSFODNN7EXAMPLE", // Or use IAM role
-        SecretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-        SessionToken:    "", // For temporary credentials
-        Endpoint:        "", // For LocalStack: "http://localhost:4566"
-        
-        // Stream settings
-        StreamName:        "production-events",
-        ShardIteratorType: "LATEST", // TRIM_HORIZON, LATEST, AT_TIMESTAMP
-        
-        // Consumer settings
-        ConsumerName:       "my-service",
-        CheckpointInterval: 60 * time.Second,
-    },
-}
-```
-
-### IAM Role (Recommended)
-
-Instead of access keys, use IAM roles:
-
-```go
-config.Kinesis.AccessKeyID = ""     // Empty = use IAM role
-config.Kinesis.SecretAccessKey = "" // Empty = use IAM role
-```
-
-Required IAM permissions:
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "kinesis:PutRecord",
-        "kinesis:PutRecords",
-        "kinesis:GetRecords",
-        "kinesis:GetShardIterator",
-        "kinesis:DescribeStream"
-      ],
-      "Resource": "arn:aws:kinesis:*:*:stream/my-stream"
-    }
-  ]
-}
-```
-
----
-
-## NATS
-
-### Basic Configuration
-
-```go
-import _ "github.com/prabhatdotdev/weave/transport/nats"
-
-config := &mqservice.Config{
-    Backend: "nats",
-    NATS: &mqservice.NATSConfig{
-        Servers: []string{"nats://localhost:4222"},
-    },
-}
-```
-
-### Full Configuration
-
-```go
-config := &mqservice.Config{
-    Backend: "nats",
-    
-    NATS: &mqservice.NATSConfig{
-        Servers: []string{
-            "nats://nats1.example.com:4222",
-            "nats://nats2.example.com:4222",
-        },
-        Username:      "nats-user",
-        Password:      "nats-pass",
-        Token:         "", // Alternative to username/password
-        MaxReconnects: -1, // -1 = infinite
-        ReconnectWait: 2 * time.Second,
-        
-        // JetStream (for persistence)
-        JetStream:       true,
-        StreamName:      "my-stream",
-        ConsumerDurable: "my-service",
-        
-        // TLS
-        TLS: &mqservice.TLSConfig{
-            Enable:   true,
-            CertFile: "/path/to/cert.pem",
-            KeyFile:  "/path/to/key.pem",
-            CAFile:   "/path/to/ca.pem",
-        },
-    },
-}
-```
-
----
-
-## ActiveMQ
-
-### Basic Configuration
-
-```go
-import _ "github.com/prabhatdotdev/weave/transport/activemq"
-
-config := &mqservice.Config{
-    Backend: "activemq",
-    ActiveMQ: &mqservice.ActiveMQConfig{
-        BrokerURL: "tcp://localhost:61616",
-        Username:  "admin",
-        Password:  "admin",
-    },
-}
-```
-
-### Full Configuration
-
-```go
-config := &mqservice.Config{
-    Backend: "activemq",
-    
-    ActiveMQ: &mqservice.ActiveMQConfig{
-        BrokerURL: "ssl://activemq.example.com:61617",
-        Username:  "app-user",
-        Password:  "app-pass",
-        UseTopics: false, // false = queues, true = topics
-        
-        // TLS
-        TLS: &mqservice.TLSConfig{
-            Enable:   true,
-            CertFile: "/path/to/cert.pem",
-            KeyFile:  "/path/to/key.pem",
-            CAFile:   "/path/to/ca.pem",
-        },
-    },
-}
-```
-
----
-
-## Redis Streams
-
-### Basic Configuration
-
-```go
-import _ "github.com/prabhatdotdev/weave/transport/redis"
-
-config := &mqservice.Config{
-    Backend: "redis",
-    Redis: &mqservice.RedisConfig{
-        Addr:          "localhost:6379",
-        ConsumerGroup: "my-service-group",
-    },
-}
-```
-
-### Full Configuration
-
-```go
-config := &mqservice.Config{
-    Backend: "redis",
-    
-    Redis: &mqservice.RedisConfig{
-        Addr:     "redis.example.com:6379",
-        Password: "redis-pass",
-        DB:       0, // Database number
-        
-        // Stream settings
-        ConsumerGroup: "my-service-group",
-        ConsumerName:  "instance-1",
-        MaxLen:        10000, // Trim stream to max length
-        
-        // TLS
-        TLS: &mqservice.TLSConfig{
-            Enable:             true,
-            InsecureSkipVerify: false,
-        },
-    },
-}
-```
+Until those transports exist under `transport/`, do not import or configure them as active backends in application code.
 
 ---
 
 ## Environment Variables
 
-All transports support environment variable overrides:
+This repository does not currently expose a `LoadConfigFromEnv()` helper. Environment-based configuration should be handled in application code.
+
+Example:
 
 ```bash
 # AMQP
@@ -404,17 +224,6 @@ export MQ_BACKEND=kafka
 export KAFKA_BROKERS=kafka1:9092,kafka2:9092
 export KAFKA_CONSUMER_GROUP=my-service
 
-# Kinesis
-export MQ_BACKEND=kinesis
-export AWS_REGION=us-east-1
-export KINESIS_STREAM_NAME=my-stream
-```
-
-Load from environment:
-
-```go
-config := mqservice.LoadConfigFromEnv()
-broker, err := mqservice.New(config.Backend, config)
 ```
 
 ---
@@ -431,6 +240,78 @@ config := &mqservice.Config{
     AMQP:            mqservice.DefaultAMQPConfig(),
 }
 ```
+
+## Connection Loss and Recovery Behavior
+
+Recovery is intentionally explicit rather than magical. The contract below describes what Weave guarantees today across both implemented transports.
+
+### Shared Contract
+
+- Before the first successful `Connect()`, `Publish()`, `Subscribe()`, and `Call()` return `ErrNotConnected`.
+- After a transport has connected at least once, a detected connection loss marks the broker disconnected and cancels all pending RPC waits.
+- In-flight `Call()` operations waiting for a reply fail with `ErrConnectionLost`; Weave does not automatically retry them.
+- `CallWithPolicy(...)` can retry a failed RPC after `ErrConnectionLost`, but that retry is opt-in because the original call may already have reached the remote service.
+- Weave does not snapshot or roll back handler-local state. If your handler performs side effects before a disconnect near the ack/commit boundary, the message may be redelivered after recovery. Handlers should therefore be idempotent.
+- Recovery only restores Weave-managed transport wiring such as connections, reply consumers/queues, and registered subscriptions. It does not recreate application-owned state, transactions, or external dependency sessions.
+
+### AMQP (RabbitMQ)
+
+- After a successful `Connect`, unexpected connection loss is detected via AMQP close notifications.
+- The broker marks itself disconnected, cancels all pending RPC calls, and retries reconnecting in the background using `ConnectionRetry`/`RetryDelay`.
+- Once reconnected, all previously registered subscriptions are re-declared, bindings are re-applied, and handlers are reattached automatically.
+- In-flight `Call()` operations waiting for a reply fail with `ErrConnectionLost` when the connection drops.
+- Operations issued while background reconnect is still in progress fail fast with `ErrNotConnected`.
+- The same handler function values are reused after reconnect; Weave does not rebuild captured state inside closures.
+- Operations attempted before the first successful `Connect` still return `ErrNotConnected`.
+
+### Kafka
+
+- Before the first successful `Connect`, operations return `ErrNotConnected`.
+- After at least one successful `Connect`, if producer/consumer connectivity is lost, the broker marks itself disconnected, closes stale clients, and cancels pending RPC calls.
+- `Publish()`/`Subscribe()`/`Call()` trigger reconnect attempts on demand after a detected loss.
+- Subscriber consume loops continue running and rejoin consumption after reconnect using the same destination and handler.
+- In-flight `Call()` operations fail with `ErrConnectionLost` when a loss is detected before a response arrives.
+- The same handler function values remain registered across reconnects; consumer-group recovery resumes the existing handler wiring rather than constructing new application state.
+
+### Retry Guidance During Recovery
+
+- Do not assume a reconnect makes an in-flight RPC safe to repeat automatically.
+- Prefer `CallWithPolicy(...)` only for idempotent operations or when the remote side can deduplicate by correlation/request ID.
+- Prefer `RetryHandler(...)` for bounded in-process retries of transient handler failures, and keep handler side effects idempotent so reconnect-triggered redelivery is safe.
+
+For standardized handler failure and retry semantics (including dead-letter guidance), see [ERROR_POLICY.md](ERROR_POLICY.md).
+
+### Observability During Recovery
+
+Weave emits events and metrics during reconnect and subscription restoration to support production observability:
+
+#### Events
+- `reconnect_started` - Recovery process has begun (Level: Info)
+- `reconnect_attempt` - A connection attempt was made with attempt counter (Level: Debug)
+- `reconnect_attempt_failed` - A single connection attempt failed with error (Level: Warn)
+- `reconnect_succeeded` - Connection and subscription restore completed successfully (Level: Info)
+- `subscription_restore_started` - Subscription restoration process began with subscription count (Level: Info)
+- `subscription_restore_failed` - A single subscription failed to restore with destination and error (Level: Error)
+- `subscription_restore_completed` - All subscriptions restored successfully (Level: Info)
+
+#### Metrics
+- `weave.transport.reconnect.started` (counter) - Incremented once per reconnect cycle start
+- `weave.transport.reconnect.succeeded` (counter) - Incremented on successful reconnect completion
+- `weave.transport.reconnect.attempt_failures` (counter) - Incremented per failed connection attempt with backend label
+- `weave.transport.subscription.restore.success` (counter) - Incremented per successfully restored subscription with backend and destination labels
+- `weave.transport.subscription.restore.failures` (counter) - Incremented per failed subscription restore with backend and destination labels
+
+#### Health Contract
+- `HealthReport.Status` returns `HealthStatusDegraded` while recovery is in progress
+- `HealthReport.Details["recovering"]` is set to `true` during reconnect windows
+- `Broker.IsRecovering()` returns `true` only while reconnect is actively running; once `IsConnected()` returns true, `IsRecovering()` is false
+- **Runtime Client/Server**: Health reports transition to `Degraded` during recovery and return to `Healthy` once `IsConnected()` succeeds
+
+This observability enables infrastructure to:
+1. Distinguish transient recovery (`Degraded`) from terminal disconnection (`Unhealthy`)
+2. Monitor reconnect attempt frequency and success rates
+3. Alert on subscription restore failures per destination
+4. Track recovery latency from loss detection to operational readiness
 
 ---
 
@@ -472,18 +353,6 @@ For debugging and monitoring:
 ```go
 config.ConnectionName = "user-service-prod-1"
 ```
-
-### 5. Test with LocalStack
-
-Use LocalStack for local AWS testing:
-
-```go
-if os.Getenv("ENV") == "local" {
-    config.Kinesis.Endpoint = "http://localhost:4566"
-}
-```
-
----
 
 ## Switching Transports
 

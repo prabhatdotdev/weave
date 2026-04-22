@@ -15,17 +15,20 @@ Welcome to the Weave documentation!
 ## Core Documentation
 
 - **[Architecture Overview](ARCHITECTURE.md)** - System design and architecture
-- **[API Reference](API.md)** - Complete API documentation
+- **[API Guide](API.md)** - Overview of the public API with links to pkg.go.dev
 - **[Transport Configuration](TRANSPORTS.md)** - Configure AMQP, Kafka, etc.
 
 ## Advanced Topics
 
-- **[Protocol Buffers Support](PROTOBUF.md)** - Type-safe messaging with protobuf
-- **[Multiple Handlers](MULTIPLE_HANDLERS.md)** - Register multiple handlers per service
+- **[Protocol Buffers Support](PROTOBUF.md)** - Manual protobuf usage with the current Client and Server APIs
+- **[Multiple Handlers](MULTIPLE_HANDLERS.md)** - Current handler patterns supported by `Server.Handle`
+- **[Error Handling And Retry Policy](ERROR_POLICY.md)** - Runtime contract for handler failures, retries, and DLQ guidance
+- **[Observability Guide](OBSERVABILITY.md)** - Logging, metrics, tracing, and operational guidance
 
-## Contributing
+## Contributing and Extending
 
 - **[Contributing Guide](../CONTRIBUTING.md)** - Contribution guidelines
+- **[Adding New Transport Backends](ADDING_BACKENDS.md)** - Guide for implementing and integrating new message broker backends
 
 ## Quick Links
 
@@ -103,7 +106,7 @@ response, _ := client.Call(ctx, "users.get", weave.NewTextMessage("123"))
 | Example | Description |
 |---------|-------------|
 | [JSON Example](../examples/json) | Basic microservices using JSON serialization |
-| [Protobuf Example](../examples/protobuf) | Type-safe messaging with Protocol Buffers |
+| [Protobuf Example](../examples/protobuf) | Manual Protocol Buffers serialization using Client and Server |
 
 ## Documentation Structure
 
@@ -114,10 +117,13 @@ docs/
 ├── SERVER.md              # Server tutorial (handling messages)
 ├── CLIENT.md              # Client tutorial (sending messages)
 ├── ARCHITECTURE.md        # Architecture & design
-├── API.md                 # API reference
+├── API.md                 # API guide and pkg.go.dev entry points
 ├── TRANSPORTS.md          # Transport configuration
+├── ERROR_POLICY.md        # Error handling and retry behavior contract
+├── OBSERVABILITY.md       # Observability hooks and production wiring
 ├── PROTOBUF.md            # Protocol Buffers guide
-└── MULTIPLE_HANDLERS.md   # Multiple handlers guide
+├── MULTIPLE_HANDLERS.md   # Multiple handlers guide
+└── ADDING_BACKENDS.md     # Guide for adding new transport backends
 ```
 
 ## Need Help?
@@ -127,7 +133,7 @@ docs/
 
 ## Project Status
 
-Weave is actively developed and ready for production use.
+Weave is actively developed. The currently implemented transports are AMQP and Kafka.
 
 ## License
 

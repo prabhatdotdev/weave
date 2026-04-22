@@ -1,130 +1,95 @@
-# API Reference
+# API Guide
 
-Complete API documentation for Weave.
+This document is a high-level guide to the currently implemented Weave surface.
+
+For canonical package signatures and symbol-level docs, use pkg.go.dev:
+
+- https://pkg.go.dev/github.com/prabhatdotdev/weave
+- https://pkg.go.dev/github.com/prabhatdotdev/weave/core
+- https://pkg.go.dev/github.com/prabhatdotdev/weave/runtime
+
+## Implemented Backends
+
+The transport implementations currently present in this repository are:
+
+- AMQP / RabbitMQ
+- Apache Kafka
 
 ## Core Types
 
-### MessageBroker Interface
-
-The primary interface implemented by all backends:
+### MessageBroker
 
 ```go
 type MessageBroker interface {
-    // Connect establishes a connection to the message broker
     Connect(ctx context.Context) error
-    
-    // Close gracefully shuts down the connection
     Close() error
-    
-    // Publish sends a message to the specified destination
-    Publish(ctx context.Context, destination string, msg *Message) error
-    
-    // Subscribe registers a handler for messages from destination
-    Subscribe(ctx context.Context, destination string, handler Handler) error
-    
-    // Call implements request-response pattern
-    Call(ctx context.Context, destination string, msg *Message, timeout time.Duration) (*Message, error)
-    
-    // IsConnected returns connection status
     IsConnected() bool
-    
-    // Backend returns the backend name
     Backend() string
+
+    Publish(ctx context.Context, destination string, message *Message, opts ...PublishOption) error
+    Call(ctx context.Context, destination string, message *Message, opts ...PublishOption) (*Message, error)
+    Subscribe(ctx context.Context, destination string, handler Handler, opts ...SubscribeOption) error
 }
 ```
 
 ### Message
 
-Represents a message to be sent or received:
-
 ```go
 type Message struct {
-    Body          []byte            // Message payload
-    CorrelationID string            // For request-response correlation
-    ReplyTo       string            // Reply destination for RPC
-    Headers       map[string]string // Custom message headers
-    ContentType   string            // MIME type (e.g., "application/json")
-    Subject       string            // Message subject/routing key
-    Partition     int32             // Partition number (Kafka)
-    Offset        int64             // Message offset (Kafka, Kinesis)
+    Body          []byte
+    CorrelationID string
+    ReplyTo       string
+    Headers       map[string]string
+    ContentType   string
+    MessageID     string
+    Timestamp     time.Time
+    Subject       string
+    Partition     int32
+    Offset        int64
 }
 ```
 
-#### Constructor
+Common constructors and helpers:
 
 ```go
 func NewMessage(body []byte) *Message
-```
+func NewTextMessage(body string) *Message
 
-Creates a new message with the given body.
-
-**Example:**
-```go
-msg := mqservice.NewMessage([]byte("hello"))
-msg.Headers = map[string]string{"user-id": "123"}
-```
-
-#### Methods
-
-```go
 func (m *Message) WithCorrelationID(id string) *Message
-```
-
-Sets correlation ID and returns message (fluent interface).
-
-```go
+func (m *Message) WithReplyTo(replyTo string) *Message
+func (m *Message) WithHeader(key, value string) *Message
+func (m *Message) WithContentType(contentType string) *Message
+func (m *Message) WithSubject(subject string) *Message
 func (m *Message) Clone() *Message
+func (m *Message) BodyString() string
+func (m *Message) GetHeader(key string) string
 ```
-
-Creates a deep copy of the message.
 
 ### Handler
 
-Function type for processing messages:
-
 ```go
-type Handler func(ctx context.Context, body []byte) ([]byte, error)
+type Handler func(ctx context.Context, msg *Message) error
 ```
 
-The handler receives message body and returns response body (or error).
-
-**Example:**
-```go
-handler := func(ctx context.Context, body []byte) ([]byte, error) {
-    // Process message
-    result := process(body)
-    return result, nil
-}
-```
-
----
+Handlers receive the full `Message`, including metadata such as `ReplyTo`, `CorrelationID`, headers, and content type.
 
 ## Factory Functions
 
 ### New
 
 ```go
-func New(backend string, config *Config) (MessageBroker, error)
+func New(config *Config) (MessageBroker, error)
 ```
 
-Creates a new MessageBroker instance for the specified backend.
+Creates a broker using `config.Backend`.
 
-**Parameters:**
-- `backend`: Backend name ("amqp", "kafka", "kinesis", etc.)
-- `config`: Configuration struct
+### NewWithBackend
 
-**Returns:**
-- `MessageBroker`: The broker instance
-- `error`: Error if backend not found or invalid config
-
-**Example:**
 ```go
-broker, err := mqservice.New("amqp", config)
-if err != nil {
-    log.Fatal(err)
-}
-defer broker.Close()
+func NewWithBackend(backend string, config *Config) (MessageBroker, error)
 ```
+
+Creates a broker using an explicit backend name.
 
 ### Register
 
@@ -132,445 +97,203 @@ defer broker.Close()
 func Register(name string, factory BrokerFactory)
 ```
 
-Registers a backend implementation. Called by backend packages in `init()`.
+Registers a backend implementation.
 
-**Parameters:**
-- `name`: Backend identifier
-- `factory`: Function that creates broker instances
+### AvailableBackends
 
-**Example (backend implementation):**
 ```go
-func init() {
-    mqservice.Register("mybackend", NewMyBroker)
-}
+func AvailableBackends() []string
+func IsBackendAvailable(name string) bool
 ```
 
----
+Returns registered backends at runtime.
 
 ## Configuration
 
 ### Config
 
-Main configuration struct:
-
 ```go
 type Config struct {
-    Backend         string        // Backend to use
-    ConnectionName  string        // Connection identifier
-    ConnectionRetry int           // Retry attempts
-    RetryDelay      time.Duration // Delay between retries
-    
-    // Backend-specific configs
-    AMQP     *AMQPConfig
-    Kafka    *KafkaConfig
-    Kinesis  *KinesisConfig
-    ActiveMQ *ActiveMQConfig
-    NATS     *NATSConfig
-    Redis    *RedisConfig
+    Backend         string
+    ConnectionName  string
+    ConnectionRetry int
+    RetryDelay      time.Duration
+
+    Logger         EventLogger
+    EventHook      EventHook
+    Metrics        MetricsHook
+    Tracing        TracingHook
+    HealthReporter HealthReporter
+    HealthHook     HealthHook
+
+    AMQP  *AMQPConfig
+    Kafka *KafkaConfig
+
+    Host     string
+    Port     int
+    Username string
+    Password string
+    VHost    string
 }
 ```
 
-### DefaultConfig
+Notes:
+
+- `AMQP` and `Kafka` are backed by implemented transports.
+- `Logger`, `EventHook`, `Metrics`, `Tracing`, `HealthReporter`, and `HealthHook` are optional observability integrations.
+
+### Defaults
 
 ```go
 func DefaultConfig() *Config
-```
-
-Returns a Config with sensible defaults (AMQP backend).
-
-**Example:**
-```go
-config := mqservice.DefaultConfig()
-config.AMQP.Host = "rabbitmq.local"
-```
-
-### Backend-Specific Configs
-
-#### AMQPConfig
-
-```go
-type AMQPConfig struct {
-    Host            string
-    Port            int
-    Username        string
-    Password        string
-    VHost           string
-    Heartbeat       time.Duration
-    TLS             *TLSConfig
-    Exchange        string
-    ExchangeType    string
-    QueueDurable    bool
-    QueueAutoDelete bool
-    QueueExclusive  bool
-}
-```
-
-```go
 func DefaultAMQPConfig() *AMQPConfig
-```
-
-#### KafkaConfig
-
-```go
-type KafkaConfig struct {
-    Brokers           []string
-    ClientID          string
-    ConsumerGroup     string
-    TLS               *TLSConfig
-    RequiredAcks      int
-    MaxRetries        int
-    RetryBackoff      time.Duration
-    CompressionType   string
-    AutoOffsetReset   string
-    SessionTimeout    time.Duration
-    HeartbeatInterval time.Duration
-    SASL              *SASLConfig
-}
-```
-
-```go
 func DefaultKafkaConfig() *KafkaConfig
 ```
 
-See [TRANSPORTS.md](TRANSPORTS.md) for full transport configuration details.
+The default broker config targets AMQP.
 
----
+## Runtime APIs
 
-## Protocol Buffers Support
-
-### ProtobufService
-
-Wrapper that provides type-safe Protocol Buffer messaging:
+### Client
 
 ```go
-type ProtobufService struct {
-    // Private fields
-}
+func NewClient(config *Config) (*Client, error)
+func NewClientWithBroker(broker MessageBroker, config *Config) *Client
 ```
 
-#### NewProtobufService
+Implemented methods:
 
 ```go
-func NewProtobufService(broker MessageBroker, defaultWorkers int) *ProtobufService
+func (c *Client) Connect(ctx context.Context) error
+func (c *Client) Close() error
+func (c *Client) IsConnected() bool
+func (c *Client) Backend() string
+func (c *Client) Publish(ctx context.Context, destination string, msg *Message, opts ...PublishOption) error
+func (c *Client) Call(ctx context.Context, destination string, msg *Message, opts ...PublishOption) (*Message, error)
+func (c *Client) Broker() MessageBroker
+func (c *Client) Config() *Config
 ```
 
-Creates a ProtobufService with the given broker and default worker count.
+### Server
 
-**Parameters:**
-- `broker`: Underlying MessageBroker
-- `defaultWorkers`: Default number of worker threads per handler
-
-**Example:**
 ```go
-service := mqservice.NewProtobufService(broker, 10)
-defer service.Close()
+func NewServer(config *Config) (*Server, error)
+func NewServerWithBroker(broker MessageBroker, config *Config) *Server
 ```
 
-#### NewProtobufServiceWithConfig
+Implemented methods:
 
 ```go
-func NewProtobufServiceWithConfig(backend string, config *Config, defaultWorkers int) (*ProtobufService, error)
+func (s *Server) Handle(destination string, handler Handler) *Server
+func (s *Server) Start(ctx context.Context) error
+func (s *Server) Stop() error
+func (s *Server) Publish(ctx context.Context, destination string, msg *Message, opts ...PublishOption) error
+func (s *Server) Call(ctx context.Context, destination string, msg *Message, opts ...PublishOption) (*Message, error)
+func (s *Server) Broker() MessageBroker
+func (s *Server) Config() *Config
+func (s *Server) IsStarted() bool
 ```
 
-Creates broker and ProtobufService in one call.
+`Service` and the `NewService` helpers remain as deprecated aliases for backward compatibility.
 
-**Example:**
+## Options
+
+Publish and subscribe operations support functional options defined in `core/options.go`, including timeouts and transport-specific behavior such as AMQP persistence or Kafka keys.
+
+See [TRANSPORTS.md](TRANSPORTS.md) and the examples in [README.md](README.md) for concrete usage.
+
+## Production Helpers
+
+Weave now includes transport-agnostic helpers for common production patterns:
+
+### Handler retry
+
 ```go
-service, err := mqservice.NewProtobufServiceWithConfig("amqp", config, 10)
-if err != nil {
-    log.Fatal(err)
-}
-defer service.Close()
-```
-
-### RegisterHandler
-
-```go
-func RegisterHandler[Req proto.Message, Resp proto.Message](
-    ps *ProtobufService,
-    method string,
-    handler TypedHandler[Req, Resp],
-    newReq func() Req,
-    newResp func() Resp,
-    workers int,
-) error
-```
-
-Registers a typed handler for a specific method.
-
-**Type Parameters:**
-- `Req`: Request message type
-- `Resp`: Response message type
-
-**Parameters:**
-- `ps`: ProtobufService instance
-- `method`: Method name (routing key)
-- `handler`: Handler function
-- `newReq`: Factory function for request messages
-- `newResp`: Factory function for response messages
-- `workers`: Number of concurrent workers for this handler
-
-**Example:**
-```go
-handler := func(ctx context.Context, req *pb.UserRequest) (*pb.UserResponse, error) {
-    return &pb.UserResponse{
-        UserId: req.UserId,
-        Name:   "John Doe",
-    }, nil
+type RetryPolicy struct {
+    MaxAttempts int
+    Backoff     BackoffStrategy
+    Retryable   RetryPredicate
+    OnRetry     RetryHook
 }
 
-err := mqservice.RegisterHandler(
-    service,
-    "user.get",
-    handler,
-    func() *pb.UserRequest { return &pb.UserRequest{} },
-    func() *pb.UserResponse { return &pb.UserResponse{} },
-    5, // 5 workers
-)
+func DefaultRetryPolicy() RetryPolicy
+func FixedBackoff(delay time.Duration) BackoffStrategy
+func ExponentialBackoff(initialDelay, maxDelay time.Duration, multiplier float64) BackoffStrategy
+func RetryAttempt(ctx context.Context) int
+func RetryHandler(handler Handler, policy RetryPolicy) Handler
 ```
 
-### ListenAndServeProtobuf
+Use `RetryHandler(...)` for bounded in-process retries, then combine it with transport-level subscribe options such as `WithHandlerErrorNoRetry()` or `WithHandlerErrorRetry()` depending on how you want the broker to behave after the wrapper gives up.
+
+### Structured error payloads and dead-letter envelopes
 
 ```go
-func (ps *ProtobufService) ListenAndServeProtobuf(queueName string) error
-```
-
-Starts the service listening on the specified queue.
-
-**Example:**
-```go
-if err := service.ListenAndServeProtobuf("user-service"); err != nil {
-    log.Fatal(err)
-}
-```
-
-### CallProtobuf
-
-```go
-func CallProtobuf[Req proto.Message, Resp proto.Message](
-    ps *ProtobufService,
-    ctx context.Context,
-    queueName string,
-    method string,
-    reqMsg Req,
-    newResp func() Resp,
-    timeout time.Duration,
-) (Resp, error)
-```
-
-Makes a typed RPC call.
-
-**Example:**
-```go
-ctx := context.Background()
-req := &pb.UserRequest{UserId: "123"}
-
-resp, err := mqservice.CallProtobuf(
-    service,
-    ctx,
-    "user-service",
-    "user.get",
-    req,
-    func() *pb.UserResponse { return &pb.UserResponse{} },
-    5*time.Second,
-)
-if err != nil {
-    log.Fatal(err)
-}
-fmt.Println(resp.Name)
-```
-
-### TypedHandler
-
-```go
-type TypedHandler[Req proto.Message, Resp proto.Message] func(ctx context.Context, req Req) (Resp, error)
-```
-
-Generic handler function for typed protobuf messages.
-
----
-
-## Error Types
-
-### ErrNotConnected
-
-```go
-type ErrNotConnected struct {
-    Backend string
-}
-```
-
-Returned when operation is attempted before connection.
-
-### ErrConnectionLost
-
-```go
-type ErrConnectionLost struct {
-    Backend string
-    Cause   error
-}
-```
-
-Returned when connection is lost during operation.
-
-### ErrTimeout
-
-```go
-type ErrTimeout struct {
-    Operation string
-    Duration  string
-}
-```
-
-Returned when operation times out.
-
-### ErrPublishFailed
-
-```go
-type ErrPublishFailed struct {
-    Backend     string
-    Destination string
-    Cause       error
-}
-```
-
-Returned when message publish fails.
-
-### ErrSubscribeFailed
-
-```go
-type ErrSubscribeFailed struct {
-    Backend     string
-    Destination string
-    Cause       error
-}
-```
-
-Returned when subscription fails.
-
-### ErrClosed
-
-```go
-var ErrClosed = errors.New("broker already closed")
-```
-
-Returned when operation is attempted on closed broker.
-
-### ErrUnknownBackend
-
-```go
-type ErrUnknownBackend struct {
-    Backend string
-}
-```
-
-Returned when backend is not registered.
-
----
-
-## Worker Pools
-
-### WorkerPool
-
-```go
-type WorkerPool struct {
-    // Private fields
-}
-```
-
-Manages concurrent message processing.
-
-#### NewWorkerPool
-
-```go
-func NewWorkerPool(workers int) *WorkerPool
-```
-
-Creates a worker pool with the specified number of workers.
-
-#### Start
-
-```go
-func (p *WorkerPool) Start()
-```
-
-Starts the worker pool.
-
-#### Submit
-
-```go
-func (p *WorkerPool) Submit(task func()) error
-```
-
-Submits a task to the worker pool.
-
-#### Stop
-
-```go
-func (p *WorkerPool) Stop()
-```
-
-Stops the worker pool and waits for tasks to complete.
-
----
-
-## Complete Example
-
-```go
-package main
-
-import (
-    "context"
-    "fmt"
-    "log"
-    "time"
-    
-    mqservice "github.com/prabhatdotdev/weave"
-    _ "github.com/prabhatdotdev/weave/transport/amqp"
+const (
+    ErrorContentType      = "application/vnd.weave.error+json"
+    DeadLetterContentType = "application/vnd.weave.dead-letter+json"
 )
 
-func main() {
-    // Create config
-    config := mqservice.DefaultConfig()
-    config.AMQP.Host = "localhost"
-    
-    // Create broker
-    broker, err := mqservice.New("amqp", config)
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer broker.Close()
-    
-    // Connect
-    ctx := context.Background()
-    if err := broker.Connect(ctx); err != nil {
-        log.Fatal(err)
-    }
-    
-    // Subscribe
-    handler := func(ctx context.Context, body []byte) ([]byte, error) {
-        fmt.Printf("Received: %s\n", body)
-        return []byte("pong"), nil
-    }
-    
-    go broker.Subscribe(ctx, "my-queue", handler)
-    
-    // Publish
-    msg := mqservice.NewMessage([]byte("ping"))
-    if err := broker.Publish(ctx, "my-queue", msg); err != nil {
-        log.Fatal(err)
-    }
-    
-    // Call (RPC)
-    response, err := broker.Call(ctx, "my-queue", msg, 5*time.Second)
-    if err != nil {
-        log.Fatal(err)
-    }
-    fmt.Printf("Response: %s\n", response.Body)
-}
+type ErrorPayload struct { ... }
+type DeadLetterOptions struct { ... }
+type DeadLetterEnvelope struct { ... }
+
+func NewErrorPayload(code string, err error) ErrorPayload
+func EncodeErrorPayload(payload ErrorPayload) ([]byte, error)
+func DecodeErrorPayload(data []byte) (ErrorPayload, error)
+func NewErrorMessage(payload ErrorPayload) (*Message, error)
+func DecodeErrorMessage(msg *Message) (ErrorPayload, error)
+func NewDeadLetterEnvelope(msg *Message, err error, opts DeadLetterOptions) DeadLetterEnvelope
+func DecodeDeadLetterMessage(msg *Message) (DeadLetterEnvelope, error)
 ```
 
----
+These helpers provide a stable JSON envelope for RPC errors and dead-letter messages across AMQP and Kafka.
+
+### RPC retry and circuit breaking
+
+`runtime.Client` and `runtime.Server` now expose:
+
+```go
+func (c *Client) CallWithPolicy(ctx context.Context, destination string, msg *Message, policy CallPolicy, opts ...PublishOption) (*Message, error)
+func (s *Server) CallWithPolicy(ctx context.Context, destination string, msg *Message, policy CallPolicy, opts ...PublishOption) (*Message, error)
+```
+
+with:
+
+```go
+type CallPolicy struct {
+    MaxAttempts    int
+    Backoff        BackoffStrategy
+    Retryable      RetryPredicate
+    OnRetry        CallRetryHook
+    CircuitBreaker *CircuitBreaker
+}
+
+func DefaultCallPolicy() CallPolicy
+func NewCircuitBreaker(options CircuitBreakerOptions) *CircuitBreaker
+```
+
+### Health snapshots
+
+`runtime.Client` and `runtime.Server` now expose `HealthReport()` helpers, and `Config` can forward health snapshots through `HealthReporter` and `HealthHook`.
+
+## Protocol Buffers
+
+There is no dedicated `ProtobufService`, typed protobuf runtime, or worker-pool API implemented in this repository.
+
+Current protobuf support is provided through the generic codec layer:
+
+1. Use `codec.Protobuf` (or root re-exports like `weave.Protobuf`) to encode and decode protobuf payloads.
+2. Use `codec.MarshalMessage(...)` / `codec.UnmarshalMessage(...)` when working directly with `Message`.
+3. Use `Client.PublishWithCodec(...)`, `Client.CallWithCodec(...)`, `Server.PublishWithCodec(...)`, or `Server.CallWithCodec(...)` to keep protobuf encoding/decoding on the runtime path.
+4. Fall back to manual `proto.Marshal` / `proto.Unmarshal` when you need total control over wire bytes or mixed request/response handling.
+
+See [PROTOBUF.md](PROTOBUF.md) and [examples/protobuf](../examples/protobuf) for the supported pattern.
+
+## Error Handling
+
+Weave exposes typed errors in `core/errors.go`, including connection, publish, subscribe, timeout, and backend selection errors.
+
+At the root package, helper predicates are re-exported for common checks such as timeout and not-connected handling. See the source in `core/errors.go` and examples in [README.md](README.md).
 
 ## See Also
 
