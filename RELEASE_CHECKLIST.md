@@ -135,7 +135,7 @@ make vet
 
 **Verification:**
 - Search codebase for deprecated APIs and ensure docs exist
-- Review release notes draft before tagging
+- Review `CHANGELOG.md`, `COMPATIBILITY.md`, and release notes draft before tagging
 
 ## Release Process
 

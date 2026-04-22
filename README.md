@@ -49,8 +49,10 @@ A unified abstraction layer for building message-driven microservices across mes
 ## Installation
 
 ```bash
-go get github.com/prabhatdotdev/weave
+go get github.com/prabhatdotdev/weave@v0.1.0
 ```
+
+For release history and support expectations, see [CHANGELOG.md](CHANGELOG.md) and [COMPATIBILITY.md](COMPATIBILITY.md).
 
 Import the transport(s) you need:
 

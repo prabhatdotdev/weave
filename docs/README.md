@@ -17,6 +17,7 @@ Welcome to the Weave documentation!
 - **[Architecture Overview](ARCHITECTURE.md)** - System design and architecture
 - **[API Guide](API.md)** - Overview of the public API with links to pkg.go.dev
 - **[Transport Configuration](TRANSPORTS.md)** - Configure AMQP, Kafka, etc.
+- **[Transport Capability Matrix](TRANSPORT_MATRIX.md)** - Cross-transport guarantees and limitations
 
 ## Advanced Topics
 
@@ -29,6 +30,8 @@ Welcome to the Weave documentation!
 
 - **[Contributing Guide](../CONTRIBUTING.md)** - Contribution guidelines
 - **[Adding New Transport Backends](ADDING_BACKENDS.md)** - Guide for implementing and integrating new message broker backends
+- **[Changelog](../CHANGELOG.md)** - Release history and user-visible changes
+- **[Compatibility And Support](../COMPATIBILITY.md)** - Supported Go and broker baselines for the current release line
 
 ## Quick Links
 
