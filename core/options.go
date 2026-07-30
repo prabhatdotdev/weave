@@ -32,6 +32,7 @@ type SubscribeOptions struct {
 	Exclusive          bool
 	ConsumerTag        string
 	PrefetchCount      int
+	WorkerCount        int
 	QueueBind          bool
 	Exchange           string
 	RoutingKey         string
@@ -61,6 +62,12 @@ func WithConsumerTag(tag string) SubscribeOption {
 // WithPrefetchCount sets the prefetch limit.
 func WithPrefetchCount(count int) SubscribeOption {
 	return func(o *SubscribeOptions) { o.PrefetchCount = count }
+}
+
+// WithWorkerCount limits the number of handlers running concurrently.
+// A zero count keeps the transport's existing concurrency behavior.
+func WithWorkerCount(count int) SubscribeOption {
+	return func(o *SubscribeOptions) { o.WorkerCount = count }
 }
 
 // WithQueueBind configures exchange binding (AMQP-specific).

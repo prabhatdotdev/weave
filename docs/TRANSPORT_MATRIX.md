@@ -9,6 +9,7 @@ This document defines what behavior guarantees each transport backend provides.
 | **Publish/Fire-and-Forget** | ✅ | ✅ | Core feature |
 | **Request-Reply RPC** | ✅ | ✅ | Core feature |
 | **Subscriptions** | ✅ | ✅ | Core feature |
+| **Bounded Handler Concurrency** | ✅ | ✅ | `WithWorkerCount(...)` |
 | **Message Ordering** | ⚠️ Limited | ✅ Per-partition | See notes |
 | **At-Least-Once Delivery** | ✅ | ✅ | Default behavior |
 | **Exactly-Once Delivery** | ⚠️ Limited | ⚠️ Config-dependent | Application responsibility |
@@ -56,6 +57,7 @@ This document defines what behavior guarantees each transport backend provides.
 - **Multiple handlers on same destination:** ⚠️ Load-balanced across handlers
 - **Consumer groups:** ⚠️ Queue-based; all consumers read the same queue
 - **Prefetch/QoS:** ✅ Via `WithPrefetchCount()` option
+- **Worker limit:** ✅ Fixed workers per subscription via `WithWorkerCount()`
 - **Auto-acknowledge:** ✅ Via `WithAutoAck()` option
 - **Dead-letter:** ✅ Native DLX (Dead Letter Exchange)
 
@@ -102,6 +104,7 @@ This document defines what behavior guarantees each transport backend provides.
 
 - **Multiple handlers on same destination:** ✅ Via consumer groups
 - **Consumer groups:** ✅ Full support with group coordination
+- **Worker limit:** ✅ Shared across partition claims via `WithWorkerCount()`; per-partition order is preserved
 - **Prefetch/QoS:** ✅ Via `WithFetchMinBytes()`, `WithFetchMaxWaitMs()`
 - **Auto-acknowledge:** ✅ Via `WithAutoOffsetReset()`
 - **Dead-letter:** 🔲 No native DLT; implement manually or via external tools

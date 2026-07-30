@@ -47,6 +47,7 @@ type fakeAMQPChannel struct {
 	consumers       []string
 	published       []amqplib.Publishing
 	consumerStreams map[string]chan amqplib.Delivery
+	prefetch        int
 	publishErr      error
 	closeErr        error
 	closed          bool
@@ -86,7 +87,12 @@ func (c *fakeAMQPChannel) QueueBind(name, key, exchange string, noWait bool, arg
 	return nil
 }
 
-func (c *fakeAMQPChannel) Qos(int, int, bool) error { return nil }
+func (c *fakeAMQPChannel) Qos(prefetch int, _ int, _ bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.prefetch = prefetch
+	return nil
+}
 
 func (c *fakeAMQPChannel) Consume(queue, consumer string, autoAck, exclusive, noLocal, noWait bool, args amqplib.Table) (<-chan amqplib.Delivery, error) {
 	c.mu.Lock()
@@ -189,6 +195,85 @@ func TestBrokerLifecycleAndDisconnectedOperations(t *testing.T) {
 	}
 	if err := broker.Connect(context.Background()); !errors.Is(err, core.ErrClosed) {
 		t.Fatalf("Connect() after Close() error = %v, want ErrClosed", err)
+	}
+}
+
+func TestSubscribeWorkerPoolLimitsConcurrency(t *testing.T) {
+	channel := newFakeAMQPChannel()
+	conn := &fakeAMQPConnection{channel: channel}
+	brokerAny, err := NewBroker(core.DefaultConfig())
+	if err != nil {
+		t.Fatalf("NewBroker() error = %v", err)
+	}
+	broker := brokerAny.(*Broker)
+	broker.dial = func(string, amqplib.Config) (amqpConnection, error) { return conn, nil }
+	if err := broker.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	defer broker.Close()
+
+	started := make(chan struct{}, 3)
+	release := make(chan struct{})
+	handler := func(context.Context, *core.Message) error {
+		started <- struct{}{}
+		<-release
+		return nil
+	}
+	if err := broker.Subscribe(context.Background(), "orders", handler, core.WithAutoAck(), core.WithWorkerCount(2)); err != nil {
+		t.Fatalf("Subscribe() error = %v", err)
+	}
+
+	channel.mu.Lock()
+	stream := channel.consumerStreams["orders"]
+	prefetch := channel.prefetch
+	channel.mu.Unlock()
+	if prefetch != 2 {
+		t.Fatalf("prefetch = %d, want worker count 2", prefetch)
+	}
+
+	sent := make(chan struct{})
+	go func() {
+		for range 3 {
+			stream <- amqplib.Delivery{}
+		}
+		close(sent)
+	}()
+
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("configured workers did not start")
+		}
+	}
+	select {
+	case <-started:
+		t.Fatal("third handler started before a worker was available")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case <-started:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("third handler did not start after a worker became available")
+	}
+	select {
+	case <-sent:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("delivery sender did not finish")
+	}
+}
+
+func TestSubscribeRejectsNegativeWorkerCount(t *testing.T) {
+	brokerAny, err := NewBroker(core.DefaultConfig())
+	if err != nil {
+		t.Fatalf("NewBroker() error = %v", err)
+	}
+
+	err = brokerAny.Subscribe(context.Background(), "orders", func(context.Context, *core.Message) error { return nil }, core.WithWorkerCount(-1))
+	if !errors.Is(err, core.ErrInvalidConfig) {
+		t.Fatalf("Subscribe() error = %v, want ErrInvalidConfig", err)
 	}
 }
 

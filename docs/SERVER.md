@@ -168,6 +168,19 @@ server.Handle("orders", func(ctx context.Context, msg *weave.Message) error {
 })
 ```
 
+### Bounded Concurrency
+
+Use `WithWorkerCount` to cap concurrent handler calls for a destination:
+
+```go
+server.Handle("orders", orderHandler, weave.WithWorkerCount(8))
+```
+
+The limit is per subscription. AMQP runs that many workers and uses the count
+as the default prefetch when no prefetch is provided. Kafka preserves ordering
+within each partition, so its actual parallelism cannot exceed the assigned
+partition count. Omitting the option preserves the existing transport behavior.
+
 ### Multiple Handlers
 
 Register handlers for different destinations:
