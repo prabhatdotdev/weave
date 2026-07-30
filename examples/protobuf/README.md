@@ -2,6 +2,9 @@
 
 This example demonstrates a complete microservices architecture using Weave with Protocol Buffers serialization.
 
+For broker setup, repository-wide example selection, validation, cleanup, and
+troubleshooting, see the [complete examples guide](../README.md).
+
 ## Architecture
 
 ```
@@ -37,11 +40,12 @@ This example demonstrates a complete microservices architecture using Weave with
 
 ### Prerequisites
 - RabbitMQ running locally (or via Docker)
-- Go 1.21+
-- Protocol Buffers compiler (`protoc`)
-- Go protobuf plugins
+- Go 1.24+
 
-### Install Protocol Buffers Tools
+Generated Go code is committed. The Protocol Buffers compiler (`protoc`) and Go
+plugin are needed only when changing and regenerating `proto/services.proto`.
+
+### Optional: Install Protocol Buffers Tools
 
 ```bash
 # Install protoc (macOS)
@@ -61,29 +65,36 @@ protoc --go_out=. --go_opt=paths=source_relative proto/services.proto
 
 ### Start RabbitMQ
 
+From the repository root:
+
 ```bash
-# Using Docker
-docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management
+docker compose up -d --wait rabbitmq
 ```
 
 ### Run the Services
 
 **Terminal 1 - Start Profile Service (start this first):**
 ```bash
-cd examples/protobuf/profile-service
-go run main.go
+go run ./examples/protobuf/profile-service
 ```
 
 **Terminal 2 - Start User Service:**
 ```bash
-cd examples/protobuf/user-service
-go run main.go
+go run ./examples/protobuf/user-service
 ```
 
 **Terminal 3 - Run API Client:**
 ```bash
-cd examples/protobuf/client
-go run main.go
+go run ./examples/protobuf/client
+```
+
+Run all three commands from the repository root. Keep the first two terminals
+running until the client finishes, then stop both services with `Ctrl+C`.
+
+Stop RabbitMQ:
+
+```bash
+docker compose stop rabbitmq
 ```
 
 ## Message Flow

@@ -351,6 +351,13 @@ func (b *Broker) Publish(ctx context.Context, destination string, msg *core.Mess
 		})
 	}
 
+	if msg.ContentType != "" {
+		kafkaMsg.Headers = append(kafkaMsg.Headers, sarama.RecordHeader{
+			Key:   []byte("content-type"),
+			Value: []byte(msg.ContentType),
+		})
+	}
+
 	producer := b.currentProducer()
 	if producer == nil {
 		return &core.ErrNotConnected{Backend: backendName}
@@ -943,6 +950,8 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 					msg.CorrelationID = value
 				case "reply-to":
 					msg.ReplyTo = value
+				case "content-type":
+					msg.ContentType = value
 				default:
 					msg.Headers[key] = value
 				}

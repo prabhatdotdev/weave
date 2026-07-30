@@ -510,6 +510,15 @@ make rabbitmq-start
 make kafka-start
 ```
 
+## Runnable Examples
+
+- [Complete examples guide](examples/README.md) — prerequisites, selection guide,
+  exact run commands, configuration, validation, cleanup, and troubleshooting
+- [AMQP + Kafka](examples/amqp-kafka/README.md) — separate server and client
+  processes for JSON publish, RPC, retry, timeout, and transport-specific options
+- [JSON microservices](examples/json/README.md)
+- [Protocol Buffers microservices](examples/protobuf/README.md)
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.

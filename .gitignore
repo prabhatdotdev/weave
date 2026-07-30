@@ -2,6 +2,8 @@
 /bin/
 /build/
 /dist/
+/.gocache/
+/examples/amqp-kafka/amqp-kafka
 *.exe
 *.exe~
 *.dll

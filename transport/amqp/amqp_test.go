@@ -325,8 +325,9 @@ func TestCallReturnsConnectionLostWhenBrokerDisconnects(t *testing.T) {
 	waitForNotifyClose(t, conn)
 
 	errCh := make(chan error, 1)
+	request := core.NewTextMessage("payload").WithHeader("example-kind", "rpc")
 	go func() {
-		_, err := broker.Call(context.Background(), "orders", core.NewTextMessage("payload"), core.WithTimeout(2*time.Second))
+		_, err := broker.Call(context.Background(), "orders", request, core.WithTimeout(2*time.Second))
 		errCh <- err
 	}()
 
@@ -345,6 +346,13 @@ func TestCallReturnsConnectionLostWhenBrokerDisconnects(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
+
+	channel.mu.Lock()
+	if len(channel.published) != 1 || channel.published[0].Headers["example-kind"] != "rpc" {
+		channel.mu.Unlock()
+		t.Fatal("Call() did not preserve request headers")
+	}
+	channel.mu.Unlock()
 
 	conn.notifyCloseCh() <- &amqplib.Error{Code: 320, Reason: "connection reset"}
 
