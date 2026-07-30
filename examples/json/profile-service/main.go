@@ -12,6 +12,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -134,15 +135,18 @@ func main() {
 func handleGetProfile(ctx context.Context, msg *weave.Message) error {
 	log.Printf("[profiles.get] Received request: %s", string(msg.Body))
 
-	// Parse request
 	var req GetProfileRequest
-	if err := json.Unmarshal(msg.Body, &req); err != nil {
+	requiredErr := errors.New("user_id is required")
+	if err := weave.UnmarshalAndValidate(weave.JSON, msg, &req, func(req *GetProfileRequest) error {
+		if req.UserID == "" {
+			return requiredErr
+		}
+		return nil
+	}); err != nil {
+		if errors.Is(err, requiredErr) {
+			return sendResponse(ctx, msg, GetProfileResponse{Error: requiredErr.Error()})
+		}
 		return sendResponse(ctx, msg, GetProfileResponse{Error: "invalid request format"})
-	}
-
-	// Validate
-	if req.UserID == "" {
-		return sendResponse(ctx, msg, GetProfileResponse{Error: "user_id is required"})
 	}
 
 	// Look up profile

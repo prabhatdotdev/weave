@@ -73,6 +73,36 @@ type Handler func(ctx context.Context, msg *Message) error
 
 Handlers receive the full `Message`, including metadata such as `ReplyTo`, `CorrelationID`, headers, and content type.
 
+## Payload Validation
+
+`UnmarshalAndValidate` decodes with any configured codec, then runs an
+application-owned typed validator:
+
+```go
+var order Order
+err := weave.UnmarshalAndValidate(weave.JSON, msg, &order, func(order *Order) error {
+    if order.ID == "" {
+        return errors.New("missing order id")
+    }
+    return nil
+})
+```
+
+The same helper works with generated protobuf messages:
+
+```go
+var request pb.GetUserRequest
+err := weave.UnmarshalAndValidate(weave.Protobuf, msg, &request, func(request *pb.GetUserRequest) error {
+    if request.Id == "" {
+        return errors.New("missing user id")
+    }
+    return nil
+})
+```
+
+Decode errors are returned unchanged. Validation errors include codec context
+and wrap the validator error for use with `errors.Is` and `errors.As`.
+
 ## Factory Functions
 
 ### New

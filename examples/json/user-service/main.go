@@ -13,6 +13,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -156,15 +157,18 @@ func main() {
 func handleGetUser(ctx context.Context, msg *weave.Message) error {
 	log.Printf("[users.get] Received request: %s", string(msg.Body))
 
-	// Parse request
 	var req GetUserRequest
-	if err := json.Unmarshal(msg.Body, &req); err != nil {
+	requiredErr := errors.New("id is required")
+	if err := weave.UnmarshalAndValidate(weave.JSON, msg, &req, func(req *GetUserRequest) error {
+		if req.ID == "" {
+			return requiredErr
+		}
+		return nil
+	}); err != nil {
+		if errors.Is(err, requiredErr) {
+			return sendResponse(ctx, msg, GetUserResponse{Error: requiredErr.Error()})
+		}
 		return sendResponse(ctx, msg, GetUserResponse{Error: "invalid request format"})
-	}
-
-	// Validate
-	if req.ID == "" {
-		return sendResponse(ctx, msg, GetUserResponse{Error: "id is required"})
 	}
 
 	// Look up user

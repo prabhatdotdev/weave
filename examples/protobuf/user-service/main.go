@@ -12,6 +12,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -99,12 +100,17 @@ func handleGetUser(ctx context.Context, msg *weave.Message) error {
 	log.Printf("[users.get] Received request (%d bytes)", len(msg.Body))
 
 	var req pb.GetUserRequest
-	if err := proto.Unmarshal(msg.Body, &req); err != nil {
+	requiredErr := errors.New("id is required")
+	if err := weave.UnmarshalAndValidate(weave.Protobuf, msg, &req, func(req *pb.GetUserRequest) error {
+		if req.Id == "" {
+			return requiredErr
+		}
+		return nil
+	}); err != nil {
+		if errors.Is(err, requiredErr) {
+			return sendResponse(ctx, msg, &pb.GetUserResponse{Error: requiredErr.Error()})
+		}
 		return sendResponse(ctx, msg, &pb.GetUserResponse{Error: "invalid request format"})
-	}
-
-	if req.Id == "" {
-		return sendResponse(ctx, msg, &pb.GetUserResponse{Error: "id is required"})
 	}
 
 	user, exists := users[req.Id]

@@ -11,6 +11,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -102,12 +103,17 @@ func handleGetProfile(ctx context.Context, msg *weave.Message) error {
 	log.Printf("[profiles.get] Received request (%d bytes)", len(msg.Body))
 
 	var req pb.GetProfileRequest
-	if err := proto.Unmarshal(msg.Body, &req); err != nil {
+	requiredErr := errors.New("user_id is required")
+	if err := weave.UnmarshalAndValidate(weave.Protobuf, msg, &req, func(req *pb.GetProfileRequest) error {
+		if req.UserId == "" {
+			return requiredErr
+		}
+		return nil
+	}); err != nil {
+		if errors.Is(err, requiredErr) {
+			return sendResponse(ctx, msg, &pb.GetProfileResponse{Error: requiredErr.Error()})
+		}
 		return sendResponse(ctx, msg, &pb.GetProfileResponse{Error: "invalid request format"})
-	}
-
-	if req.UserId == "" {
-		return sendResponse(ctx, msg, &pb.GetProfileResponse{Error: "user_id is required"})
 	}
 
 	profile, exists := profiles[req.UserId]
