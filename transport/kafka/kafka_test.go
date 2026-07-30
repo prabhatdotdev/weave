@@ -88,6 +88,7 @@ func (g *fakeConsumerGroup) PauseAll()                 {}
 func (g *fakeConsumerGroup) ResumeAll()                {}
 
 type fakeSession struct {
+	mu     sync.Mutex
 	marked []*sarama.ConsumerMessage
 }
 
@@ -98,6 +99,8 @@ func (s *fakeSession) MarkOffset(string, int32, int64, string)  {}
 func (s *fakeSession) Commit()                                  {}
 func (s *fakeSession) ResetOffset(string, int32, int64, string) {}
 func (s *fakeSession) MarkMessage(msg *sarama.ConsumerMessage, metadata string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.marked = append(s.marked, msg)
 }
 func (s *fakeSession) Context() context.Context { return context.Background() }
@@ -238,6 +241,22 @@ func TestSubscribeRequiresConsumerGroup(t *testing.T) {
 	var subscribeErr *core.ErrSubscribeFailed
 	if !errors.As(err, &subscribeErr) {
 		t.Fatalf("Subscribe() error = %v, want ErrSubscribeFailed", err)
+	}
+}
+
+func TestSubscribeRejectsNegativeWorkerCount(t *testing.T) {
+	t.Parallel()
+
+	broker := &Broker{
+		config:      &core.Config{},
+		kafkaConfig: core.DefaultKafkaConfig(),
+		pending:     make(map[string]chan *core.Message),
+		closeChan:   make(chan struct{}),
+	}
+
+	err := broker.Subscribe(context.Background(), "users", func(context.Context, *core.Message) error { return nil }, core.WithWorkerCount(-1))
+	if !errors.Is(err, core.ErrInvalidConfig) {
+		t.Fatalf("Subscribe() error = %v, want ErrInvalidConfig", err)
 	}
 }
 
@@ -448,6 +467,68 @@ func TestConsumerGroupHandlerRoutesResponsesAndInvokesHandlers(t *testing.T) {
 			t.Fatalf("marked messages = %d, want 0", len(session.marked))
 		}
 	})
+}
+
+func TestConsumerGroupHandlerWorkerPoolLimitsClaims(t *testing.T) {
+	started := make(chan struct{}, 3)
+	release := make(chan struct{})
+	handler := &consumerGroupHandler{
+		handler: func(context.Context, *core.Message) error {
+			started <- struct{}{}
+			<-release
+			return nil
+		},
+		closeChan: make(chan struct{}),
+		workers:   make(chan struct{}, 2),
+		pending:   make(map[string]chan *core.Message),
+		pendingMu: &sync.RWMutex{},
+	}
+
+	session := &fakeSession{}
+	var wg sync.WaitGroup
+	for partition := range 3 {
+		claim := &fakeClaim{messages: make(chan *sarama.ConsumerMessage, 1)}
+		claim.messages <- &sarama.ConsumerMessage{Topic: "users", Partition: int32(partition)}
+		close(claim.messages)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := handler.ConsumeClaim(session, claim); err != nil {
+				t.Errorf("ConsumeClaim() error = %v", err)
+			}
+		}()
+	}
+
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("configured workers did not start")
+		}
+	}
+	select {
+	case <-started:
+		t.Fatal("third claim started before a worker was available")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case <-started:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("third claim did not start after a worker became available")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("claims did not finish")
+	}
 }
 
 func TestPublishReconnectsWhenDisconnected(t *testing.T) {

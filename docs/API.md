@@ -184,7 +184,7 @@ func NewServerWithBroker(broker MessageBroker, config *Config) *Server
 Implemented methods:
 
 ```go
-func (s *Server) Handle(destination string, handler Handler) *Server
+func (s *Server) Handle(destination string, handler Handler, opts ...SubscribeOption) *Server
 func (s *Server) Start(ctx context.Context) error
 func (s *Server) Stop() error
 func (s *Server) Publish(ctx context.Context, destination string, msg *Message, opts ...PublishOption) error
@@ -198,7 +198,7 @@ func (s *Server) IsStarted() bool
 
 ## Options
 
-Publish and subscribe operations support functional options defined in `core/options.go`, including timeouts and transport-specific behavior such as AMQP persistence or Kafka keys.
+Publish and subscribe operations support functional options defined in `core/options.go`, including timeouts and transport-specific behavior such as AMQP persistence or Kafka keys. `WithWorkerCount(n)` caps concurrent handler execution for one subscription; zero preserves the transport default and negative values are rejected.
 
 See [TRANSPORTS.md](TRANSPORTS.md) and the examples in [README.md](README.md) for concrete usage.
 

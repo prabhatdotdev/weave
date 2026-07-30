@@ -424,6 +424,9 @@ var (
 	// WithPrefetchCount sets the prefetch limit.
 	WithPrefetchCount = core.WithPrefetchCount
 
+	// WithWorkerCount limits concurrent handler execution per subscription.
+	WithWorkerCount = core.WithWorkerCount
+
 	// WithQueueBind configures exchange binding (AMQP).
 	WithQueueBind = core.WithQueueBind
 

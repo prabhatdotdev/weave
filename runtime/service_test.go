@@ -37,6 +37,7 @@ func (b *startFailBroker) Subscribe(context.Context, string, core.Handler, ...co
 type subscribeFailBroker struct {
 	subscribeErr error
 	connected    bool
+	options      *core.SubscribeOptions
 }
 
 func (b *subscribeFailBroker) Connect(context.Context) error {
@@ -56,7 +57,8 @@ func (b *subscribeFailBroker) Publish(context.Context, string, *core.Message, ..
 func (b *subscribeFailBroker) Call(context.Context, string, *core.Message, ...core.PublishOption) (*core.Message, error) {
 	return core.NewTextMessage("ok"), nil
 }
-func (b *subscribeFailBroker) Subscribe(context.Context, string, core.Handler, ...core.SubscribeOption) error {
+func (b *subscribeFailBroker) Subscribe(_ context.Context, _ string, _ core.Handler, opts ...core.SubscribeOption) error {
+	b.options = core.ApplySubscribeOptions(opts...)
 	return b.subscribeErr
 }
 
@@ -134,6 +136,21 @@ func TestServerStartSubscribesHandlersAndDelegatesMessaging(t *testing.T) {
 	}
 	if err := server.Stop(); err != nil {
 		t.Fatalf("second Stop() error = %v, want nil", err)
+	}
+}
+
+func TestServerHandlePassesSubscriptionOptions(t *testing.T) {
+	t.Parallel()
+
+	broker := &subscribeFailBroker{}
+	server := NewServerWithBroker(broker, core.DefaultConfig())
+	server.Handle("orders", func(context.Context, *core.Message) error { return nil }, core.WithWorkerCount(3))
+
+	if err := server.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if broker.options == nil || broker.options.WorkerCount != 3 {
+		t.Fatalf("worker count = %#v, want 3", broker.options)
 	}
 }
 

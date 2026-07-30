@@ -70,13 +70,18 @@ import (
 type Server struct {
 	broker   core.MessageBroker
 	config   *core.Config
-	handlers map[string]core.Handler
+	handlers map[string]handlerRegistration
 
 	mu        sync.RWMutex
 	started   bool
 	ctx       context.Context
 	cancel    context.CancelFunc
 	closeOnce sync.Once
+}
+
+type handlerRegistration struct {
+	handler core.Handler
+	opts    []core.SubscribeOption
 }
 
 // NewServer creates a new Server with the given broker configuration.
@@ -96,7 +101,7 @@ func NewServerWithBroker(broker core.MessageBroker, config *core.Config) *Server
 	return &Server{
 		broker:   broker,
 		config:   config,
-		handlers: make(map[string]core.Handler),
+		handlers: make(map[string]handlerRegistration),
 		ctx:      ctx,
 		cancel:   cancel,
 	}
@@ -105,10 +110,13 @@ func NewServerWithBroker(broker core.MessageBroker, config *core.Config) *Server
 // Handle registers a handler for a destination (queue/topic).
 // Multiple handlers can be registered for different destinations.
 // Returns the server for method chaining.
-func (s *Server) Handle(destination string, handler core.Handler) *Server {
+func (s *Server) Handle(destination string, handler core.Handler, opts ...core.SubscribeOption) *Server {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.handlers[destination] = handler
+	s.handlers[destination] = handlerRegistration{
+		handler: handler,
+		opts:    append([]core.SubscribeOption(nil), opts...),
+	}
 	return s
 }
 
@@ -140,8 +148,9 @@ func (s *Server) Start(ctx context.Context) (err error) {
 		err = fmt.Errorf("server already started")
 		return err
 	}
-	handlers := make(map[string]core.Handler, len(s.handlers))
+	handlers := make(map[string]handlerRegistration, len(s.handlers))
 	for k, v := range s.handlers {
+		v.opts = append([]core.SubscribeOption(nil), v.opts...)
 		handlers[k] = v
 	}
 	s.mu.Unlock()
@@ -180,8 +189,8 @@ func (s *Server) Start(ctx context.Context) (err error) {
 		}
 	}
 
-	for dest, handler := range handlers {
-		if err = s.broker.Subscribe(ctx, dest, handler); err != nil {
+	for dest, registration := range handlers {
+		if err = s.broker.Subscribe(ctx, dest, registration.handler, registration.opts...); err != nil {
 			if s.config != nil {
 				s.config.EmitEvent(ctx, core.Event{
 					Level:       core.EventLevelError,

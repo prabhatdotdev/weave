@@ -390,6 +390,11 @@ func (b *Broker) Subscribe(ctx context.Context, destination string, handler core
 }
 
 func (b *Broker) subscribe(ctx context.Context, destination string, handler core.Handler, track bool, opts ...core.SubscribeOption) error {
+	options := core.ApplySubscribeOptions(opts...)
+	if options.WorkerCount < 0 {
+		return fmt.Errorf("%w: worker count must not be negative", core.ErrInvalidConfig)
+	}
+
 	if err := b.ensureConnected(); err != nil {
 		return err
 	}
@@ -399,7 +404,7 @@ func (b *Broker) subscribe(ctx context.Context, destination string, handler core
 		reg = b.registerSubscription(ctx, destination, handler, opts)
 	}
 
-	if err := b.startSubscriptionConsumer(ctx, destination, handler, opts, reg.id); err != nil {
+	if err := b.startSubscriptionConsumer(ctx, destination, handler, options, reg.id); err != nil {
 		if track {
 			b.unregisterSubscription(reg.id)
 		}
@@ -409,7 +414,7 @@ func (b *Broker) subscribe(ctx context.Context, destination string, handler core
 	return nil
 }
 
-func (b *Broker) startSubscriptionConsumer(ctx context.Context, destination string, handler core.Handler, opts []core.SubscribeOption, subID uint64) error {
+func (b *Broker) startSubscriptionConsumer(ctx context.Context, destination string, handler core.Handler, options *core.SubscribeOptions, subID uint64) error {
 	if err := b.ensureConnected(); err != nil {
 		return err
 	}
@@ -417,8 +422,6 @@ func (b *Broker) startSubscriptionConsumer(ctx context.Context, destination stri
 	if subID != 0 && !b.startRunner(subID) {
 		return nil
 	}
-
-	options := core.ApplySubscribeOptions(opts...)
 
 	consumerGroup := options.ConsumerGroup
 	if consumerGroup == "" {
@@ -449,6 +452,9 @@ func (b *Broker) startSubscriptionConsumer(ctx context.Context, destination stri
 		pendingMu: &b.pendingMu,
 		config:    b.config,
 		policy:    options.HandlerErrorPolicy,
+	}
+	if options.WorkerCount > 0 {
+		cgHandler.workers = make(chan struct{}, options.WorkerCount)
 	}
 
 	go func() {
@@ -755,7 +761,8 @@ func (b *Broker) restoreTrackedSubscriptions() {
 		if sub.ctx.Err() != nil {
 			continue
 		}
-		err := b.startSubscriptionConsumer(sub.ctx, sub.destination, sub.handler, sub.opts, sub.id)
+		options := core.ApplySubscribeOptions(sub.opts...)
+		err := b.startSubscriptionConsumer(sub.ctx, sub.destination, sub.handler, options, sub.id)
 		if err != nil {
 			b.emitEvent(context.Background(), core.Event{
 				Level:       core.EventLevelError,
@@ -889,6 +896,7 @@ func (b *Broker) watchConsumerErrors(ctx context.Context, destination string, co
 type consumerGroupHandler struct {
 	handler   core.Handler
 	closeChan chan struct{}
+	workers   chan struct{}
 	pending   map[string]chan *core.Message
 	pendingMu *sync.RWMutex
 	config    *core.Config
@@ -968,7 +976,21 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 				}
 			}
 
-			err := h.handler(ctx, msg)
+			if h.workers != nil {
+				select {
+				case h.workers <- struct{}{}:
+				case <-h.closeChan:
+					return nil
+				case <-session.Context().Done():
+					return nil
+				}
+			}
+			err := func() error {
+				if h.workers != nil {
+					defer func() { <-h.workers }()
+				}
+				return h.handler(ctx, msg)
+			}()
 			if err != nil {
 				h.emitSubscribeFailure(kafkaMsg.Topic, err)
 				if h.policy == core.HandlerErrorRetry {

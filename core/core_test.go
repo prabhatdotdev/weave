@@ -163,19 +163,20 @@ func TestApplySubscribeOptions(t *testing.T) {
 		WithExclusive(),
 		WithConsumerTag("consumer-1"),
 		WithPrefetchCount(10),
+		WithWorkerCount(4),
 		WithQueueBind("events", "users.*"),
 		WithConsumerGroup("workers"),
 		WithStartFromBeginning(),
 		WithHandlerErrorRetry(),
 	)
 
-	if !options.AutoAck || !options.Exclusive || options.ConsumerTag != "consumer-1" || options.PrefetchCount != 10 || !options.QueueBind || options.Exchange != "events" || options.RoutingKey != "users.*" || options.ConsumerGroup != "workers" || !options.StartFromBeginning || options.HandlerErrorPolicy != HandlerErrorRetry {
+	if !options.AutoAck || !options.Exclusive || options.ConsumerTag != "consumer-1" || options.PrefetchCount != 10 || options.WorkerCount != 4 || !options.QueueBind || options.Exchange != "events" || options.RoutingKey != "users.*" || options.ConsumerGroup != "workers" || !options.StartFromBeginning || options.HandlerErrorPolicy != HandlerErrorRetry {
 		t.Fatalf("unexpected subscribe options: %#v", options)
 	}
 
 	defaultOptions := ApplySubscribeOptions()
-	if defaultOptions.HandlerErrorPolicy != HandlerErrorNoRetry {
-		t.Fatalf("default HandlerErrorPolicy = %q, want %q", defaultOptions.HandlerErrorPolicy, HandlerErrorNoRetry)
+	if defaultOptions.HandlerErrorPolicy != HandlerErrorNoRetry || defaultOptions.WorkerCount != 0 {
+		t.Fatalf("unexpected default subscribe options: %#v", defaultOptions)
 	}
 }
 

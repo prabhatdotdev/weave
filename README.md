@@ -20,7 +20,7 @@ A unified abstraction layer for building message-driven microservices across mes
 | Connection recovery & reconnect | ✅ Stable | Recovery paths are covered by automated reconnect tests; semantics differ by backend |
 | Protobuf integration | ✅ Stable | Built-in protobuf codec and codec-aware helpers; no typed APIs |
 | Dead-letter handling | ✅ Stable | Standard dead-letter envelope helpers are implemented; broker-native routing remains backend-specific |
-| Worker pool abstractions | 📋 Planned | Future enhancement |
+| Worker pool abstractions | ✅ Stable | Opt-in per-subscription concurrency limits for AMQP and Kafka |
 | Schema validation helpers | 📋 Planned | Future enhancement |
 | Tracing integration | ✅ Stable | Hook-based span integration with adapter examples |
 | Health check endpoints | 📋 Planned | Future enhancement |
@@ -147,7 +147,7 @@ func main() {
     server.Handle("orders", func(ctx context.Context, msg *weave.Message) error {
         fmt.Printf("Processing order: %s\n", string(msg.Body))
         return nil
-    })
+    }, weave.WithWorkerCount(4))
     
     server.Handle("users.get", func(ctx context.Context, msg *weave.Message) error {
         fmt.Printf("User request: %s\n", string(msg.Body))

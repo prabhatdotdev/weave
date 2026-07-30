@@ -18,12 +18,12 @@ Supported pattern:
 
 - multiple handlers on different destinations
 - a single `Server` instance subscribing to all registered destinations when `Start()` is called
+- per-handler concurrency limits through `WithWorkerCount`
 
 Not implemented as a built-in feature:
 
 - typed handler registry APIs such as `RegisterHandler`
 - one-queue method dispatch runtime such as `ProtobufService`
-- per-handler worker-pool configuration in the library API
 
 ## Recommended Pattern
 
@@ -44,6 +44,19 @@ if err := server.Start(context.Background()); err != nil {
 ```
 
 This is the pattern used by the current examples and runtime implementation.
+
+## Worker Limits
+
+Configure bounded concurrency independently for each destination:
+
+```go
+server.Handle("users.get", handleGetUser, weave.WithWorkerCount(4))
+server.Handle("users.created", handleUserCreated, weave.WithWorkerCount(1))
+```
+
+AMQP uses fixed workers. Kafka shares the limit across assigned partition
+claims while keeping each partition serial. A zero or omitted count retains
+the transport's default behavior.
 
 ## If You Need One Destination With Manual Dispatch
 
@@ -91,7 +104,7 @@ Cons:
 
 - routing is your responsibility
 - validation and error handling are application-level concerns
-- the library does not manage per-method concurrency or worker pools for you
+- worker limits apply to the registered destination, not individual methods inside a manual dispatcher
 
 ## Protobuf Note
 

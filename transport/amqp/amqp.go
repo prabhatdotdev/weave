@@ -627,12 +627,15 @@ func (b *Broker) Subscribe(ctx context.Context, destination string, handler core
 }
 
 func (b *Broker) subscribe(ctx context.Context, destination string, handler core.Handler, track bool, allowRecovering bool, opts ...core.SubscribeOption) error {
+	options := core.ApplySubscribeOptions(opts...)
+	if options.WorkerCount < 0 {
+		return fmt.Errorf("%w: worker count must not be negative", core.ErrInvalidConfig)
+	}
+
 	channel, err := b.currentChannel(allowRecovering)
 	if err != nil {
 		return err
 	}
-
-	options := core.ApplySubscribeOptions(opts...)
 
 	q, err := channel.QueueDeclare(
 		destination,
@@ -675,6 +678,9 @@ func (b *Broker) subscribe(ctx context.Context, destination string, handler core
 	prefetch := options.PrefetchCount
 	if prefetch == 0 {
 		prefetch = 1
+		if options.WorkerCount > 0 {
+			prefetch = options.WorkerCount
+		}
 	}
 	if err := channel.Qos(prefetch, 0, false); err != nil {
 		b.emitEvent(ctx, core.Event{
@@ -707,7 +713,7 @@ func (b *Broker) subscribe(ctx context.Context, destination string, handler core
 		b.subsMu.Unlock()
 	}
 
-	go func() {
+	consume := func(concurrent bool) {
 		for {
 			select {
 			case <-b.closeChan:
@@ -718,10 +724,25 @@ func (b *Broker) subscribe(ctx context.Context, destination string, handler core
 				if !ok {
 					return
 				}
-				go b.handleMessage(ctx, msg, handler, options.AutoAck, options.HandlerErrorPolicy)
+				if ctx.Err() != nil {
+					return
+				}
+				if concurrent {
+					go b.handleMessage(ctx, msg, handler, options.AutoAck, options.HandlerErrorPolicy)
+				} else {
+					b.handleMessage(ctx, msg, handler, options.AutoAck, options.HandlerErrorPolicy)
+				}
 			}
 		}
-	}()
+	}
+
+	if options.WorkerCount == 0 {
+		go consume(true)
+	} else {
+		for range options.WorkerCount {
+			go consume(false)
+		}
+	}
 
 	return nil
 }
