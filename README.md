@@ -45,6 +45,31 @@ A unified abstraction layer for building message-driven microservices across mes
 - 🧰 **Extensible** - Registry-based transport design for adding future backends
 - 🔍 **Observability** - Structured logging, metrics, and tracing hooks
 
+## Local AMQP RPC Benchmark
+
+Measured on 2026-07-30 with the [load-test example](examples/load-test):
+
+- MacBook Air, Apple M4 (10 cores), 24 GB RAM, macOS 26.5.2
+- Go 1.25.5, RabbitMQ 4.3.4 in Docker 29.6.2
+- One shared client, 256 server workers, 1 KiB echo payload, 5-second request timeout
+- 5-second warm-up followed by a 30-second measurement at each concurrency level
+
+| Concurrency | Requests | RPS | p95 | p99 |
+|------------:|---------:|----:|----:|----:|
+| 1 | 28,143 | 938.05 | 1.65 ms | 2.34 ms |
+| 2 | 46,435 | 1,547.81 | 1.98 ms | 2.74 ms |
+| 4 | 78,699 | 2,623.20 | 2.37 ms | 3.23 ms |
+| 8 | 127,852 | 4,261.51 | 2.90 ms | 4.01 ms |
+| 16 | 216,103 | 7,203.24 | 3.52 ms | 4.72 ms |
+| 32 | 307,713 | 10,256.37 | 4.81 ms | 6.40 ms |
+| 64 | 392,027 | 13,066.58 | 7.79 ms | 9.94 ms |
+| 128 | 413,399 | 13,778.13 | 15.80 ms | 23.09 ms |
+| 256 | 459,379 | **15,307.82** | **26.88 ms** | **34.68 ms** |
+
+All 2,069,750 measured requests succeeded with zero failures. Concurrency 256
+is the tested ceiling, not an absolute system maximum. These local echo results
+exclude production network latency and application work such as database calls.
+
 ## Installation
 
 ```bash
