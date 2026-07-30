@@ -17,7 +17,6 @@ package core
 import (
 	"errors"
 	"fmt"
-	"strings"
 )
 
 // ErrNotConnected is returned when an operation is attempted on a disconnected broker.
@@ -67,19 +66,6 @@ func (e *ErrCircuitOpen) Error() string {
 		return fmt.Sprintf("operation %s blocked by open circuit breaker; retry after %s", e.Operation, e.RetryAfter)
 	}
 	return fmt.Sprintf("operation %s blocked by open circuit breaker", e.Operation)
-}
-
-// ErrUnknownBackend is returned when an unknown backend is requested.
-type ErrUnknownBackend struct {
-	Backend string
-}
-
-func (e *ErrUnknownBackend) Error() string {
-	available := AvailableBackends()
-	if len(available) == 0 {
-		return fmt.Sprintf("unknown backend: %s (no backends registered)", e.Backend)
-	}
-	return fmt.Sprintf("unknown backend: %s (available: %s)", e.Backend, strings.Join(available, ", "))
 }
 
 // ErrPublishFailed is returned when message publishing fails.
@@ -169,12 +155,6 @@ func IsTimeout(err error) bool {
 // IsCircuitOpen returns true if the error indicates an open circuit breaker.
 func IsCircuitOpen(err error) bool {
 	var e *ErrCircuitOpen
-	return errors.As(err, &e)
-}
-
-// IsUnknownBackend returns true if the error indicates an unknown backend.
-func IsUnknownBackend(err error) bool {
-	var e *ErrUnknownBackend
 	return errors.As(err, &e)
 }
 

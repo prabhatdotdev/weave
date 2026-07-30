@@ -2,6 +2,7 @@ package core
 
 import (
 	"encoding/json"
+	"maps"
 	"time"
 )
 
@@ -123,7 +124,7 @@ func NewDeadLetterEnvelope(msg *Message, err error, opts DeadLetterOptions) Dead
 			Message:       errorMessage(err),
 			Retryable:     opts.Retryable,
 			CorrelationID: correlationIDFromMessage(msg),
-			Details:       cloneDeadLetterDetails(opts.Details),
+			Details:       maps.Clone(opts.Details),
 			Timestamp:     time.Now().UTC(),
 		},
 	}
@@ -132,7 +133,7 @@ func NewDeadLetterEnvelope(msg *Message, err error, opts DeadLetterOptions) Dead
 			Body:          append([]byte(nil), msg.Body...),
 			CorrelationID: msg.CorrelationID,
 			ReplyTo:       msg.ReplyTo,
-			Headers:       cloneHeaders(msg.Headers),
+			Headers:       maps.Clone(msg.Headers),
 			ContentType:   msg.ContentType,
 			MessageID:     msg.MessageID,
 			Timestamp:     msg.Timestamp,
@@ -187,26 +188,4 @@ func correlationIDFromMessage(msg *Message) string {
 		return ""
 	}
 	return msg.CorrelationID
-}
-
-func cloneDeadLetterDetails(details map[string]any) map[string]any {
-	if len(details) == 0 {
-		return nil
-	}
-	cloned := make(map[string]any, len(details))
-	for k, v := range details {
-		cloned[k] = v
-	}
-	return cloned
-}
-
-func cloneHeaders(headers map[string]string) map[string]string {
-	if len(headers) == 0 {
-		return nil
-	}
-	cloned := make(map[string]string, len(headers))
-	for k, v := range headers {
-		cloned[k] = v
-	}
-	return cloned
 }

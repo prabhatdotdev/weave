@@ -18,33 +18,12 @@ import "time"
 
 // Config holds the configuration for a message broker.
 type Config struct {
-	Backend         string
 	ConnectionName  string
 	ConnectionRetry int
 	RetryDelay      time.Duration
-
-	// Logger receives structured runtime and transport events.
-	Logger EventLogger
-	// EventHook receives structured runtime and transport events.
-	EventHook EventHook
-	// Metrics receives basic counters and duration measurements.
-	Metrics MetricsHook
-	// Tracing receives span lifecycle callbacks for high-level runtime operations.
-	Tracing TracingHook
-	// HealthReporter receives runtime health snapshots.
-	HealthReporter HealthReporter
-	// HealthHook receives runtime health snapshots as a callback.
-	HealthHook HealthHook
-
-	AMQP  *AMQPConfig
-	Kafka *KafkaConfig
-
-	// Shorthand for AMQP
-	Host     string
-	Port     int
-	Username string
-	Password string
-	VHost    string
+	EventHook       EventHook
+	AMQP            *AMQPConfig
+	Kafka           *KafkaConfig
 }
 
 // AMQPConfig holds AMQP/RabbitMQ-specific configuration.
@@ -55,9 +34,7 @@ type AMQPConfig struct {
 	Password        string
 	VHost           string
 	Heartbeat       time.Duration
-	TLS             *TLSConfig
 	Exchange        string
-	ExchangeType    string
 	QueueDurable    bool
 	QueueAutoDelete bool
 	QueueExclusive  bool
@@ -68,24 +45,13 @@ type KafkaConfig struct {
 	Brokers           []string
 	ClientID          string
 	ConsumerGroup     string
-	TLS               *TLSConfig
 	RequiredAcks      int
 	MaxRetries        int
 	RetryBackoff      time.Duration
-	CompressionType   string
 	AutoOffsetReset   string
 	SessionTimeout    time.Duration
 	HeartbeatInterval time.Duration
 	SASL              *SASLConfig
-}
-
-// TLSConfig holds TLS/SSL configuration.
-type TLSConfig struct {
-	Enable             bool
-	CertFile           string
-	KeyFile            string
-	CAFile             string
-	InsecureSkipVerify bool
 }
 
 // SASLConfig holds SASL authentication configuration (for Kafka).
@@ -96,13 +62,11 @@ type SASLConfig struct {
 	Password  string
 }
 
-// DefaultConfig returns a Config with sensible defaults for AMQP.
+// DefaultConfig returns common connection defaults.
 func DefaultConfig() *Config {
 	return &Config{
-		Backend:         "amqp",
 		ConnectionRetry: 3,
 		RetryDelay:      2 * time.Second,
-		AMQP:            DefaultAMQPConfig(),
 	}
 }
 
@@ -129,24 +93,4 @@ func DefaultKafkaConfig() *KafkaConfig {
 		SessionTimeout:    10 * time.Second,
 		HeartbeatInterval: 3 * time.Second,
 	}
-}
-
-// WithBackend sets the backend and returns the config for chaining.
-func (c *Config) WithBackend(backend string) *Config {
-	c.Backend = backend
-	return c
-}
-
-// WithAMQP sets AMQP configuration and returns the config for chaining.
-func (c *Config) WithAMQP(amqp *AMQPConfig) *Config {
-	c.AMQP = amqp
-	c.Backend = "amqp"
-	return c
-}
-
-// WithKafka sets Kafka configuration and returns the config for chaining.
-func (c *Config) WithKafka(kafka *KafkaConfig) *Config {
-	c.Kafka = kafka
-	c.Backend = "kafka"
-	return c
 }

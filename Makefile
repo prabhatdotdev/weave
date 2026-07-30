@@ -1,4 +1,4 @@
-.PHONY: help test test-verbose test-coverage test-coverage-check test-recovery bench lint fmt vet build rabbitmq-start rabbitmq-stop kafka-start kafka-stop clean install-deps
+.PHONY: help test test-verbose test-coverage-check test-recovery bench lint fmt vet build rabbitmq-start rabbitmq-stop clean install-deps
 
 help: ## Show this help message
 	@echo 'Usage: make [target]'
@@ -17,10 +17,6 @@ test: ## Run tests
 
 test-verbose: ## Run tests with verbose output
 	@go test -v -race -cover ./...
-
-test-coverage: ## Run coverage for critical packages and generate report
-	@echo "Running coverage for critical packages..."
-	@./scripts/check_coverage.sh
 
 test-coverage-check: ## Enforce minimum coverage for critical packages
 	@echo "Checking critical package coverage threshold..."
@@ -62,22 +58,8 @@ rabbitmq-stop: ## Stop RabbitMQ
 	@echo "Stopping RabbitMQ..."
 	@docker-compose stop rabbitmq
 
-kafka-start: ## Start Kafka with Docker Compose
-	@echo "Starting Kafka..."
-	@docker-compose up -d kafka zookeeper
-	@echo "Waiting for Kafka to be ready..."
-	@sleep 10
-	@echo "Kafka is ready at localhost:9092"
-
-kafka-stop: ## Stop Kafka
-	@echo "Stopping Kafka..."
-	@docker-compose stop kafka zookeeper
-
 rabbitmq-logs: ## Show RabbitMQ logs
 	@docker-compose logs -f rabbitmq
-
-kafka-logs: ## Show Kafka logs
-	@docker-compose logs -f kafka
 
 clean: ## Clean build artifacts and test files
 	@echo "Cleaning..."

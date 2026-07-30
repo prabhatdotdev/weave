@@ -14,7 +14,11 @@
 
 package core
 
-import "time"
+import (
+	"bytes"
+	"maps"
+	"time"
+)
 
 // Message represents a message to be sent or received from a message broker.
 type Message struct {
@@ -80,7 +84,7 @@ func (m *Message) WithSubject(subject string) *Message {
 // Clone creates a deep copy of the message.
 func (m *Message) Clone() *Message {
 	clone := &Message{
-		Body:          make([]byte, len(m.Body)),
+		Body:          bytes.Clone(m.Body),
 		CorrelationID: m.CorrelationID,
 		ReplyTo:       m.ReplyTo,
 		ContentType:   m.ContentType,
@@ -90,14 +94,7 @@ func (m *Message) Clone() *Message {
 		Partition:     m.Partition,
 		Offset:        m.Offset,
 	}
-	copy(clone.Body, m.Body)
-
-	if m.Headers != nil {
-		clone.Headers = make(map[string]string, len(m.Headers))
-		for k, v := range m.Headers {
-			clone.Headers[k] = v
-		}
-	}
+	clone.Headers = maps.Clone(m.Headers)
 	return clone
 }
 

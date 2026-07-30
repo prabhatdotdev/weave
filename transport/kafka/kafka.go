@@ -17,12 +17,12 @@ package kafka
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/IBM/sarama"
-	"github.com/google/uuid"
 
 	"github.com/prabhatdotdev/weave/core"
 )
@@ -35,10 +35,6 @@ type subscriptionRegistration struct {
 	destination string
 	handler     core.Handler
 	opts        []core.SubscribeOption
-}
-
-func init() {
-	core.Register(backendName, NewBroker)
 }
 
 // Broker implements the core.MessageBroker interface for Apache Kafka.
@@ -84,22 +80,11 @@ func (b *Broker) emitEvent(ctx context.Context, event core.Event) {
 	b.config.EmitEvent(ctx, event)
 }
 
-func (b *Broker) emitCounter(name string, labels map[string]string) {
-	if b.config == nil {
-		return
-	}
-	b.config.EmitCounter(name, 1, labels)
-}
-
-func (b *Broker) emitDuration(name string, value time.Duration, labels map[string]string) {
-	if b.config == nil {
-		return
-	}
-	b.config.EmitDuration(name, value, labels)
-}
-
 // NewBroker creates a new Kafka broker instance.
 func NewBroker(config *core.Config) (core.MessageBroker, error) {
+	if config == nil {
+		config = core.DefaultConfig()
+	}
 	if config.Kafka == nil {
 		config.Kafka = core.DefaultKafkaConfig()
 	}
@@ -139,7 +124,6 @@ func (b *Broker) Connect(ctx context.Context) error {
 }
 
 func (b *Broker) connectLocked() error {
-	start := time.Now()
 	saramaConfig := b.buildSaramaConfig()
 	retries := b.config.ConnectionRetry
 	if retries <= 0 {
@@ -185,8 +169,6 @@ func (b *Broker) connectLocked() error {
 					Operation: "connect",
 					Fields:    map[string]any{"outcome": "success"},
 				})
-				b.emitCounter("weave.transport.connect.success", map[string]string{"backend": backendName})
-				b.emitDuration("weave.transport.connect.duration", time.Since(start), map[string]string{"backend": backendName, "outcome": "success"})
 				return nil
 			}
 		}
@@ -207,8 +189,6 @@ func (b *Broker) connectLocked() error {
 		Err:       lastErr,
 		Fields:    map[string]any{"outcome": "failure"},
 	})
-	b.emitCounter("weave.transport.connect.failures", map[string]string{"backend": backendName})
-	b.emitDuration("weave.transport.connect.duration", time.Since(start), map[string]string{"backend": backendName, "outcome": "failure"})
 
 	return &core.ErrConnectionFailed{
 		Backend: backendName,
@@ -296,7 +276,6 @@ func (b *Broker) Close() error {
 			Operation: "close",
 			Fields:    map[string]any{"outcome": "success", "reason": "close"},
 		})
-		b.emitCounter("weave.transport.disconnect.events", map[string]string{"backend": backendName, "reason": "close"})
 	})
 
 	if len(errs) > 0 {
@@ -372,7 +351,6 @@ func (b *Broker) Publish(ctx context.Context, destination string, msg *core.Mess
 			Destination: destination,
 			Err:         err,
 		})
-		b.emitCounter("weave.transport.publish.failures", map[string]string{"backend": backendName, "destination": destination})
 		b.handleProducerLoss(producer, err)
 		return &core.ErrPublishFailed{Backend: backendName, Destination: destination, Cause: err}
 	}
@@ -437,7 +415,6 @@ func (b *Broker) startSubscriptionConsumer(ctx context.Context, destination stri
 			Destination: destination,
 			Err:         err,
 		})
-		b.emitCounter("weave.transport.subscribe.failures", map[string]string{"backend": backendName, "destination": destination, "stage": "config"})
 		return &core.ErrSubscribeFailed{
 			Backend:     backendName,
 			Destination: destination,
@@ -477,7 +454,6 @@ func (b *Broker) startSubscriptionConsumer(ctx context.Context, destination stri
 							Err:         err,
 							Fields:      map[string]any{"outcome": "failure"},
 						})
-						b.emitCounter("weave.transport.connect.failures", map[string]string{"backend": backendName, "stage": "reconnect"})
 						time.Sleep(200 * time.Millisecond)
 						continue
 					}
@@ -498,7 +474,6 @@ func (b *Broker) startSubscriptionConsumer(ctx context.Context, destination stri
 						Destination: destination,
 						Err:         err,
 					})
-					b.emitCounter("weave.transport.subscribe.failures", map[string]string{"backend": backendName, "destination": destination, "stage": "consume"})
 					if ctx.Err() != nil || b.isClosed() {
 						return
 					}
@@ -525,7 +500,7 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 
 	corrID := msg.CorrelationID
 	if corrID == "" {
-		corrID = uuid.New().String()
+		corrID = rand.Text()
 	}
 
 	respChan := make(chan *core.Message, 1)
@@ -544,7 +519,6 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 		ctx, cancel = context.WithTimeout(ctx, options.Timeout)
 		defer cancel()
 	}
-	callStart := time.Now()
 
 	msg.CorrelationID = corrID
 	msg.ReplyTo = b.currentReplyTopic()
@@ -564,14 +538,11 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 				"timeout": options.Timeout.String(),
 			},
 		})
-		b.emitCounter("weave.transport.call.timeouts", map[string]string{"backend": backendName, "destination": destination})
-		b.emitDuration("weave.transport.call.duration", time.Since(callStart), map[string]string{"backend": backendName, "destination": destination, "outcome": "timeout"})
 		return nil, &core.ErrTimeout{Operation: "Call", Duration: options.Timeout.String()}
 	case response := <-respChan:
 		if response == nil {
 			return nil, &core.ErrConnectionLost{Backend: backendName}
 		}
-		b.emitDuration("weave.transport.call.duration", time.Since(callStart), map[string]string{"backend": backendName, "destination": destination, "outcome": "success"})
 		return response, nil
 	}
 }
@@ -583,7 +554,7 @@ func (b *Broker) ensureReplyConsumer() error {
 		return nil
 	}
 
-	replyTopic := fmt.Sprintf("reply-%s-%s", b.kafkaConfig.ClientID, uuid.New().String()[:8])
+	replyTopic := fmt.Sprintf("reply-%s-%s", b.kafkaConfig.ClientID, rand.Text()[:8])
 	b.replyTopic = replyTopic
 	b.closeMu.Unlock()
 
@@ -626,7 +597,6 @@ func (b *Broker) ensureConnected() error {
 		Name:      "reconnect_started",
 		Operation: "ensure_connected",
 	})
-	b.emitCounter("weave.transport.reconnect.started", map[string]string{"backend": backendName})
 
 	err := b.connectLocked()
 	b.closeMu.Unlock()
@@ -637,7 +607,6 @@ func (b *Broker) ensureConnected() error {
 			Operation: "ensure_connected",
 			Err:       err,
 		})
-		b.emitCounter("weave.transport.reconnect.attempt_failures", map[string]string{"backend": backendName})
 		return err
 	}
 
@@ -646,7 +615,6 @@ func (b *Broker) ensureConnected() error {
 		Name:      "reconnect_succeeded",
 		Operation: "ensure_connected",
 	})
-	b.emitCounter("weave.transport.reconnect.succeeded", map[string]string{"backend": backendName})
 
 	b.restoreTrackedSubscriptions()
 	return nil
@@ -709,7 +677,6 @@ func (b *Broker) handleConnectionLossFor(expectedProducer sarama.SyncProducer, e
 		Err:       cause,
 		Fields:    map[string]any{"outcome": "failure"},
 	})
-	b.emitCounter("weave.transport.disconnect.events", map[string]string{"backend": backendName, "reason": "connection_lost"})
 }
 
 func (b *Broker) registerSubscription(ctx context.Context, destination string, handler core.Handler, opts []core.SubscribeOption) subscriptionRegistration {
@@ -771,9 +738,6 @@ func (b *Broker) restoreTrackedSubscriptions() {
 				Destination: sub.destination,
 				Err:         err,
 			})
-			b.emitCounter("weave.transport.subscription.restore.failures", map[string]string{"backend": backendName, "destination": sub.destination})
-		} else {
-			b.emitCounter("weave.transport.subscription.restore.success", map[string]string{"backend": backendName, "destination": sub.destination})
 		}
 	}
 
@@ -884,7 +848,6 @@ func (b *Broker) watchConsumerErrors(ctx context.Context, destination string, co
 					Destination: destination,
 					Err:         err,
 				})
-				b.emitCounter("weave.transport.subscribe.failures", map[string]string{"backend": backendName, "destination": destination, "stage": "consumer_errors"})
 				if !b.isClosed() {
 					b.handleConsumerLoss(consumer, err)
 				}
@@ -916,7 +879,6 @@ func (h *consumerGroupHandler) emitSubscribeFailure(destination string, err erro
 		Destination: destination,
 		Err:         err,
 	})
-	h.config.EmitCounter("weave.transport.subscribe.failures", 1, map[string]string{"backend": backendName, "destination": destination, "stage": "handler"})
 }
 
 func (h *consumerGroupHandler) Setup(sarama.ConsumerGroupSession) error {

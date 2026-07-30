@@ -13,8 +13,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/prabhatdotdev/weave"
-	_ "github.com/prabhatdotdev/weave/transport/amqp"
+	"github.com/prabhatdotdev/weave/core"
+	"github.com/prabhatdotdev/weave/transport/amqp"
 )
 
 type config struct {
@@ -91,8 +91,9 @@ func (c config) validate() error {
 	return nil
 }
 
-func amqpConfig(cfg config) *weave.Config {
-	brokerConfig := weave.DefaultConfig()
+func amqpConfig(cfg config) *core.Config {
+	brokerConfig := core.DefaultConfig()
+	brokerConfig.AMQP = core.DefaultAMQPConfig()
 	brokerConfig.AMQP.Host = cfg.host
 	brokerConfig.AMQP.Port = cfg.port
 	return brokerConfig
@@ -103,25 +104,26 @@ func runServer(cfg config) error {
 	brokerConfig.AMQP.QueueAutoDelete = true
 	brokerConfig.AMQP.QueueExclusive = true
 
-	server, err := weave.NewServer(brokerConfig)
+	broker, err := amqp.NewBroker(brokerConfig)
 	if err != nil {
 		return err
 	}
-	defer server.Stop()
-
-	server.Handle(cfg.queue, func(ctx context.Context, request *weave.Message) error {
-		if request.ReplyTo == "" {
-			return weave.ErrNoReplyTo
-		}
-		response := weave.NewMessage(request.Body)
-		response.CorrelationID = request.CorrelationID
-		return server.Publish(ctx, request.ReplyTo, response)
-	}, weave.WithWorkerCount(cfg.workers))
+	defer broker.Close()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	if err := broker.Connect(ctx); err != nil {
+		return err
+	}
 
-	if err := server.Start(ctx); err != nil {
+	if err := broker.Subscribe(ctx, cfg.queue, func(ctx context.Context, request *core.Message) error {
+		if request.ReplyTo == "" {
+			return core.ErrNoReplyTo
+		}
+		response := core.NewMessage(request.Body)
+		response.CorrelationID = request.CorrelationID
+		return broker.Publish(ctx, request.ReplyTo, response)
+	}, core.WithWorkerCount(cfg.workers)); err != nil {
 		return err
 	}
 	fmt.Printf("ready queue=%s workers=%d\n", cfg.queue, cfg.workers)
@@ -130,7 +132,7 @@ func runServer(cfg config) error {
 }
 
 func runClient(cfg config) error {
-	client, err := weave.NewClient(amqpConfig(cfg))
+	client, err := amqp.NewBroker(amqpConfig(cfg))
 	if err != nil {
 		return err
 	}
@@ -174,7 +176,7 @@ func runClient(cfg config) error {
 
 func runStage(
 	ctx context.Context,
-	client *weave.Client,
+	client core.Caller,
 	queue string,
 	payload []byte,
 	concurrency int,
@@ -213,8 +215,8 @@ func runStage(
 	return combined
 }
 
-func call(ctx context.Context, client *weave.Client, queue string, payload []byte, timeout time.Duration) error {
-	response, err := client.Call(ctx, queue, weave.NewMessage(payload), weave.WithTimeout(timeout))
+func call(ctx context.Context, client core.Caller, queue string, payload []byte, timeout time.Duration) error {
+	response, err := client.Call(ctx, queue, core.NewMessage(payload), core.WithTimeout(timeout))
 	if err != nil {
 		return err
 	}
