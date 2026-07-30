@@ -21,7 +21,7 @@ A unified abstraction layer for building message-driven microservices across mes
 | Protobuf integration | ✅ Stable | Built-in protobuf codec and codec-aware helpers; no typed APIs |
 | Dead-letter handling | ✅ Stable | Standard dead-letter envelope helpers are implemented; broker-native routing remains backend-specific |
 | Worker pool abstractions | ✅ Stable | Opt-in per-subscription concurrency limits for AMQP and Kafka |
-| Schema validation helpers | 📋 Planned | Future enhancement |
+| Schema validation helpers | ✅ Stable | Typed decode-and-validate helper for JSON, protobuf, and custom codecs |
 | Tracing integration | ✅ Stable | Hook-based span integration with adapter examples |
 | Health check endpoints | 📋 Planned | Future enhancement |
 | Additional backends (NATS, Redis, etc.) | 📋 Reserved | Design-phase only, not under development |
@@ -95,7 +95,36 @@ Weave provides two high-level abstractions:
 - **Client** - For sending messages and making RPC calls (no subscriptions)
 - **Server** - For subscribing to queues/topics and handling incoming messages
 
-Payload format is intentionally transport-agnostic. Weave now ships built-in JSON and Protocol Buffers codecs, plus helpers like `weave.MarshalMessage(...)`, `weave.UnmarshalMessage(...)`, `Client.PublishWithCodec(...)`, and `Client.CallWithCodec(...)` so you can keep serialization concerns out of most call sites.
+Payload format is intentionally transport-agnostic. Weave ships built-in JSON and Protocol Buffers codecs, plus helpers like `weave.MarshalMessage(...)`, `weave.UnmarshalMessage(...)`, `weave.UnmarshalAndValidate(...)`, `Client.PublishWithCodec(...)`, and `Client.CallWithCodec(...)` so you can keep serialization concerns out of most call sites.
+
+### Decode and Validate Payloads
+
+Decode a message and run application-owned validation in one call:
+
+```go
+var order CreateOrderRequest
+err := weave.UnmarshalAndValidate(weave.JSON, msg, &order, func(order *CreateOrderRequest) error {
+    if order.ID == "" {
+        return errors.New("missing order id")
+    }
+    return nil
+})
+```
+
+The same helper works with generated protobuf messages:
+
+```go
+var request pb.GetUserRequest
+err := weave.UnmarshalAndValidate(weave.Protobuf, msg, &request, func(request *pb.GetUserRequest) error {
+    if request.Id == "" {
+        return errors.New("missing user id")
+    }
+    return nil
+})
+```
+
+Decode errors are returned unchanged; validation errors wrap the validator's
+original error for `errors.Is` and `errors.As`.
 
 ### Client Example (Sending Messages / RPC)
 

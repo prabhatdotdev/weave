@@ -122,6 +122,20 @@ func UnmarshalMessage(c Codec, msg *core.Message, v any) error {
 	return c.Decode(msg.Body, v)
 }
 
+// UnmarshalAndValidate decodes a message and validates the decoded value.
+func UnmarshalAndValidate[T any](c Codec, msg *core.Message, v *T, validate func(*T) error) error {
+	if validate == nil {
+		return errors.New("codec: nil validator")
+	}
+	if err := UnmarshalMessage(c, msg, v); err != nil {
+		return err
+	}
+	if err := validate(v); err != nil {
+		return fmt.Errorf("codec: validation failed: %w", err)
+	}
+	return nil
+}
+
 func isNilValue(v any) bool {
 	if v == nil {
 		return true

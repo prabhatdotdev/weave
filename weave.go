@@ -392,6 +392,11 @@ var (
 	DecodeDeadLetterMessage = core.DecodeDeadLetterMessage
 )
 
+// UnmarshalAndValidate decodes a message and validates the decoded value.
+func UnmarshalAndValidate[T any](c Codec, msg *Message, v *T, validate func(*T) error) error {
+	return codec.UnmarshalAndValidate(c, msg, v, validate)
+}
+
 // Re-export configuration defaults.
 var (
 	// DefaultConfig returns default configuration.

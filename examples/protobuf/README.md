@@ -140,7 +140,12 @@ server.Start(ctx)
 // Handler using protobuf
 func handleGetProfile(ctx context.Context, msg *weave.Message) error {
     var req pb.GetProfileRequest
-    if err := proto.Unmarshal(msg.Body, &req); err != nil {
+    if err := weave.UnmarshalAndValidate(weave.Protobuf, msg, &req, func(req *pb.GetProfileRequest) error {
+        if req.UserId == "" {
+            return errors.New("user_id is required")
+        }
+        return nil
+    }); err != nil {
         return sendResponse(ctx, msg, &pb.GetProfileResponse{Error: "invalid request"})
     }
     // Process and respond...
