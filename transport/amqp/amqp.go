@@ -813,14 +813,19 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 		exchange = b.amqpConfig.Exchange
 	}
 
-	err = channel.PublishWithContext(ctx, exchange, destination, false, false,
-		amqplib.Publishing{
-			ContentType:   msg.ContentType,
-			CorrelationId: corrID,
-			ReplyTo:       b.currentReplyQueue(),
-			Body:          msg.Body,
-		},
-	)
+	publishing := amqplib.Publishing{
+		ContentType:   msg.ContentType,
+		CorrelationId: corrID,
+		ReplyTo:       b.currentReplyQueue(),
+		Body:          msg.Body,
+	}
+	if len(msg.Headers) > 0 {
+		publishing.Headers = make(amqplib.Table, len(msg.Headers))
+		for key, value := range msg.Headers {
+			publishing.Headers[key] = value
+		}
+	}
+	err = channel.PublishWithContext(ctx, exchange, destination, false, false, publishing)
 	if err != nil {
 		b.emitEvent(ctx, core.Event{
 			Level:       core.EventLevelError,

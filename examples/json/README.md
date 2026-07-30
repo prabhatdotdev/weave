@@ -2,6 +2,9 @@
 
 This example demonstrates a complete microservices architecture using Weave with JSON serialization.
 
+For broker setup, repository-wide example selection, validation, cleanup, and
+troubleshooting, see the [complete examples guide](../README.md).
+
 ## Architecture
 
 ```
@@ -37,32 +40,40 @@ This example demonstrates a complete microservices architecture using Weave with
 
 ### Prerequisites
 - RabbitMQ running locally (or via Docker)
-- Go 1.21+
+- Go 1.24+
 
 ### Start RabbitMQ
+
+From the repository root:
+
 ```bash
-# Using Docker
-docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management
+docker compose up -d --wait rabbitmq
 ```
 
 ### Run the Services
 
 **Terminal 1 - Start Profile Service (start this first):**
 ```bash
-cd examples/json/profile-service
-go run main.go
+go run ./examples/json/profile-service
 ```
 
 **Terminal 2 - Start User Service:**
 ```bash
-cd examples/json/user-service
-go run main.go
+go run ./examples/json/user-service
 ```
 
 **Terminal 3 - Run API Client:**
 ```bash
-cd examples/json/client
-go run main.go
+go run ./examples/json/client
+```
+
+Run all three commands from the repository root. Keep the first two terminals
+running until the client finishes, then stop both services with `Ctrl+C`.
+
+Stop RabbitMQ:
+
+```bash
+docker compose stop rabbitmq
 ```
 
 ## Message Flow

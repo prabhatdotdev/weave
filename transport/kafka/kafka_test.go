@@ -190,6 +190,7 @@ func TestPublishBuildsKafkaMessageAndErrors(t *testing.T) {
 	msg.Headers = map[string]string{"trace-id": "abc"}
 	msg.CorrelationID = "corr-1"
 	msg.ReplyTo = "reply-topic"
+	msg.ContentType = "application/json"
 
 	if err := broker.Publish(context.Background(), "users", msg); err != nil {
 		t.Fatalf("Publish() error = %v", err)
@@ -211,6 +212,9 @@ func TestPublishBuildsKafkaMessageAndErrors(t *testing.T) {
 	}
 	if got := headerValue(producer.lastMsg, "reply-to"); got != "reply-topic" {
 		t.Fatalf("reply-to header = %q, want %q", got, "reply-topic")
+	}
+	if got := headerValue(producer.lastMsg, "content-type"); got != "application/json" {
+		t.Fatalf("content-type header = %q, want %q", got, "application/json")
 	}
 
 	producer.sendErr = errors.New("send failed")
@@ -376,6 +380,7 @@ func TestConsumerGroupHandlerRoutesResponsesAndInvokesHandlers(t *testing.T) {
 			Timestamp: time.Unix(1700000000, 0),
 			Headers: []*sarama.RecordHeader{
 				{Key: []byte("reply-to"), Value: []byte("reply-topic")},
+				{Key: []byte("content-type"), Value: []byte("application/json")},
 				{Key: []byte("trace-id"), Value: []byte("abc")},
 			},
 		}
@@ -388,7 +393,7 @@ func TestConsumerGroupHandlerRoutesResponsesAndInvokesHandlers(t *testing.T) {
 		if got == nil {
 			t.Fatal("handler was not called")
 		}
-		if got.Subject != "subject" || got.ReplyTo != "reply-topic" || got.GetHeader("trace-id") != "abc" || got.Partition != 1 || got.Offset != 8 {
+		if got.Subject != "subject" || got.ReplyTo != "reply-topic" || got.ContentType != "application/json" || got.GetHeader("trace-id") != "abc" || got.Partition != 1 || got.Offset != 8 {
 			t.Fatalf("unexpected converted message: %#v", got)
 		}
 		if len(session.marked) != 1 {
