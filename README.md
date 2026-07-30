@@ -2,7 +2,6 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/prabhatdotdev/weave.svg)](https://pkg.go.dev/github.com/prabhatdotdev/weave)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Go Report Card](https://goreportcard.com/badge/github.com/prabhatdotdev/weave)](https://goreportcard.com/report/github.com/prabhatdotdev/weave)
 
 A unified abstraction layer for building message-driven microservices across message queue backends. Today, the implemented transports are RabbitMQ/AMQP and Apache Kafka.
 
