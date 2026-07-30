@@ -17,11 +17,11 @@ package amqp
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	amqplib "github.com/rabbitmq/amqp091-go"
 
 	"github.com/prabhatdotdev/weave/core"
@@ -99,10 +99,6 @@ type subscriptionRegistration struct {
 	opts        []core.SubscribeOption
 }
 
-func init() {
-	core.Register(backendName, NewBroker)
-}
-
 // Broker implements the core.MessageBroker interface for AMQP/RabbitMQ.
 type Broker struct {
 	config     *core.Config
@@ -139,46 +135,13 @@ func (b *Broker) emitEvent(ctx context.Context, event core.Event) {
 	b.config.EmitEvent(ctx, event)
 }
 
-func (b *Broker) emitCounter(name string, labels map[string]string) {
-	if b.config == nil {
-		return
-	}
-	b.config.EmitCounter(name, 1, labels)
-}
-
-func (b *Broker) emitDuration(name string, value time.Duration, labels map[string]string) {
-	if b.config == nil {
-		return
-	}
-	b.config.EmitDuration(name, value, labels)
-}
-
 // NewBroker creates a new AMQP broker instance.
 func NewBroker(config *core.Config) (core.MessageBroker, error) {
+	if config == nil {
+		config = core.DefaultConfig()
+	}
 	if config.AMQP == nil {
-		if config.Host != "" {
-			config.AMQP = &core.AMQPConfig{
-				Host:     config.Host,
-				Port:     config.Port,
-				Username: config.Username,
-				Password: config.Password,
-				VHost:    config.VHost,
-			}
-			if config.Port == 0 {
-				config.AMQP.Port = 5672
-			}
-			if config.Username == "" {
-				config.AMQP.Username = "guest"
-			}
-			if config.Password == "" {
-				config.AMQP.Password = "guest"
-			}
-			if config.VHost == "" {
-				config.AMQP.VHost = "/"
-			}
-		} else {
-			config.AMQP = core.DefaultAMQPConfig()
-		}
+		config.AMQP = core.DefaultAMQPConfig()
 	}
 
 	return &Broker{
@@ -220,7 +183,6 @@ func (b *Broker) Connect(ctx context.Context) error {
 }
 
 func (b *Broker) connect() error {
-	start := time.Now()
 	var conn amqpConnection
 	var err error
 
@@ -260,8 +222,6 @@ func (b *Broker) connect() error {
 				"outcome": "failure",
 			},
 		})
-		b.emitCounter("weave.transport.connect.failures", map[string]string{"backend": backendName})
-		b.emitDuration("weave.transport.connect.duration", time.Since(start), map[string]string{"backend": backendName, "outcome": "failure"})
 		return &core.ErrConnectionFailed{
 			Backend: backendName,
 			Address: fmt.Sprintf("%s:%d", b.amqpConfig.Host, b.amqpConfig.Port),
@@ -278,8 +238,6 @@ func (b *Broker) connect() error {
 			Err:       err,
 			Fields:    map[string]any{"outcome": "failure", "stage": "open_channel"},
 		})
-		b.emitCounter("weave.transport.connect.failures", map[string]string{"backend": backendName})
-		b.emitDuration("weave.transport.connect.duration", time.Since(start), map[string]string{"backend": backendName, "outcome": "failure"})
 		conn.Close()
 		return fmt.Errorf("failed to open channel: %w", err)
 	}
@@ -294,8 +252,6 @@ func (b *Broker) connect() error {
 		Operation: "connect",
 		Fields:    map[string]any{"outcome": "success"},
 	})
-	b.emitCounter("weave.transport.connect.success", map[string]string{"backend": backendName})
-	b.emitDuration("weave.transport.connect.duration", time.Since(start), map[string]string{"backend": backendName, "outcome": "success"})
 
 	go b.monitorConnection(conn)
 
@@ -328,7 +284,6 @@ func (b *Broker) monitorConnection(conn amqpConnection) {
 				Err:       connErr,
 				Fields:    map[string]any{"outcome": "failure"},
 			})
-			b.emitCounter("weave.transport.disconnect.events", map[string]string{"backend": backendName, "reason": "connection_lost"})
 			b.reconnectLoop()
 		}
 	case <-b.closeChan:
@@ -359,7 +314,6 @@ func (b *Broker) handleConnectionLoss(conn amqpConnection, connErr *amqplib.Erro
 		Operation: "handle_connection_loss",
 		Err:       connErr,
 	})
-	b.emitCounter("weave.transport.reconnect.disconnect_triggered", map[string]string{"backend": backendName})
 
 	return true
 }
@@ -371,7 +325,6 @@ func (b *Broker) reconnectLoop() {
 		Name:      "reconnect_started",
 		Operation: "reconnect_loop",
 	})
-	b.emitCounter("weave.transport.reconnect.started", map[string]string{"backend": backendName})
 
 	attempt := 0
 	for {
@@ -410,7 +363,6 @@ func (b *Broker) reconnectLoop() {
 					Destination: "*",
 					Err:         restoreErr,
 				})
-				b.emitCounter("weave.transport.subscribe.failures", map[string]string{"backend": backendName, "stage": "restore"})
 				b.closeMu.RLock()
 				conn := b.conn
 				b.closeMu.RUnlock()
@@ -432,7 +384,6 @@ func (b *Broker) reconnectLoop() {
 					"attempts": attempt,
 				},
 			})
-			b.emitCounter("weave.transport.reconnect.succeeded", map[string]string{"backend": backendName})
 			return
 		}
 
@@ -446,7 +397,6 @@ func (b *Broker) reconnectLoop() {
 				"attempt": attempt,
 			},
 		})
-		b.emitCounter("weave.transport.reconnect.attempt_failures", map[string]string{"backend": backendName})
 
 		delay := b.config.RetryDelay
 		if delay == 0 {
@@ -489,10 +439,8 @@ func (b *Broker) restoreSubscriptions() error {
 				Destination: sub.destination,
 				Err:         err,
 			})
-			b.emitCounter("weave.transport.subscription.restore.failures", map[string]string{"backend": backendName, "destination": sub.destination})
 			return err
 		}
-		b.emitCounter("weave.transport.subscription.restore.success", map[string]string{"backend": backendName, "destination": sub.destination})
 	}
 
 	if len(subscriptions) > 0 {
@@ -554,7 +502,6 @@ func (b *Broker) Close() error {
 			Operation: "close",
 			Fields:    map[string]any{"outcome": "success", "reason": "close"},
 		})
-		b.emitCounter("weave.transport.disconnect.events", map[string]string{"backend": backendName, "reason": "close"})
 	})
 	return err
 }
@@ -610,7 +557,6 @@ func (b *Broker) Publish(ctx context.Context, destination string, msg *core.Mess
 			Destination: destination,
 			Err:         err,
 		})
-		b.emitCounter("weave.transport.publish.failures", map[string]string{"backend": backendName, "destination": destination})
 		return &core.ErrPublishFailed{Backend: backendName, Destination: destination, Cause: err}
 	}
 
@@ -653,7 +599,6 @@ func (b *Broker) subscribe(ctx context.Context, destination string, handler core
 			Destination: destination,
 			Err:         err,
 		})
-		b.emitCounter("weave.transport.subscribe.failures", map[string]string{"backend": backendName, "destination": destination, "stage": "queue_declare"})
 		return &core.ErrSubscribeFailed{Backend: backendName, Destination: destination, Cause: err}
 	}
 
@@ -670,7 +615,6 @@ func (b *Broker) subscribe(ctx context.Context, destination string, handler core
 				Destination: destination,
 				Err:         err,
 			})
-			b.emitCounter("weave.transport.subscribe.failures", map[string]string{"backend": backendName, "destination": destination, "stage": "queue_bind"})
 			return &core.ErrSubscribeFailed{Backend: backendName, Destination: destination, Cause: err}
 		}
 	}
@@ -690,7 +634,6 @@ func (b *Broker) subscribe(ctx context.Context, destination string, handler core
 			Destination: destination,
 			Err:         err,
 		})
-		b.emitCounter("weave.transport.subscribe.failures", map[string]string{"backend": backendName, "destination": destination, "stage": "qos"})
 		return fmt.Errorf("failed to set QoS: %w", err)
 	}
 
@@ -703,7 +646,6 @@ func (b *Broker) subscribe(ctx context.Context, destination string, handler core
 			Destination: destination,
 			Err:         err,
 		})
-		b.emitCounter("weave.transport.subscribe.failures", map[string]string{"backend": backendName, "destination": destination, "stage": "consume"})
 		return &core.ErrSubscribeFailed{Backend: backendName, Destination: destination, Cause: err}
 	}
 
@@ -756,7 +698,6 @@ func (b *Broker) handleMessage(ctx context.Context, msg amqplib.Delivery, handle
 				Operation: "handler_panic",
 				Err:       fmt.Errorf("panic: %v", r),
 			})
-			b.emitCounter("weave.transport.subscribe.failures", map[string]string{"backend": backendName, "stage": "handler_panic"})
 			if !autoAck {
 				msg.Nack(false, false)
 			}
@@ -808,7 +749,7 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 
 	corrID := msg.CorrelationID
 	if corrID == "" {
-		corrID = uuid.New().String()
+		corrID = rand.Text()
 	}
 
 	respChan := make(chan *amqplib.Delivery, 1)
@@ -827,7 +768,6 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 		ctx, cancel = context.WithTimeout(ctx, options.Timeout)
 		defer cancel()
 	}
-	callStart := time.Now()
 
 	exchange := options.Exchange
 	if exchange == "" {
@@ -855,7 +795,6 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 			Destination: destination,
 			Err:         err,
 		})
-		b.emitCounter("weave.transport.publish.failures", map[string]string{"backend": backendName, "destination": destination})
 		return nil, &core.ErrPublishFailed{Backend: backendName, Destination: destination, Cause: err}
 	}
 
@@ -870,14 +809,11 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 				"timeout": options.Timeout.String(),
 			},
 		})
-		b.emitCounter("weave.transport.call.timeouts", map[string]string{"backend": backendName, "destination": destination})
-		b.emitDuration("weave.transport.call.duration", time.Since(callStart), map[string]string{"backend": backendName, "destination": destination, "outcome": "timeout"})
 		return nil, &core.ErrTimeout{Operation: "Call", Duration: options.Timeout.String()}
 	case response := <-respChan:
 		if response == nil {
 			return nil, &core.ErrConnectionLost{Backend: backendName}
 		}
-		b.emitDuration("weave.transport.call.duration", time.Since(callStart), map[string]string{"backend": backendName, "destination": destination, "outcome": "success"})
 		return &core.Message{
 			Body:          response.Body,
 			CorrelationID: response.CorrelationId,

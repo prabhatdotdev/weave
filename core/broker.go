@@ -63,25 +63,5 @@ type MessageBroker interface {
 	Subscriber
 }
 
-// Client is a subset of MessageBroker for client-only operations.
-// Use this interface when you only need to publish messages or make RPC calls,
-// without subscribing to messages (server-side).
-type Client interface {
-	Connector
-	Publisher
-	Caller
-}
-
-// Server is a subset of MessageBroker for server-only operations.
-// Use this interface when you only need to subscribe to messages,
-// without publishing (client-side).
-type Server interface {
-	Connector
-	Subscriber
-}
-
 // Handler is a function that processes incoming messages.
 type Handler func(ctx context.Context, msg *Message) error
-
-// BrokerFactory is a function that creates a new MessageBroker instance.
-type BrokerFactory func(config *Config) (MessageBroker, error)

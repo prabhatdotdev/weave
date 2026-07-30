@@ -8,7 +8,7 @@ cd "$ROOT_DIR"
 COVERAGE_MIN=${COVERAGE_MIN:-75.0}
 COVERAGE_FILE=${COVERAGE_FILE:-coverage.critical.out}
 COVERAGE_HTML_FILE=${COVERAGE_HTML_FILE:-coverage.critical.html}
-COVERAGE_PACKAGES=${COVERAGE_PACKAGES:-"./core ./runtime ./testkit ./transport/amqp ./transport/kafka"}
+COVERAGE_PACKAGES=${COVERAGE_PACKAGES:-"./codec ./core ./testkit ./transport/amqp ./transport/kafka"}
 GOCACHE_DIR=${GOCACHE:-"$ROOT_DIR/.gocache"}
 
 mkdir -p "$GOCACHE_DIR"

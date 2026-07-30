@@ -150,14 +150,6 @@ func TestNewBrokerAppliesDefaults(t *testing.T) {
 		t.Fatalf("default AMQP config not applied: %#v", broker.amqpConfig)
 	}
 
-	shorthandAny, err := NewBroker(&core.Config{Host: "rabbitmq", Username: "user"})
-	if err != nil {
-		t.Fatalf("NewBroker() with shorthand config error = %v", err)
-	}
-	shorthand := shorthandAny.(*Broker)
-	if shorthand.amqpConfig.Host != "rabbitmq" || shorthand.amqpConfig.Port != 5672 || shorthand.amqpConfig.Username != "user" || shorthand.amqpConfig.Password != "guest" || shorthand.amqpConfig.VHost != "/" {
-		t.Fatalf("shorthand AMQP config not normalized: %#v", shorthand.amqpConfig)
-	}
 }
 
 func TestBrokerLifecycleAndDisconnectedOperations(t *testing.T) {
