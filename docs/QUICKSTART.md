@@ -60,8 +60,12 @@ For Kafka:
 config := core.DefaultConfig()
 config.Kafka = core.DefaultKafkaConfig()
 config.Kafka.ConsumerGroup = "demo"
+config.Kafka.ReplyTopic = "demo.replies"
 broker, err := kafka.NewBroker(config)
 ```
+
+Provision `demo.replies` before using `Call`. Kafka topic auto-creation is
+disabled by the transport, and the application owns cleanup of its reply topic.
 
 Both constructors return `core.MessageBroker`, so the rest of the program is
 transport-independent.

@@ -323,7 +323,7 @@ func TestReplyConsumerInitializationRetriesAfterFailure(t *testing.T) {
 	producer := &fakeSyncProducer{}
 	broker := &Broker{
 		config:      &core.Config{},
-		kafkaConfig: &core.KafkaConfig{ClientID: "test"},
+		kafkaConfig: &core.KafkaConfig{ClientID: "test", ReplyTopic: "reply-topic"},
 		producer:    producer,
 		pending:     make(map[string]*pendingCall),
 		closeChan:   make(chan struct{}),
@@ -373,10 +373,43 @@ func TestReplyConsumerInitializationRetriesAfterFailure(t *testing.T) {
 	}
 }
 
+func TestCallRequiresConfiguredReplyTopic(t *testing.T) {
+	producer := &fakeSyncProducer{}
+	broker := &Broker{
+		config:      &core.Config{},
+		kafkaConfig: &core.KafkaConfig{ConsumerGroup: "workers"},
+		producer:    producer,
+		consumer:    &fakeConsumerGroup{},
+		pending:     make(map[string]*pendingCall),
+		closeChan:   make(chan struct{}),
+		connected:   true,
+	}
+
+	response, err := broker.Call(context.Background(), "users.get", core.NewTextMessage("request"))
+	if response != nil || !errors.Is(err, core.ErrInvalidConfig) {
+		t.Fatalf("Call() = %#v, %v; want nil, ErrInvalidConfig", response, err)
+	}
+	if producer.lastMsg != nil {
+		t.Fatal("Call() published before validating the reply topic")
+	}
+	broker.subsMu.RLock()
+	defer broker.subsMu.RUnlock()
+	if len(broker.subs) != 0 {
+		t.Fatalf("subscriptions after invalid Call() = %d, want 0", len(broker.subs))
+	}
+}
+
+func TestSaramaConfigDisablesAutoTopicCreation(t *testing.T) {
+	broker := &Broker{kafkaConfig: core.DefaultKafkaConfig()}
+	if broker.buildSaramaConfig().Metadata.AllowAutoTopicCreation {
+		t.Fatal("Kafka metadata requests allow topic auto-creation")
+	}
+}
+
 func TestReplyConsumerInitializationIsSerialized(t *testing.T) {
 	broker := &Broker{
 		config:      &core.Config{},
-		kafkaConfig: &core.KafkaConfig{ClientID: "test", ConsumerGroup: "workers"},
+		kafkaConfig: &core.KafkaConfig{ClientID: "test", ConsumerGroup: "workers", ReplyTopic: "reply-topic"},
 		consumer:    &fakeConsumerGroup{},
 		pending:     make(map[string]*pendingCall),
 		closeChan:   make(chan struct{}),
@@ -1015,6 +1048,7 @@ func TestReplyConsumerSurvivesRepeatedReconnects(t *testing.T) {
 			Brokers:       []string{"kafka:9092"},
 			ClientID:      "client",
 			ConsumerGroup: "workers",
+			ReplyTopic:    "reply-topic",
 		},
 		producer:      producers[0],
 		consumer:      consumers[0],

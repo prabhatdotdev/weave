@@ -331,19 +331,6 @@ func TestReplyConsumerInitializationRetryWithLiveKafka(t *testing.T) {
 		t.Fatalf("retry ensureReplyConsumer() error = %v", err)
 	}
 
-	replyTopic := broker.currentReplyTopic()
-	admin, err := sarama.NewClusterAdmin(broker.kafkaConfig.Brokers, sarama.NewConfig())
-	if err != nil {
-		t.Fatalf("create Kafka admin: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = admin.DeleteTopic(replyTopic)
-		_ = admin.Close()
-	})
-	if err := admin.CreateTopic(replyTopic, &sarama.TopicDetail{NumPartitions: 1, ReplicationFactor: 1}, false); err != nil && !errors.Is(err, sarama.ErrTopicAlreadyExists) {
-		t.Fatalf("create reply topic: %v", err)
-	}
-
 	responderConfig := core.DefaultConfig()
 	responderConfig.Kafka = core.DefaultKafkaConfig()
 	responderConfig.Kafka.Brokers = broker.kafkaConfig.Brokers
@@ -405,25 +392,34 @@ func TestReplyConsumerSurvivesReconnectsWithLiveKafka(t *testing.T) {
 	}
 }
 
+func TestConfiguredReplyTopicWithLiveKafka(t *testing.T) {
+	broker, responder, requestTopic, ctx := newLiveKafkaRPCPair(t, "fix-010")
+	if got, want := broker.currentReplyTopic(), broker.kafkaConfig.ReplyTopic; got != want {
+		t.Fatalf("reply topic = %q, want configured topic %q", got, want)
+	}
+
+	if err := responder.Subscribe(ctx, requestTopic, func(_ context.Context, request *core.Message) error {
+		response := core.NewTextMessage("response").WithCorrelationID(request.CorrelationID)
+		return responder.Publish(ctx, request.ReplyTo, response)
+	}); err != nil {
+		t.Fatalf("Subscribe(%s) error = %v", requestTopic, err)
+	}
+
+	response, err := broker.Call(ctx, requestTopic, core.NewTextMessage("request"), core.WithTimeout(10*time.Second))
+	if err != nil {
+		t.Fatalf("Call() error = %v", err)
+	}
+	if response.BodyString() != "response" {
+		t.Fatalf("Call() response = %q, want response", response.BodyString())
+	}
+}
+
 func newLiveKafkaRPCPair(t *testing.T, name string) (*Broker, *Broker, string, context.Context) {
 	t.Helper()
 	broker, topics, ctx := newLiveKafkaBroker(t, name, 1)
 	if err := broker.ensureReplyConsumer(); err != nil {
 		t.Fatalf("initialize reply consumer: %v", err)
 	}
-	replyTopic := broker.currentReplyTopic()
-	admin, err := sarama.NewClusterAdmin(broker.kafkaConfig.Brokers, sarama.NewConfig())
-	if err != nil {
-		t.Fatalf("create Kafka admin: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = admin.DeleteTopic(replyTopic)
-		_ = admin.Close()
-	})
-	if err := admin.CreateTopic(replyTopic, &sarama.TopicDetail{NumPartitions: 1, ReplicationFactor: 1}, false); err != nil && !errors.Is(err, sarama.ErrTopicAlreadyExists) {
-		t.Fatalf("create reply topic: %v", err)
-	}
-
 	responderConfig := core.DefaultConfig()
 	responderConfig.Kafka = core.DefaultKafkaConfig()
 	responderConfig.Kafka.Brokers = broker.kafkaConfig.Brokers
@@ -458,18 +454,20 @@ func newLiveKafkaBroker(t *testing.T, name string, topicCount int) (*Broker, []s
 	for i := range topics {
 		topics[i] = fmt.Sprintf("weave-%s-%d-%d", name, i, suffix)
 	}
+	replyTopic := fmt.Sprintf("weave-%s-replies-%d", name, suffix)
+	managedTopics := append(append([]string(nil), topics...), replyTopic)
 
 	admin, err := sarama.NewClusterAdmin(brokers, sarama.NewConfig())
 	if err != nil {
 		t.Fatalf("create Kafka admin: %v", err)
 	}
 	t.Cleanup(func() {
-		for _, topic := range topics {
+		for _, topic := range managedTopics {
 			_ = admin.DeleteTopic(topic)
 		}
 		_ = admin.Close()
 	})
-	for _, topic := range topics {
+	for _, topic := range managedTopics {
 		if err := admin.CreateTopic(topic, &sarama.TopicDetail{NumPartitions: 1, ReplicationFactor: 1}, false); err != nil {
 			t.Fatalf("create topic %s: %v", topic, err)
 		}
@@ -480,6 +478,7 @@ func newLiveKafkaBroker(t *testing.T, name string, topicCount int) (*Broker, []s
 	config.Kafka.Brokers = brokers
 	config.Kafka.ClientID = fmt.Sprintf("weave-%s-%d", name, suffix)
 	config.Kafka.ConsumerGroup = fmt.Sprintf("weave-%s-%d", name, suffix)
+	config.Kafka.ReplyTopic = replyTopic
 	config.Kafka.AutoOffsetReset = "earliest"
 
 	brokerAny, err := NewBroker(config)

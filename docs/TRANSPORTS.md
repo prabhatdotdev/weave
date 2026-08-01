@@ -26,12 +26,19 @@ config.Kafka = core.DefaultKafkaConfig()
 config.Kafka.Brokers = []string{"kafka:9092"}
 config.Kafka.ClientID = "orders"
 config.Kafka.ConsumerGroup = "orders"
+config.Kafka.ReplyTopic = "orders.replies"
 
 broker, err := kafka.NewBroker(config)
 ```
 
 Kafka supports keys, explicit partitions, consumer groups, offset selection,
 request/reply, SASL configuration, and connection recovery.
+
+Kafka does not auto-create topics. Provision publish, subscription, and reply
+topics before use. `ReplyTopic` is required only for `Call`; the application
+owns it and must delete it when the caller deployment is retired. Use a unique
+reply topic and consumer group per concurrently running caller so another
+caller cannot consume its responses.
 
 ## Common lifecycle
 

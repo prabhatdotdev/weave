@@ -227,6 +227,7 @@ func (b *Broker) buildSaramaConfig() *sarama.Config {
 	saramaConfig.Producer.RequiredAcks = sarama.RequiredAcks(b.kafkaConfig.RequiredAcks)
 	saramaConfig.Producer.Retry.Max = b.kafkaConfig.MaxRetries
 	saramaConfig.Producer.Retry.Backoff = b.kafkaConfig.RetryBackoff
+	saramaConfig.Metadata.AllowAutoTopicCreation = false
 
 	saramaConfig.Consumer.Group.Session.Timeout = b.kafkaConfig.SessionTimeout
 	saramaConfig.Consumer.Group.Heartbeat.Interval = b.kafkaConfig.HeartbeatInterval
@@ -654,7 +655,10 @@ func (b *Broker) ensureReplyConsumer() error {
 		return nil
 	}
 
-	replyTopic := fmt.Sprintf("reply-%s-%s", b.kafkaConfig.ClientID, rand.Text()[:8])
+	replyTopic := b.kafkaConfig.ReplyTopic
+	if replyTopic == "" {
+		return fmt.Errorf("%w: Kafka reply topic must be configured", core.ErrInvalidConfig)
+	}
 	if err := b.subscribe(context.Background(), replyTopic, func(ctx context.Context, msg *core.Message) error {
 		return nil
 	}, false); err != nil {

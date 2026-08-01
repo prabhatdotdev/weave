@@ -45,6 +45,7 @@ type KafkaConfig struct {
 	Brokers           []string
 	ClientID          string
 	ConsumerGroup     string
+	ReplyTopic        string
 	RequiredAcks      int
 	MaxRetries        int
 	RetryBackoff      time.Duration
