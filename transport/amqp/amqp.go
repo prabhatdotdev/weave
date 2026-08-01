@@ -99,6 +99,19 @@ type subscriptionRegistration struct {
 	opts        []core.SubscribeOption
 }
 
+type pendingCall struct {
+	once     sync.Once
+	response chan *amqplib.Delivery
+}
+
+func newPendingCall() *pendingCall {
+	return &pendingCall{response: make(chan *amqplib.Delivery, 1)}
+}
+
+func (p *pendingCall) complete(response *amqplib.Delivery) {
+	p.once.Do(func() { p.response <- response })
+}
+
 // Broker implements the core.MessageBroker interface for AMQP/RabbitMQ.
 type Broker struct {
 	config     *core.Config
@@ -109,7 +122,7 @@ type Broker struct {
 
 	replyQueue        string
 	replyConsumerStop chan struct{}
-	pending           map[string]chan *amqplib.Delivery
+	pending           map[string]*pendingCall
 	pendingMu         sync.RWMutex
 	subs              []subscriptionRegistration
 	subsMu            sync.RWMutex
@@ -154,7 +167,7 @@ func NewBroker(config *core.Config) (core.MessageBroker, error) {
 			}
 			return &amqpConnectionAdapter{conn: conn}, nil
 		},
-		pending:   make(map[string]chan *amqplib.Delivery),
+		pending:   make(map[string]*pendingCall),
 		closeChan: make(chan struct{}),
 	}, nil
 }
@@ -752,9 +765,13 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 		corrID = rand.Text()
 	}
 
-	respChan := make(chan *amqplib.Delivery, 1)
+	pending := newPendingCall()
 	b.pendingMu.Lock()
-	b.pending[corrID] = respChan
+	if _, exists := b.pending[corrID]; exists {
+		b.pendingMu.Unlock()
+		return nil, fmt.Errorf("%w: %q", core.ErrDuplicateCorrelationID, corrID)
+	}
+	b.pending[corrID] = pending
 	b.pendingMu.Unlock()
 
 	defer func() {
@@ -810,7 +827,7 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 			},
 		})
 		return nil, &core.ErrTimeout{Operation: "Call", Duration: options.Timeout.String()}
-	case response := <-respChan:
+	case response := <-pending.response:
 		if response == nil {
 			return nil, &core.ErrConnectionLost{Backend: backendName}
 		}
@@ -869,11 +886,11 @@ func (b *Broker) handleResponses(msgs <-chan amqplib.Delivery, stop <-chan struc
 
 			corrID := msg.CorrelationId
 			b.pendingMu.RLock()
-			respChan, exists := b.pending[corrID]
+			pending, exists := b.pending[corrID]
 			b.pendingMu.RUnlock()
 
 			if exists {
-				respChan <- &msg
+				pending.complete(&msg)
 			}
 		}
 	}
@@ -881,11 +898,12 @@ func (b *Broker) handleResponses(msgs <-chan amqplib.Delivery, stop <-chan struc
 
 func (b *Broker) cancelAllPending() {
 	b.pendingMu.Lock()
-	defer b.pendingMu.Unlock()
+	pending := b.pending
+	b.pending = make(map[string]*pendingCall)
+	b.pendingMu.Unlock()
 
-	for key, ch := range b.pending {
-		close(ch)
-		delete(b.pending, key)
+	for _, call := range pending {
+		call.complete(nil)
 	}
 }
 
