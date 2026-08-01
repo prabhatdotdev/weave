@@ -66,4 +66,6 @@ the application's existing observability stack.
 
 Transport errors use concrete types such as `ErrNotConnected`, `ErrTimeout`,
 and `ErrConnectionLost`. The `IsNotConnected`, `IsTimeout`, and
-`IsConnectionLost` helpers use `errors.As`.
+`IsConnectionLost` helpers use `errors.As`. `ErrDuplicateCorrelationID` is a
+sentinel matched with `errors.Is` when another RPC call already has the same
+caller-supplied correlation ID in flight.

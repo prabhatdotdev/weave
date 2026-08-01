@@ -19,6 +19,7 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -35,6 +36,27 @@ type subscriptionRegistration struct {
 	destination string
 	handler     core.Handler
 	opts        []core.SubscribeOption
+	tracked     bool
+}
+
+type subscriptionRoute struct {
+	ctx     context.Context
+	handler core.Handler
+	workers chan struct{}
+	policy  core.HandlerErrorPolicy
+}
+
+type pendingCall struct {
+	once     sync.Once
+	response chan *core.Message
+}
+
+func newPendingCall() *pendingCall {
+	return &pendingCall{response: make(chan *core.Message, 1)}
+}
+
+func (p *pendingCall) complete(response *core.Message) {
+	p.once.Do(func() { p.response <- response })
 }
 
 // Broker implements the core.MessageBroker interface for Apache Kafka.
@@ -47,16 +69,17 @@ type Broker struct {
 	newSyncProducer  func([]string, *sarama.Config) (sarama.SyncProducer, error)
 	newConsumerGroup func([]string, string, *sarama.Config) (sarama.ConsumerGroup, error)
 
-	replyTopic string
-	pending    map[string]chan *core.Message
-	pendingMu  sync.RWMutex
-	subs       []subscriptionRegistration
-	subsMu     sync.RWMutex
-	nextSubID  uint64
-	runnersMu  sync.Mutex
-	runners    map[uint64]struct{}
-	watchMu    sync.Mutex
-	watching   map[sarama.ConsumerGroup]struct{}
+	replyTopic  string
+	pending     map[string]*pendingCall
+	pendingMu   sync.RWMutex
+	subs        []subscriptionRegistration
+	subsMu      sync.RWMutex
+	nextSubID   uint64
+	runnersMu   sync.Mutex
+	runner      bool
+	subsChanged chan struct{}
+	watchMu     sync.Mutex
+	watching    map[sarama.ConsumerGroup]struct{}
 
 	connected     bool
 	everConnected bool
@@ -94,8 +117,8 @@ func NewBroker(config *core.Config) (core.MessageBroker, error) {
 		kafkaConfig:      config.Kafka,
 		newSyncProducer:  sarama.NewSyncProducer,
 		newConsumerGroup: sarama.NewConsumerGroup,
-		pending:          make(map[string]chan *core.Message),
-		runners:          make(map[uint64]struct{}),
+		pending:          make(map[string]*pendingCall),
+		subsChanged:      make(chan struct{}, 1),
 		watching:         make(map[sarama.ConsumerGroup]struct{}),
 		closeChan:        make(chan struct{}),
 	}, nil
@@ -377,28 +400,28 @@ func (b *Broker) subscribe(ctx context.Context, destination string, handler core
 		return err
 	}
 
-	var reg subscriptionRegistration
-	if track {
-		reg = b.registerSubscription(ctx, destination, handler, opts)
-	}
+	reg := b.registerSubscription(ctx, destination, handler, opts, track)
 
-	if err := b.startSubscriptionConsumer(ctx, destination, handler, options, reg.id); err != nil {
-		if track {
-			b.unregisterSubscription(reg.id)
-		}
+	if err := b.startSubscriptionConsumer(ctx, destination, options); err != nil {
+		b.unregisterSubscription(reg.id)
 		return err
 	}
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			b.unregisterSubscription(reg.id)
+			b.restartSubscriptionRunner()
+		case <-b.closeChan:
+		}
+	}()
 
 	return nil
 }
 
-func (b *Broker) startSubscriptionConsumer(ctx context.Context, destination string, handler core.Handler, options *core.SubscribeOptions, subID uint64) error {
+func (b *Broker) startSubscriptionConsumer(ctx context.Context, destination string, options *core.SubscribeOptions) error {
 	if err := b.ensureConnected(); err != nil {
 		return err
-	}
-
-	if subID != 0 && !b.startRunner(subID) {
-		return nil
 	}
 
 	consumerGroup := options.ConsumerGroup
@@ -422,68 +445,139 @@ func (b *Broker) startSubscriptionConsumer(ctx context.Context, destination stri
 		}
 	}
 
-	cgHandler := &consumerGroupHandler{
-		handler:   handler,
-		closeChan: b.closeChan,
-		pending:   b.pending,
-		pendingMu: &b.pendingMu,
-		config:    b.config,
-		policy:    options.HandlerErrorPolicy,
+	b.restartSubscriptionRunner()
+	return nil
+}
+
+func (b *Broker) restartSubscriptionRunner() {
+	b.runnersMu.Lock()
+	if b.subsChanged == nil {
+		b.subsChanged = make(chan struct{}, 1)
 	}
-	if options.WorkerCount > 0 {
-		cgHandler.workers = make(chan struct{}, options.WorkerCount)
+	changed := b.subsChanged
+	if !b.runner {
+		b.runner = true
+		go b.runSubscriptionConsumer(changed)
+		b.runnersMu.Unlock()
+		return
 	}
+	b.runnersMu.Unlock()
 
-	go func() {
-		defer b.stopRunner(subID)
-		for {
-			select {
-			case <-b.closeChan:
-				return
-			case <-ctx.Done():
-				return
-			default:
-				consumer := b.currentConsumer()
-				if consumer == nil {
-					if err := b.ensureConnected(); err != nil {
-						b.emitEvent(ctx, core.Event{
-							Level:       core.EventLevelWarn,
-							Name:        core.EventConnect,
-							Operation:   "reconnect",
-							Destination: destination,
-							Err:         err,
-							Fields:      map[string]any{"outcome": "failure"},
-						})
-						time.Sleep(200 * time.Millisecond)
-						continue
-					}
-					consumer = b.currentConsumer()
-					if consumer == nil {
-						time.Sleep(200 * time.Millisecond)
-						continue
-					}
-				}
+	select {
+	case changed <- struct{}{}:
+	default:
+	}
+}
 
-				b.watchConsumerErrors(ctx, destination, consumer)
-
-				if err := consumer.Consume(ctx, []string{destination}, cgHandler); err != nil {
-					b.emitEvent(ctx, core.Event{
-						Level:       core.EventLevelError,
-						Name:        core.EventSubscribeFailed,
-						Operation:   "consume",
-						Destination: destination,
-						Err:         err,
-					})
-					if ctx.Err() != nil || b.isClosed() {
-						return
-					}
-					b.handleConsumerLoss(consumer, err)
-				}
-			}
-		}
+func (b *Broker) runSubscriptionConsumer(changed <-chan struct{}) {
+	defer func() {
+		b.runnersMu.Lock()
+		b.runner = false
+		b.runnersMu.Unlock()
 	}()
 
-	return nil
+	for {
+		topics, routes := b.activeSubscriptionRoutes()
+		if len(topics) == 0 {
+			select {
+			case <-changed:
+				continue
+			case <-b.closeChan:
+				return
+			}
+		}
+
+		if err := b.ensureConnected(); err != nil {
+			b.emitEvent(context.Background(), core.Event{
+				Level:       core.EventLevelWarn,
+				Name:        core.EventConnect,
+				Operation:   "reconnect",
+				Destination: "*",
+				Err:         err,
+				Fields:      map[string]any{"outcome": "failure"},
+			})
+			select {
+			case <-time.After(200 * time.Millisecond):
+			case <-b.closeChan:
+				return
+			}
+			continue
+		}
+
+		consumer := b.currentConsumer()
+		if consumer == nil {
+			select {
+			case <-time.After(200 * time.Millisecond):
+			case <-b.closeChan:
+				return
+			}
+			continue
+		}
+
+		consumeCtx, cancel := context.WithCancel(context.Background())
+		go func() {
+			select {
+			case <-changed:
+				cancel()
+			case <-consumeCtx.Done():
+			case <-b.closeChan:
+				cancel()
+			}
+		}()
+
+		b.watchConsumerErrors(consumeCtx, "*", consumer)
+		handler := &consumerGroupHandler{
+			routes:    routes,
+			closeChan: b.closeChan,
+			pending:   b.pending,
+			pendingMu: &b.pendingMu,
+			config:    b.config,
+		}
+		err := consumer.Consume(consumeCtx, topics, handler)
+		changedTopics := consumeCtx.Err() != nil
+		cancel()
+		if err == nil || changedTopics || b.isClosed() {
+			continue
+		}
+
+		b.emitEvent(context.Background(), core.Event{
+			Level:       core.EventLevelError,
+			Name:        core.EventSubscribeFailed,
+			Operation:   "consume",
+			Destination: "*",
+			Err:         err,
+		})
+		b.handleConsumerLoss(consumer, err)
+	}
+}
+
+func (b *Broker) activeSubscriptionRoutes() ([]string, map[string]subscriptionRoute) {
+	b.subsMu.RLock()
+	defer b.subsMu.RUnlock()
+
+	routes := make(map[string]subscriptionRoute, len(b.subs))
+	for _, sub := range b.subs {
+		if sub.ctx.Err() != nil {
+			continue
+		}
+		options := core.ApplySubscribeOptions(sub.opts...)
+		route := subscriptionRoute{
+			ctx:     sub.ctx,
+			handler: sub.handler,
+			policy:  options.HandlerErrorPolicy,
+		}
+		if options.WorkerCount > 0 {
+			route.workers = make(chan struct{}, options.WorkerCount)
+		}
+		routes[sub.destination] = route
+	}
+
+	topics := make([]string, 0, len(routes))
+	for topic := range routes {
+		topics = append(topics, topic)
+	}
+	sort.Strings(topics)
+	return topics, routes
 }
 
 // Call implements request-response pattern using correlation IDs and reply topics.
@@ -503,9 +597,13 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 		corrID = rand.Text()
 	}
 
-	respChan := make(chan *core.Message, 1)
+	pending := newPendingCall()
 	b.pendingMu.Lock()
-	b.pending[corrID] = respChan
+	if _, exists := b.pending[corrID]; exists {
+		b.pendingMu.Unlock()
+		return nil, fmt.Errorf("%w: %q", core.ErrDuplicateCorrelationID, corrID)
+	}
+	b.pending[corrID] = pending
 	b.pendingMu.Unlock()
 
 	defer func() {
@@ -539,7 +637,7 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 			},
 		})
 		return nil, &core.ErrTimeout{Operation: "Call", Duration: options.Timeout.String()}
-	case response := <-respChan:
+	case response := <-pending.response:
 		if response == nil {
 			return nil, &core.ErrConnectionLost{Backend: backendName}
 		}
@@ -565,11 +663,15 @@ func (b *Broker) ensureReplyConsumer() error {
 
 func (b *Broker) cancelAllPending() {
 	b.pendingMu.Lock()
-	defer b.pendingMu.Unlock()
-
-	for key, ch := range b.pending {
-		close(ch)
+	pending := make([]*pendingCall, 0, len(b.pending))
+	for key, call := range b.pending {
+		pending = append(pending, call)
 		delete(b.pending, key)
+	}
+	b.pendingMu.Unlock()
+
+	for _, call := range pending {
+		call.complete(nil)
 	}
 }
 
@@ -679,7 +781,7 @@ func (b *Broker) handleConnectionLossFor(expectedProducer sarama.SyncProducer, e
 	})
 }
 
-func (b *Broker) registerSubscription(ctx context.Context, destination string, handler core.Handler, opts []core.SubscribeOption) subscriptionRegistration {
+func (b *Broker) registerSubscription(ctx context.Context, destination string, handler core.Handler, opts []core.SubscribeOption, tracked bool) subscriptionRegistration {
 	b.subsMu.Lock()
 	defer b.subsMu.Unlock()
 	b.nextSubID++
@@ -689,6 +791,7 @@ func (b *Broker) registerSubscription(ctx context.Context, destination string, h
 		destination: destination,
 		handler:     handler,
 		opts:        append([]core.SubscribeOption(nil), opts...),
+		tracked:     tracked,
 	}
 	b.subs = append(b.subs, reg)
 	return reg
@@ -710,73 +813,39 @@ func (b *Broker) unregisterSubscription(id uint64) {
 
 func (b *Broker) restoreTrackedSubscriptions() {
 	b.subsMu.RLock()
-	subscriptions := append([]subscriptionRegistration(nil), b.subs...)
+	tracked := 0
+	for _, sub := range b.subs {
+		if sub.tracked && sub.ctx.Err() == nil {
+			tracked++
+		}
+	}
 	b.subsMu.RUnlock()
 
-	if len(subscriptions) > 0 {
+	if tracked > 0 {
 		b.emitEvent(context.Background(), core.Event{
 			Level:     core.EventLevelInfo,
 			Name:      "subscription_restore_started",
 			Operation: "restore_subscriptions",
 			Fields: map[string]any{
-				"subscription_count": len(subscriptions),
+				"subscription_count": tracked,
 			},
 		})
 	}
 
-	for _, sub := range subscriptions {
-		if sub.ctx.Err() != nil {
-			continue
-		}
-		options := core.ApplySubscribeOptions(sub.opts...)
-		err := b.startSubscriptionConsumer(sub.ctx, sub.destination, sub.handler, options, sub.id)
-		if err != nil {
-			b.emitEvent(context.Background(), core.Event{
-				Level:       core.EventLevelError,
-				Name:        "subscription_restore_failed",
-				Operation:   "restore_subscriptions",
-				Destination: sub.destination,
-				Err:         err,
-			})
-		}
-	}
+	b.restartSubscriptionRunner()
 
-	if len(subscriptions) > 0 {
+	if tracked > 0 {
 		b.emitEvent(context.Background(), core.Event{
 			Level:     core.EventLevelInfo,
 			Name:      "subscription_restore_completed",
 			Operation: "restore_subscriptions",
 			Fields: map[string]any{
-				"subscription_count": len(subscriptions),
+				"subscription_count": tracked,
 			},
 		})
 	}
 }
 
-func (b *Broker) startRunner(id uint64) bool {
-	if id == 0 {
-		return true
-	}
-	b.runnersMu.Lock()
-	defer b.runnersMu.Unlock()
-	if b.runners == nil {
-		b.runners = make(map[uint64]struct{})
-	}
-	if _, exists := b.runners[id]; exists {
-		return false
-	}
-	b.runners[id] = struct{}{}
-	return true
-}
-
-func (b *Broker) stopRunner(id uint64) {
-	if id == 0 {
-		return
-	}
-	b.runnersMu.Lock()
-	defer b.runnersMu.Unlock()
-	delete(b.runners, id)
-}
 func (b *Broker) currentProducer() sarama.SyncProducer {
 	b.closeMu.RLock()
 	defer b.closeMu.RUnlock()
@@ -858,12 +927,29 @@ func (b *Broker) watchConsumerErrors(ctx context.Context, destination string, co
 
 type consumerGroupHandler struct {
 	handler   core.Handler
+	routes    map[string]subscriptionRoute
 	closeChan chan struct{}
 	workers   chan struct{}
-	pending   map[string]chan *core.Message
+	pending   map[string]*pendingCall
 	pendingMu *sync.RWMutex
 	config    *core.Config
 	policy    core.HandlerErrorPolicy
+}
+
+func (h *consumerGroupHandler) route(topic string) (subscriptionRoute, bool) {
+	if len(h.routes) > 0 {
+		route, ok := h.routes[topic]
+		if route.ctx == nil {
+			route.ctx = context.Background()
+		}
+		return route, ok
+	}
+	return subscriptionRoute{
+		ctx:     context.Background(),
+		handler: h.handler,
+		workers: h.workers,
+		policy:  h.policy,
+	}, h.handler != nil
 }
 
 func (h *consumerGroupHandler) emitSubscribeFailure(destination string, err error) {
@@ -899,8 +985,6 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 				return nil
 			}
 
-			ctx := context.Background()
-
 			msg := &core.Message{
 				Body:      kafkaMsg.Value,
 				Subject:   string(kafkaMsg.Key),
@@ -929,18 +1013,24 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 
 			if correlationID != "" {
 				h.pendingMu.RLock()
-				respChan, exists := h.pending[correlationID]
+				pending, exists := h.pending[correlationID]
 				h.pendingMu.RUnlock()
 				if exists {
-					respChan <- msg
+					pending.complete(msg)
 					session.MarkMessage(kafkaMsg, "")
 					continue
 				}
 			}
 
-			if h.workers != nil {
+			route, ok := h.route(kafkaMsg.Topic)
+			if !ok {
+				session.MarkMessage(kafkaMsg, "")
+				continue
+			}
+
+			if route.workers != nil {
 				select {
-				case h.workers <- struct{}{}:
+				case route.workers <- struct{}{}:
 				case <-h.closeChan:
 					return nil
 				case <-session.Context().Done():
@@ -948,19 +1038,42 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 				}
 			}
 			err := func() error {
-				if h.workers != nil {
-					defer func() { <-h.workers }()
+				if route.workers != nil {
+					defer func() { <-route.workers }()
 				}
-				return h.handler(ctx, msg)
+				handlerCtx, release := mergeHandlerContexts(session.Context(), route.ctx)
+				defer release()
+				return callSubscriptionHandler(handlerCtx, route.handler, msg)
 			}()
 			if err != nil {
 				h.emitSubscribeFailure(kafkaMsg.Topic, err)
-				if h.policy == core.HandlerErrorRetry {
-					continue
+				if route.policy == core.HandlerErrorRetry {
+					return err
 				}
 			}
 
 			session.MarkMessage(kafkaMsg, "")
 		}
 	}
+}
+
+func mergeHandlerContexts(sessionCtx, subscriptionCtx context.Context) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(subscriptionCtx)
+	stop := context.AfterFunc(sessionCtx, cancel)
+	if sessionCtx.Err() != nil {
+		cancel()
+	}
+	return ctx, func() {
+		stop()
+		cancel()
+	}
+}
+
+func callSubscriptionHandler(ctx context.Context, handler core.Handler, msg *core.Message) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("handler panic: %v", recovered)
+		}
+	}()
+	return handler(ctx, msg)
 }

@@ -128,10 +128,11 @@ func (e *ErrConnectionFailed) Unwrap() error {
 
 // Sentinel errors for common conditions.
 var (
-	ErrClosed           = errors.New("broker is closed")
-	ErrNoReplyTo        = errors.New("no reply-to destination specified")
-	ErrAlreadyConnected = errors.New("broker is already connected")
-	ErrInvalidConfig    = errors.New("invalid configuration")
+	ErrClosed                 = errors.New("broker is closed")
+	ErrNoReplyTo              = errors.New("no reply-to destination specified")
+	ErrAlreadyConnected       = errors.New("broker is already connected")
+	ErrInvalidConfig          = errors.New("invalid configuration")
+	ErrDuplicateCorrelationID = errors.New("duplicate RPC correlation ID")
 )
 
 // IsNotConnected returns true if the error indicates the broker is not connected.

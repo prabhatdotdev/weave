@@ -34,6 +34,20 @@ jobs:
       - name: Run tests with race detector
         run: make test-verbose
 
+      - name: Run Kafka integration test
+        env:
+          WEAVE_KAFKA_E2E: "1"
+        run: |
+          docker compose -f examples/amqp-kafka/compose.yaml up -d --wait kafka
+          go test -race ./transport/kafka -run 'WithLiveKafka$' -count=1
+
+      - name: Run RabbitMQ integration test
+        env:
+          WEAVE_AMQP_E2E: "1"
+        run: |
+          docker compose -f examples/amqp-kafka/compose.yaml up -d --wait rabbitmq
+          go test -race ./transport/amqp -run 'WithLiveRabbitMQ$' -count=1
+
       - name: Enforce critical package coverage
         env:
           COVERAGE_MIN: "75.0"

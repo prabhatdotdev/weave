@@ -3,6 +3,7 @@ package kafka
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -90,6 +91,7 @@ func (g *fakeConsumerGroup) ResumeAll()                {}
 type fakeSession struct {
 	mu     sync.Mutex
 	marked []*sarama.ConsumerMessage
+	ctx    context.Context
 }
 
 func (s *fakeSession) Claims() map[string][]int32               { return nil }
@@ -103,7 +105,12 @@ func (s *fakeSession) MarkMessage(msg *sarama.ConsumerMessage, metadata string) 
 	defer s.mu.Unlock()
 	s.marked = append(s.marked, msg)
 }
-func (s *fakeSession) Context() context.Context { return context.Background() }
+func (s *fakeSession) Context() context.Context {
+	if s.ctx != nil {
+		return s.ctx
+	}
+	return context.Background()
+}
 
 type fakeClaim struct {
 	messages chan *sarama.ConsumerMessage
@@ -183,7 +190,7 @@ func TestPublishBuildsKafkaMessageAndErrors(t *testing.T) {
 		config:      &core.Config{},
 		kafkaConfig: core.DefaultKafkaConfig(),
 		producer:    producer,
-		pending:     make(map[string]chan *core.Message),
+		pending:     make(map[string]*pendingCall),
 		closeChan:   make(chan struct{}),
 		connected:   true,
 	}
@@ -232,7 +239,7 @@ func TestSubscribeRequiresConsumerGroup(t *testing.T) {
 	broker := &Broker{
 		config:      &core.Config{},
 		kafkaConfig: &core.KafkaConfig{},
-		pending:     make(map[string]chan *core.Message),
+		pending:     make(map[string]*pendingCall),
 		closeChan:   make(chan struct{}),
 		connected:   true,
 	}
@@ -250,7 +257,7 @@ func TestSubscribeRejectsNegativeWorkerCount(t *testing.T) {
 	broker := &Broker{
 		config:      &core.Config{},
 		kafkaConfig: core.DefaultKafkaConfig(),
-		pending:     make(map[string]chan *core.Message),
+		pending:     make(map[string]*pendingCall),
 		closeChan:   make(chan struct{}),
 	}
 
@@ -267,7 +274,7 @@ func TestCallTimeoutAndCorrelationFlow(t *testing.T) {
 			config:      &core.Config{},
 			kafkaConfig: core.DefaultKafkaConfig(),
 			producer:    producer,
-			pending:     make(map[string]chan *core.Message),
+			pending:     make(map[string]*pendingCall),
 			closeChan:   make(chan struct{}),
 			connected:   true,
 			replyTopic:  "reply-topic",
@@ -286,7 +293,7 @@ func TestCallTimeoutAndCorrelationFlow(t *testing.T) {
 		broker := &Broker{
 			config:      &core.Config{},
 			kafkaConfig: core.DefaultKafkaConfig(),
-			pending:     make(map[string]chan *core.Message),
+			pending:     make(map[string]*pendingCall),
 			closeChan:   make(chan struct{}),
 			connected:   true,
 			replyTopic:  "reply-topic",
@@ -296,9 +303,9 @@ func TestCallTimeoutAndCorrelationFlow(t *testing.T) {
 		producer.afterSend = func(msg *sarama.ProducerMessage) {
 			corrID := headerValue(msg, "correlation-id")
 			broker.pendingMu.RLock()
-			respChan := broker.pending[corrID]
+			pending := broker.pending[corrID]
 			broker.pendingMu.RUnlock()
-			respChan <- core.NewTextMessage("response")
+			pending.complete(core.NewTextMessage("response"))
 		}
 		broker.producer = producer
 
@@ -312,31 +319,175 @@ func TestCallTimeoutAndCorrelationFlow(t *testing.T) {
 	})
 }
 
-func TestCancelAllPendingClosesChannels(t *testing.T) {
+func TestCancelAllPendingSignalsConnectionLoss(t *testing.T) {
 	t.Parallel()
 
-	broker := &Broker{pending: make(map[string]chan *core.Message)}
-	ch1 := make(chan *core.Message)
-	ch2 := make(chan *core.Message)
-	broker.pending["one"] = ch1
-	broker.pending["two"] = ch2
+	broker := &Broker{pending: make(map[string]*pendingCall)}
+	call1 := newPendingCall()
+	call2 := newPendingCall()
+	broker.pending["one"] = call1
+	broker.pending["two"] = call2
 
 	broker.cancelAllPending()
 
 	if len(broker.pending) != 0 {
 		t.Fatalf("pending map length = %d, want 0", len(broker.pending))
 	}
-	if _, ok := <-ch1; ok {
-		t.Fatal("pending channel ch1 should be closed")
+	if response := <-call1.response; response != nil {
+		t.Fatalf("pending call one response = %#v, want nil", response)
 	}
-	if _, ok := <-ch2; ok {
-		t.Fatal("pending channel ch2 should be closed")
+	if response := <-call2.response; response != nil {
+		t.Fatalf("pending call two response = %#v, want nil", response)
+	}
+}
+
+func TestCallRejectsConcurrentDuplicateCorrelationIDs(t *testing.T) {
+	broker := &Broker{
+		config:      &core.Config{},
+		kafkaConfig: core.DefaultKafkaConfig(),
+		producer:    &fakeSyncProducer{},
+		pending:     make(map[string]*pendingCall),
+		closeChan:   make(chan struct{}),
+		connected:   true,
+		replyTopic:  "reply-topic",
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	type callResult struct {
+		response *core.Message
+		err      error
+	}
+	for i := 0; i < 1000; i++ {
+		results := make(chan callResult, 2)
+		start := make(chan struct{})
+		for range 2 {
+			go func() {
+				<-start
+				response, err := broker.Call(ctx, "users.get", core.NewTextMessage("request").WithCorrelationID("shared-id"))
+				results <- callResult{response: response, err: err}
+			}()
+		}
+		close(start)
+
+		var duplicate callResult
+		select {
+		case duplicate = <-results:
+		case <-ctx.Done():
+			t.Fatal("duplicate call did not return")
+		}
+		if !errors.Is(duplicate.err, core.ErrDuplicateCorrelationID) {
+			t.Fatalf("iteration %d duplicate error = %v, want ErrDuplicateCorrelationID", i, duplicate.err)
+		}
+
+		broker.pendingMu.RLock()
+		pending := broker.pending["shared-id"]
+		broker.pendingMu.RUnlock()
+		if pending == nil {
+			t.Fatalf("iteration %d winning call was not reserved", i)
+		}
+		pending.complete(core.NewTextMessage("response").WithCorrelationID("shared-id"))
+
+		select {
+		case winner := <-results:
+			if winner.err != nil || winner.response.BodyString() != "response" {
+				t.Fatalf("iteration %d winning result = %#v, %v", i, winner.response, winner.err)
+			}
+		case <-ctx.Done():
+			t.Fatal("winning call was stranded")
+		}
+	}
+}
+
+func TestConcurrentResponseDeliveryAndDisconnect(t *testing.T) {
+	for i := 0; i < 1000; i++ {
+		broker := &Broker{pending: make(map[string]*pendingCall)}
+		pending := newPendingCall()
+		broker.pending["corr-1"] = pending
+		handler := &consumerGroupHandler{
+			closeChan: make(chan struct{}),
+			pending:   broker.pending,
+			pendingMu: &broker.pendingMu,
+		}
+		claim := &fakeClaim{messages: make(chan *sarama.ConsumerMessage, 1)}
+		claim.messages <- &sarama.ConsumerMessage{
+			Topic:   "reply-topic",
+			Headers: []*sarama.RecordHeader{{Key: []byte("correlation-id"), Value: []byte("corr-1")}},
+		}
+		close(claim.messages)
+
+		start := make(chan struct{})
+		consumeDone := make(chan error, 1)
+		cancelDone := make(chan struct{})
+		go func() {
+			<-start
+			consumeDone <- handler.ConsumeClaim(&fakeSession{}, claim)
+		}()
+		go func() {
+			<-start
+			broker.cancelAllPending()
+			close(cancelDone)
+		}()
+
+		close(start)
+		if err := <-consumeDone; err != nil {
+			t.Fatalf("iteration %d ConsumeClaim() error = %v", i, err)
+		}
+		<-cancelDone
+
+		response := <-pending.response
+		if response != nil && response.CorrelationID != "corr-1" {
+			t.Fatalf("iteration %d correlation ID = %q, want corr-1", i, response.CorrelationID)
+		}
+		select {
+		case duplicate := <-pending.response:
+			t.Fatalf("iteration %d delivered a second result: %#v", i, duplicate)
+		default:
+		}
 	}
 }
 
 func TestConsumerGroupHandlerRoutesResponsesAndInvokesHandlers(t *testing.T) {
+	t.Run("routes messages to handlers by topic", func(t *testing.T) {
+		called := make(map[string]int)
+		handler := &consumerGroupHandler{
+			routes: map[string]subscriptionRoute{
+				"users": {
+					handler: func(context.Context, *core.Message) error {
+						called["users"]++
+						return nil
+					},
+				},
+				"orders": {
+					handler: func(context.Context, *core.Message) error {
+						called["orders"]++
+						return nil
+					},
+				},
+			},
+			closeChan: make(chan struct{}),
+			pending:   make(map[string]*pendingCall),
+			pendingMu: &sync.RWMutex{},
+		}
+
+		claim := &fakeClaim{messages: make(chan *sarama.ConsumerMessage, 2)}
+		claim.messages <- &sarama.ConsumerMessage{Topic: "users"}
+		claim.messages <- &sarama.ConsumerMessage{Topic: "orders"}
+		close(claim.messages)
+		session := &fakeSession{}
+		if err := handler.ConsumeClaim(session, claim); err != nil {
+			t.Fatalf("ConsumeClaim() error = %v", err)
+		}
+		if called["users"] != 1 || called["orders"] != 1 {
+			t.Fatalf("handler calls = %v, want one call per topic", called)
+		}
+		if len(session.marked) != 2 {
+			t.Fatalf("marked messages = %d, want 2", len(session.marked))
+		}
+	})
+
 	t.Run("routes response by correlation id", func(t *testing.T) {
-		pending := map[string]chan *core.Message{"corr-1": make(chan *core.Message, 1)}
+		pending := map[string]*pendingCall{"corr-1": newPendingCall()}
 		handlerCalled := false
 		handler := &consumerGroupHandler{
 			handler: func(context.Context, *core.Message) error {
@@ -362,7 +513,7 @@ func TestConsumerGroupHandlerRoutesResponsesAndInvokesHandlers(t *testing.T) {
 			t.Fatalf("ConsumeClaim() error = %v", err)
 		}
 		select {
-		case response := <-pending["corr-1"]:
+		case response := <-pending["corr-1"].response:
 			if response.CorrelationID != "corr-1" {
 				t.Fatalf("response.CorrelationID = %q, want %q", response.CorrelationID, "corr-1")
 			}
@@ -385,7 +536,7 @@ func TestConsumerGroupHandlerRoutesResponsesAndInvokesHandlers(t *testing.T) {
 				return nil
 			},
 			closeChan: make(chan struct{}),
-			pending:   make(map[string]chan *core.Message),
+			pending:   make(map[string]*pendingCall),
 			pendingMu: &sync.RWMutex{},
 		}
 
@@ -426,7 +577,7 @@ func TestConsumerGroupHandlerRoutesResponsesAndInvokesHandlers(t *testing.T) {
 				return errors.New("boom")
 			},
 			closeChan: make(chan struct{}),
-			pending:   make(map[string]chan *core.Message),
+			pending:   make(map[string]*pendingCall),
 			pendingMu: &sync.RWMutex{},
 			policy:    core.HandlerErrorNoRetry,
 		}
@@ -444,27 +595,197 @@ func TestConsumerGroupHandlerRoutesResponsesAndInvokesHandlers(t *testing.T) {
 		}
 	})
 
-	t.Run("handler error does not commit when retry policy enabled", func(t *testing.T) {
+	t.Run("handler error stops claim without committing when retry policy enabled", func(t *testing.T) {
+		handlerCalls := 0
 		handler := &consumerGroupHandler{
 			handler: func(context.Context, *core.Message) error {
+				handlerCalls++
 				return errors.New("boom")
 			},
 			closeChan: make(chan struct{}),
-			pending:   make(map[string]chan *core.Message),
+			pending:   make(map[string]*pendingCall),
 			pendingMu: &sync.RWMutex{},
 			policy:    core.HandlerErrorRetry,
 		}
 
-		claim := &fakeClaim{messages: make(chan *sarama.ConsumerMessage, 1)}
+		claim := &fakeClaim{messages: make(chan *sarama.ConsumerMessage, 2)}
 		claim.messages <- &sarama.ConsumerMessage{Topic: "users", Offset: 12}
+		claim.messages <- &sarama.ConsumerMessage{Topic: "users", Offset: 13}
+		close(claim.messages)
+
+		session := &fakeSession{}
+		if err := handler.ConsumeClaim(session, claim); err == nil {
+			t.Fatal("ConsumeClaim() error = nil, want handler error")
+		}
+		if len(session.marked) != 0 {
+			t.Fatalf("marked messages = %d, want 0", len(session.marked))
+		}
+		if handlerCalls != 1 {
+			t.Fatalf("handler calls = %d, want 1", handlerCalls)
+		}
+	})
+
+	t.Run("handler panic is contained and committed by no-retry policy", func(t *testing.T) {
+		handlerCalls := 0
+		events := make(chan core.Event, 1)
+		handler := &consumerGroupHandler{
+			handler: func(context.Context, *core.Message) error {
+				handlerCalls++
+				if handlerCalls == 1 {
+					panic("boom")
+				}
+				return nil
+			},
+			closeChan: make(chan struct{}),
+			pending:   make(map[string]*pendingCall),
+			pendingMu: &sync.RWMutex{},
+			config: &core.Config{EventHook: func(_ context.Context, event core.Event) {
+				events <- event
+			}},
+			policy: core.HandlerErrorNoRetry,
+		}
+		claim := &fakeClaim{messages: make(chan *sarama.ConsumerMessage, 2)}
+		claim.messages <- &sarama.ConsumerMessage{Topic: "users", Offset: 14}
+		claim.messages <- &sarama.ConsumerMessage{Topic: "users", Offset: 15}
 		close(claim.messages)
 
 		session := &fakeSession{}
 		if err := handler.ConsumeClaim(session, claim); err != nil {
 			t.Fatalf("ConsumeClaim() error = %v", err)
 		}
+		if handlerCalls != 2 {
+			t.Fatalf("handler calls = %d, want 2", handlerCalls)
+		}
+		if len(session.marked) != 2 {
+			t.Fatalf("marked messages = %d, want 2", len(session.marked))
+		}
+		select {
+		case event := <-events:
+			if event.Operation != "handler" || event.Err == nil || !strings.Contains(event.Err.Error(), "handler panic: boom") {
+				t.Fatalf("unexpected panic event: %#v", event)
+			}
+		default:
+			t.Fatal("handler panic did not emit a failure event")
+		}
+	})
+
+	t.Run("handler panic stops claim when retry policy enabled", func(t *testing.T) {
+		handlerCalls := 0
+		handler := &consumerGroupHandler{
+			handler: func(context.Context, *core.Message) error {
+				handlerCalls++
+				panic("boom")
+			},
+			closeChan: make(chan struct{}),
+			pending:   make(map[string]*pendingCall),
+			pendingMu: &sync.RWMutex{},
+			policy:    core.HandlerErrorRetry,
+		}
+		claim := &fakeClaim{messages: make(chan *sarama.ConsumerMessage, 2)}
+		claim.messages <- &sarama.ConsumerMessage{Topic: "users", Offset: 16}
+		claim.messages <- &sarama.ConsumerMessage{Topic: "users", Offset: 17}
+		close(claim.messages)
+
+		session := &fakeSession{}
+		err := handler.ConsumeClaim(session, claim)
+		if err == nil || !strings.Contains(err.Error(), "handler panic: boom") {
+			t.Fatalf("ConsumeClaim() error = %v, want recovered panic", err)
+		}
+		if handlerCalls != 1 {
+			t.Fatalf("handler calls = %d, want 1", handlerCalls)
+		}
 		if len(session.marked) != 0 {
 			t.Fatalf("marked messages = %d, want 0", len(session.marked))
+		}
+	})
+}
+
+func TestConsumerGroupHandlerPropagatesSubscriptionAndSessionContexts(t *testing.T) {
+	t.Run("session cancellation preserves subscription values and deadline", func(t *testing.T) {
+		type contextKey struct{}
+		key := contextKey{}
+		valueCtx := context.WithValue(context.Background(), key, "trace-123")
+		subscriptionCtx, cancelSubscription := context.WithTimeout(valueCtx, time.Hour)
+		defer cancelSubscription()
+		sessionCtx, cancelSession := context.WithCancel(context.Background())
+		cancelSession()
+
+		var gotErr error
+		var gotValue any
+		var gotDeadline bool
+		handler := &consumerGroupHandler{
+			routes: map[string]subscriptionRoute{
+				"users": {
+					ctx: subscriptionCtx,
+					handler: func(ctx context.Context, _ *core.Message) error {
+						gotErr = ctx.Err()
+						gotValue = ctx.Value(key)
+						_, gotDeadline = ctx.Deadline()
+						return nil
+					},
+				},
+			},
+			closeChan: make(chan struct{}),
+			pending:   make(map[string]*pendingCall),
+			pendingMu: &sync.RWMutex{},
+		}
+		claim := &fakeClaim{messages: make(chan *sarama.ConsumerMessage, 1)}
+		claim.messages <- &sarama.ConsumerMessage{Topic: "users"}
+		close(claim.messages)
+
+		if err := handler.ConsumeClaim(&fakeSession{ctx: sessionCtx}, claim); err != nil {
+			t.Fatalf("ConsumeClaim() error = %v", err)
+		}
+		if !errors.Is(gotErr, context.Canceled) {
+			t.Fatalf("handler context error = %v, want context.Canceled", gotErr)
+		}
+		if gotValue != "trace-123" || !gotDeadline {
+			t.Fatalf("handler context value=%v deadline=%v, want trace value and deadline", gotValue, gotDeadline)
+		}
+	})
+
+	t.Run("subscription cancellation stops active handler", func(t *testing.T) {
+		subscriptionCtx, cancelSubscription := context.WithCancel(context.Background())
+		started := make(chan struct{})
+		stopped := make(chan error, 1)
+		handler := &consumerGroupHandler{
+			routes: map[string]subscriptionRoute{
+				"users": {
+					ctx: subscriptionCtx,
+					handler: func(ctx context.Context, _ *core.Message) error {
+						close(started)
+						<-ctx.Done()
+						stopped <- ctx.Err()
+						return nil
+					},
+				},
+			},
+			closeChan: make(chan struct{}),
+			pending:   make(map[string]*pendingCall),
+			pendingMu: &sync.RWMutex{},
+		}
+		claim := &fakeClaim{messages: make(chan *sarama.ConsumerMessage, 1)}
+		claim.messages <- &sarama.ConsumerMessage{Topic: "users"}
+		close(claim.messages)
+
+		done := make(chan error, 1)
+		go func() { done <- handler.ConsumeClaim(&fakeSession{}, claim) }()
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("handler did not start")
+		}
+		cancelSubscription()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("ConsumeClaim() error = %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("handler did not stop after subscription cancellation")
+		}
+		if err := <-stopped; !errors.Is(err, context.Canceled) {
+			t.Fatalf("handler context error = %v, want context.Canceled", err)
 		}
 	})
 }
@@ -480,7 +801,7 @@ func TestConsumerGroupHandlerWorkerPoolLimitsClaims(t *testing.T) {
 		},
 		closeChan: make(chan struct{}),
 		workers:   make(chan struct{}, 2),
-		pending:   make(map[string]chan *core.Message),
+		pending:   make(map[string]*pendingCall),
 		pendingMu: &sync.RWMutex{},
 	}
 
@@ -541,7 +862,7 @@ func TestPublishReconnectsWhenDisconnected(t *testing.T) {
 			RetryDelay:      time.Millisecond,
 		},
 		kafkaConfig:   &core.KafkaConfig{Brokers: []string{"kafka:9092"}},
-		pending:       make(map[string]chan *core.Message),
+		pending:       make(map[string]*pendingCall),
 		closeChan:     make(chan struct{}),
 		everConnected: true,
 		newSyncProducer: func(_ []string, _ *sarama.Config) (sarama.SyncProducer, error) {
@@ -569,7 +890,7 @@ func TestCallReturnsConnectionLostWhenKafkaConnectionDrops(t *testing.T) {
 	broker := &Broker{
 		config:      &core.Config{},
 		kafkaConfig: core.DefaultKafkaConfig(),
-		pending:     make(map[string]chan *core.Message),
+		pending:     make(map[string]*pendingCall),
 		closeChan:   make(chan struct{}),
 		connected:   true,
 		replyTopic:  "reply-topic",
@@ -613,7 +934,7 @@ func TestSubscribeReconnectsAndResumesConsume(t *testing.T) {
 			Brokers:       []string{"kafka:9092"},
 			ConsumerGroup: "workers",
 		},
-		pending:   make(map[string]chan *core.Message),
+		pending:   make(map[string]*pendingCall),
 		closeChan: make(chan struct{}),
 		newSyncProducer: func(_ []string, _ *sarama.Config) (sarama.SyncProducer, error) {
 			if len(producerQueue) == 0 {
@@ -690,7 +1011,7 @@ func TestSubscribeConsumerErrorsTriggerDisconnectHandling(t *testing.T) {
 		kafkaConfig: &core.KafkaConfig{ConsumerGroup: "workers"},
 		consumer:    group,
 		connected:   true,
-		pending:     make(map[string]chan *core.Message),
+		pending:     make(map[string]*pendingCall),
 		watching:    make(map[sarama.ConsumerGroup]struct{}),
 		closeChan:   make(chan struct{}),
 	}
@@ -753,7 +1074,7 @@ func TestTrackedSubscriptionsRestoreAfterReconnectForMultipleDestinations(t *tes
 			Brokers:       []string{"kafka:9092"},
 			ConsumerGroup: "workers",
 		},
-		pending:   make(map[string]chan *core.Message),
+		pending:   make(map[string]*pendingCall),
 		closeChan: make(chan struct{}),
 		newSyncProducer: func(_ []string, _ *sarama.Config) (sarama.SyncProducer, error) {
 			if len(producerQueue) == 0 {
@@ -814,5 +1135,85 @@ func TestTrackedSubscriptionsRestoreAfterReconnectForMultipleDestinations(t *tes
 
 	if err := broker.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
+	}
+}
+
+func TestSubscriptionsUseOneConsumerLoopForAllTopics(t *testing.T) {
+	consumeCalls := make(chan []string, 8)
+	var consumeMu sync.Mutex
+	activeConsumes := 0
+	maxActiveConsumes := 0
+	group := &fakeConsumerGroup{}
+	group.consumeFn = func(ctx context.Context, topics []string, _ sarama.ConsumerGroupHandler) error {
+		consumeMu.Lock()
+		activeConsumes++
+		if activeConsumes > maxActiveConsumes {
+			maxActiveConsumes = activeConsumes
+		}
+		consumeMu.Unlock()
+
+		consumeCalls <- append([]string(nil), topics...)
+		<-ctx.Done()
+
+		consumeMu.Lock()
+		activeConsumes--
+		consumeMu.Unlock()
+		return nil
+	}
+
+	broker := &Broker{
+		config:      &core.Config{},
+		kafkaConfig: &core.KafkaConfig{ConsumerGroup: "workers"},
+		consumer:    group,
+		connected:   true,
+		pending:     make(map[string]*pendingCall),
+		closeChan:   make(chan struct{}),
+	}
+	defer broker.Close()
+
+	usersCtx, cancelUsers := context.WithCancel(context.Background())
+	defer cancelUsers()
+	ordersCtx, cancelOrders := context.WithCancel(context.Background())
+	defer cancelOrders()
+	if err := broker.Subscribe(usersCtx, "users", func(context.Context, *core.Message) error { return nil }); err != nil {
+		t.Fatalf("Subscribe(users) error = %v", err)
+	}
+
+	waitForTopics := func(want []string) {
+		t.Helper()
+		deadline := time.After(time.Second)
+		for {
+			select {
+			case topics := <-consumeCalls:
+				if len(topics) == len(want) {
+					match := true
+					for i := range want {
+						if topics[i] != want[i] {
+							match = false
+							break
+						}
+					}
+					if match {
+						return
+					}
+				}
+			case <-deadline:
+				t.Fatalf("consumer never received topics %v", want)
+			}
+		}
+	}
+
+	waitForTopics([]string{"users"})
+	if err := broker.Subscribe(ordersCtx, "orders", func(context.Context, *core.Message) error { return nil }); err != nil {
+		t.Fatalf("Subscribe(orders) error = %v", err)
+	}
+	waitForTopics([]string{"orders", "users"})
+	cancelUsers()
+	waitForTopics([]string{"orders"})
+
+	consumeMu.Lock()
+	defer consumeMu.Unlock()
+	if maxActiveConsumes != 1 {
+		t.Fatalf("maximum concurrent Consume calls = %d, want 1", maxActiveConsumes)
 	}
 }

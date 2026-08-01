@@ -275,9 +275,8 @@ func TestHandleResponsesRoutesByCorrelationID(t *testing.T) {
 	brokerAny, _ := NewBroker(core.DefaultConfig())
 	broker := brokerAny.(*Broker)
 
-	responseCh := make(chan *amqplib.Delivery, 1)
-	broker.pending["corr-1"] = responseCh
-
+	pending := newPendingCall()
+	broker.pending["corr-1"] = pending
 	msgs := make(chan amqplib.Delivery, 1)
 	msgs <- amqplib.Delivery{CorrelationId: "corr-1", Body: []byte("reply")}
 	close(msgs)
@@ -290,36 +289,140 @@ func TestHandleResponsesRoutesByCorrelationID(t *testing.T) {
 	}()
 
 	select {
-	case delivery := <-responseCh:
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("handleResponses() did not return")
+	}
+	select {
+	case delivery := <-pending.response:
 		if string(delivery.Body) != "reply" {
 			t.Fatalf("delivery body = %q, want %q", string(delivery.Body), "reply")
 		}
-	case <-done:
+	default:
 		t.Fatal("handleResponses() returned before routing the pending response")
 	}
 }
 
-func TestCancelAllPendingClosesChannels(t *testing.T) {
+func TestCancelAllPendingSignalsConnectionLoss(t *testing.T) {
 	t.Parallel()
 
 	brokerAny, _ := NewBroker(core.DefaultConfig())
 	broker := brokerAny.(*Broker)
 
-	ch1 := make(chan *amqplib.Delivery)
-	ch2 := make(chan *amqplib.Delivery)
-	broker.pending["one"] = ch1
-	broker.pending["two"] = ch2
+	call1 := newPendingCall()
+	call2 := newPendingCall()
+	broker.pending["one"] = call1
+	broker.pending["two"] = call2
 
 	broker.cancelAllPending()
 
 	if len(broker.pending) != 0 {
 		t.Fatalf("pending map length = %d, want 0", len(broker.pending))
 	}
-	if _, ok := <-ch1; ok {
-		t.Fatal("pending channel ch1 should be closed")
+	if response := <-call1.response; response != nil {
+		t.Fatalf("pending call one response = %#v, want nil", response)
 	}
-	if _, ok := <-ch2; ok {
-		t.Fatal("pending channel ch2 should be closed")
+	if response := <-call2.response; response != nil {
+		t.Fatalf("pending call two response = %#v, want nil", response)
+	}
+}
+
+func TestCallRejectsConcurrentDuplicateCorrelationIDs(t *testing.T) {
+	channel := newFakeAMQPChannel()
+	broker := &Broker{
+		config:     &core.Config{},
+		amqpConfig: core.DefaultAMQPConfig(),
+		channel:    channel,
+		pending:    make(map[string]*pendingCall),
+		closeChan:  make(chan struct{}),
+		connected:  true,
+		replyQueue: "reply-queue",
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	type callResult struct {
+		response *core.Message
+		err      error
+	}
+	for i := 0; i < 1000; i++ {
+		results := make(chan callResult, 2)
+		start := make(chan struct{})
+		for range 2 {
+			go func() {
+				<-start
+				response, err := broker.Call(ctx, "orders", core.NewTextMessage("request").WithCorrelationID("shared-id"))
+				results <- callResult{response: response, err: err}
+			}()
+		}
+		close(start)
+
+		var duplicate callResult
+		select {
+		case duplicate = <-results:
+		case <-ctx.Done():
+			t.Fatal("duplicate call did not return")
+		}
+		if !errors.Is(duplicate.err, core.ErrDuplicateCorrelationID) {
+			t.Fatalf("iteration %d duplicate error = %v, want ErrDuplicateCorrelationID", i, duplicate.err)
+		}
+
+		broker.pendingMu.RLock()
+		pending := broker.pending["shared-id"]
+		broker.pendingMu.RUnlock()
+		if pending == nil {
+			t.Fatalf("iteration %d winning call was not reserved", i)
+		}
+		pending.complete(&amqplib.Delivery{CorrelationId: "shared-id", Body: []byte("response")})
+
+		select {
+		case winner := <-results:
+			if winner.err != nil || winner.response.BodyString() != "response" {
+				t.Fatalf("iteration %d winning result = %#v, %v", i, winner.response, winner.err)
+			}
+		case <-ctx.Done():
+			t.Fatal("winning call was stranded")
+		}
+	}
+}
+
+func TestConcurrentResponseDeliveryAndDisconnect(t *testing.T) {
+	for i := 0; i < 1000; i++ {
+		brokerAny, _ := NewBroker(core.DefaultConfig())
+		broker := brokerAny.(*Broker)
+		pending := newPendingCall()
+		broker.pending["corr-1"] = pending
+
+		msgs := make(chan amqplib.Delivery, 1)
+		msgs <- amqplib.Delivery{CorrelationId: "corr-1", Body: []byte("reply")}
+		close(msgs)
+
+		start := make(chan struct{})
+		done := make(chan struct{}, 2)
+		go func() {
+			<-start
+			broker.handleResponses(msgs, make(chan struct{}))
+			done <- struct{}{}
+		}()
+		go func() {
+			<-start
+			broker.cancelAllPending()
+			done <- struct{}{}
+		}()
+
+		close(start)
+		<-done
+		<-done
+
+		response := <-pending.response
+		if response != nil && string(response.Body) != "reply" {
+			t.Fatalf("iteration %d response body = %q, want reply", i, response.Body)
+		}
+		select {
+		case duplicate := <-pending.response:
+			t.Fatalf("iteration %d delivered a second result: %#v", i, duplicate)
+		default:
+		}
 	}
 }
 

@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"sync/atomic"
 	"time"
 
 	"github.com/prabhatdotdev/weave/codec"
@@ -29,27 +31,48 @@ func main() {
 		log.Fatal(err)
 	}
 
-	received := make(chan string, 1)
-	if err := broker.Subscribe(ctx, "weave.example", func(_ context.Context, msg *core.Message) error {
-		received <- msg.BodyString()
-		return nil
-	}); err != nil {
-		log.Fatal(err)
+	destinations := []string{"weave.example.users", "weave.example.orders"}
+	received := make(map[string]chan string, len(destinations))
+	var panicUsers atomic.Bool
+	var retryOrders atomic.Bool
+	for _, destination := range destinations {
+		received[destination] = make(chan string, 1)
+		handler := func(handlerCtx context.Context, msg *core.Message) error {
+			if *backend == "kafka" && destination == "weave.example.users" && !panicUsers.Swap(true) {
+				panic("temporary user handler panic")
+			}
+			if destination == "weave.example.orders" && !retryOrders.Swap(true) {
+				return errors.New("temporary order handler failure")
+			}
+			select {
+			case received[destination] <- msg.BodyString():
+				return nil
+			case <-handlerCtx.Done():
+				return handlerCtx.Err()
+			}
+		}
+		if err := broker.Subscribe(ctx, destination, handler, core.WithHandlerErrorRetry()); err != nil {
+			log.Fatal(err)
+		}
 	}
 
-	msg, err := codec.MarshalMessage(codec.JSON, map[string]string{"status": "ok"})
-	if err != nil {
-		log.Fatal(err)
-	}
-	if err := broker.Publish(ctx, "weave.example", msg); err != nil {
-		log.Fatal(err)
+	for _, destination := range destinations {
+		msg, err := codec.MarshalMessage(codec.JSON, map[string]string{"destination": destination, "status": "ok"})
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := broker.Publish(ctx, destination, msg); err != nil {
+			log.Fatal(err)
+		}
 	}
 
-	select {
-	case body := <-received:
-		fmt.Println(body)
-	case <-ctx.Done():
-		log.Fatal(ctx.Err())
+	for _, destination := range destinations {
+		select {
+		case body := <-received[destination]:
+			fmt.Printf("%s: %s\n", destination, body)
+		case <-ctx.Done():
+			log.Fatal(ctx.Err())
+		}
 	}
 }
 
@@ -61,6 +84,7 @@ func newBroker(backend string) (core.MessageBroker, error) {
 	case "kafka":
 		config.Kafka = core.DefaultKafkaConfig()
 		config.Kafka.ConsumerGroup = "weave-example"
+		config.Kafka.AutoOffsetReset = "earliest"
 		return kafka.NewBroker(config)
 	default:
 		return nil, fmt.Errorf("backend must be amqp or kafka")
