@@ -90,11 +90,13 @@ func main() {
 	}); err != nil {
 		log.Fatal(err)
 	}
-	response, err := broker.Call(ctx, rpcDestination, core.NewTextMessage("request"), core.WithTimeout(5*time.Second))
-	if err != nil {
-		log.Fatal(err)
+	for _, body := range []string{"request-1", "request-2"} {
+		response, err := broker.Call(ctx, rpcDestination, core.NewTextMessage(body), core.WithTimeout(5*time.Second))
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("%s: %s\n", rpcDestination, response.BodyString())
 	}
-	fmt.Printf("%s: %s\n", rpcDestination, response.BodyString())
 }
 
 func newBroker(backend, instance string) (core.MessageBroker, error) {

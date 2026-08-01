@@ -1001,6 +1001,70 @@ func TestCallReturnsConnectionLostWhenKafkaConnectionDrops(t *testing.T) {
 	}
 }
 
+func TestReplyConsumerSurvivesRepeatedReconnects(t *testing.T) {
+	producers := []*fakeSyncProducer{{}, {}, {}, {}}
+	consumers := []*fakeConsumerGroup{{}, {}, {}, {}}
+	producerIndex := 1
+	consumerIndex := 1
+	broker := &Broker{
+		config: &core.Config{
+			ConnectionRetry: 1,
+			RetryDelay:      time.Millisecond,
+		},
+		kafkaConfig: &core.KafkaConfig{
+			Brokers:       []string{"kafka:9092"},
+			ClientID:      "client",
+			ConsumerGroup: "workers",
+		},
+		producer:      producers[0],
+		consumer:      consumers[0],
+		pending:       make(map[string]*pendingCall),
+		closeChan:     make(chan struct{}),
+		subsChanged:   make(chan struct{}, 1),
+		runner:        true,
+		connected:     true,
+		everConnected: true,
+		newSyncProducer: func(_ []string, _ *sarama.Config) (sarama.SyncProducer, error) {
+			producer := producers[producerIndex]
+			producerIndex++
+			return producer, nil
+		},
+		newConsumerGroup: func(_ []string, _ string, _ *sarama.Config) (sarama.ConsumerGroup, error) {
+			consumer := consumers[consumerIndex]
+			consumerIndex++
+			return consumer, nil
+		},
+	}
+	defer broker.Close()
+
+	if err := broker.ensureReplyConsumer(); err != nil {
+		t.Fatalf("ensureReplyConsumer() error = %v", err)
+	}
+	replyTopic := broker.currentReplyTopic()
+
+	for cycle := range 3 {
+		oldProducer := broker.currentProducer().(*fakeSyncProducer)
+		oldConsumer := broker.currentConsumer().(*fakeConsumerGroup)
+		broker.handleConnectionLoss(errors.New("connection lost"))
+		if !oldProducer.closed || !oldConsumer.closed {
+			t.Fatalf("cycle %d did not close the superseded producer and consumer", cycle+1)
+		}
+		if err := broker.ensureConnected(); err != nil {
+			t.Fatalf("cycle %d ensureConnected() error = %v", cycle+1, err)
+		}
+		if err := broker.ensureReplyConsumer(); err != nil {
+			t.Fatalf("cycle %d ensureReplyConsumer() error = %v", cycle+1, err)
+		}
+		if got := broker.currentReplyTopic(); got != replyTopic {
+			t.Fatalf("cycle %d reply topic = %q, want %q", cycle+1, got, replyTopic)
+		}
+		topics, _ := broker.activeSubscriptionRoutes()
+		if len(topics) != 1 || topics[0] != replyTopic {
+			t.Fatalf("cycle %d active topics = %v, want [%s]", cycle+1, topics, replyTopic)
+		}
+	}
+}
+
 func TestSubscribeReconnectsAndResumesConsume(t *testing.T) {
 	firstProducer := &fakeSyncProducer{}
 	secondProducer := &fakeSyncProducer{}

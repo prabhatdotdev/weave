@@ -24,11 +24,14 @@ deadlines, and tracing values propagate into active work.
 Each run also completes the same request/reply round trip through `Call`:
 
 ```text
-weave.example.rpc: pong: request
+weave.example.rpc: pong: request-1
+weave.example.rpc: pong: request-2
 ```
 
 Kafka initializes its reply consumer on the first call. If that initialization
-fails, no reply topic is retained and the next call retries it.
+fails, no reply topic is retained and the next call retries it. Later calls
+reuse the same reply consumer; after a reconnect, Kafka restores that one
+registration instead of accumulating obsolete reply-topic loops.
 
 AMQP and Kafka calls that are in flight while the broker disconnects or closes
 complete once: either with the response that won the race or with
