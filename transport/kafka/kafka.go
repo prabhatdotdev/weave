@@ -760,7 +760,6 @@ func (b *Broker) handleConnectionLossFor(expectedProducer sarama.SyncProducer, e
 	}
 	b.connected = false
 	b.recovering = true
-	b.replyTopic = ""
 	producer := b.producer
 	consumer := b.consumer
 	b.producer = nil

@@ -375,6 +375,36 @@ func TestReplyConsumerInitializationRetryWithLiveKafka(t *testing.T) {
 	}
 }
 
+func TestReplyConsumerSurvivesReconnectsWithLiveKafka(t *testing.T) {
+	broker, responder, requestTopic, ctx := newLiveKafkaRPCPair(t, "fix-009")
+	replyTopic := broker.currentReplyTopic()
+
+	if err := responder.Subscribe(ctx, requestTopic, func(_ context.Context, request *core.Message) error {
+		response := core.NewTextMessage("response-" + request.BodyString()).WithCorrelationID(request.CorrelationID)
+		return responder.Publish(ctx, request.ReplyTo, response)
+	}); err != nil {
+		t.Fatalf("Subscribe(%s) error = %v", requestTopic, err)
+	}
+
+	for cycle := 1; cycle <= 2; cycle++ {
+		broker.handleConnectionLoss(fmt.Errorf("connection lost in cycle %d", cycle))
+		response, err := broker.Call(ctx, requestTopic, core.NewTextMessage(fmt.Sprint(cycle)), core.WithTimeout(10*time.Second))
+		if err != nil {
+			t.Fatalf("cycle %d Call() error = %v", cycle, err)
+		}
+		if got, want := response.BodyString(), fmt.Sprintf("response-%d", cycle); got != want {
+			t.Fatalf("cycle %d response = %q, want %q", cycle, got, want)
+		}
+		if got := broker.currentReplyTopic(); got != replyTopic {
+			t.Fatalf("cycle %d reply topic = %q, want %q", cycle, got, replyTopic)
+		}
+		topics, _ := broker.activeSubscriptionRoutes()
+		if len(topics) != 1 || topics[0] != replyTopic {
+			t.Fatalf("cycle %d active topics = %v, want [%s]", cycle, topics, replyTopic)
+		}
+	}
+}
+
 func newLiveKafkaRPCPair(t *testing.T, name string) (*Broker, *Broker, string, context.Context) {
 	t.Helper()
 	broker, topics, ctx := newLiveKafkaBroker(t, name, 1)
