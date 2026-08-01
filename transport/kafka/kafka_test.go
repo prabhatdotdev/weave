@@ -319,6 +319,99 @@ func TestCallTimeoutAndCorrelationFlow(t *testing.T) {
 	})
 }
 
+func TestReplyConsumerInitializationRetriesAfterFailure(t *testing.T) {
+	producer := &fakeSyncProducer{}
+	broker := &Broker{
+		config:      &core.Config{},
+		kafkaConfig: &core.KafkaConfig{ClientID: "test"},
+		producer:    producer,
+		pending:     make(map[string]*pendingCall),
+		closeChan:   make(chan struct{}),
+		connected:   true,
+	}
+	defer broker.Close()
+
+	if _, err := broker.Call(context.Background(), "users.get", core.NewTextMessage("first")); err == nil {
+		t.Fatal("first Call() error = nil, want reply subscription failure")
+	}
+	if got := broker.currentReplyTopic(); got != "" {
+		t.Fatalf("reply topic after failed initialization = %q, want empty", got)
+	}
+	broker.subsMu.RLock()
+	failedSubscriptions := len(broker.subs)
+	broker.subsMu.RUnlock()
+	if failedSubscriptions != 0 {
+		t.Fatalf("subscriptions after failed initialization = %d, want 0", failedSubscriptions)
+	}
+
+	broker.closeMu.Lock()
+	broker.consumer = &fakeConsumerGroup{}
+	broker.kafkaConfig.ConsumerGroup = "workers"
+	broker.closeMu.Unlock()
+	producer.afterSend = func(msg *sarama.ProducerMessage) {
+		broker.pendingMu.RLock()
+		pending := broker.pending[headerValue(msg, "correlation-id")]
+		broker.pendingMu.RUnlock()
+		pending.complete(core.NewTextMessage("response"))
+	}
+
+	response, err := broker.Call(context.Background(), "users.get", core.NewTextMessage("second"), core.WithTimeout(time.Second))
+	if err != nil {
+		t.Fatalf("second Call() error = %v", err)
+	}
+	if response.BodyString() != "response" {
+		t.Fatalf("second Call() response = %q, want response", response.BodyString())
+	}
+	if got := broker.currentReplyTopic(); got == "" {
+		t.Fatal("reply topic after successful retry is empty")
+	}
+	broker.subsMu.RLock()
+	successfulSubscriptions := len(broker.subs)
+	broker.subsMu.RUnlock()
+	if successfulSubscriptions != 1 {
+		t.Fatalf("subscriptions after successful retry = %d, want 1", successfulSubscriptions)
+	}
+}
+
+func TestReplyConsumerInitializationIsSerialized(t *testing.T) {
+	broker := &Broker{
+		config:      &core.Config{},
+		kafkaConfig: &core.KafkaConfig{ClientID: "test", ConsumerGroup: "workers"},
+		consumer:    &fakeConsumerGroup{},
+		pending:     make(map[string]*pendingCall),
+		closeChan:   make(chan struct{}),
+		connected:   true,
+	}
+	defer broker.Close()
+
+	const callers = 20
+	errs := make(chan error, callers)
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- broker.ensureReplyConsumer()
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("ensureReplyConsumer() error = %v", err)
+		}
+	}
+
+	broker.subsMu.RLock()
+	defer broker.subsMu.RUnlock()
+	if len(broker.subs) != 1 {
+		t.Fatalf("reply subscriptions = %d, want 1", len(broker.subs))
+	}
+	if broker.subs[0].destination != broker.currentReplyTopic() {
+		t.Fatalf("subscription destination = %q, reply topic = %q", broker.subs[0].destination, broker.currentReplyTopic())
+	}
+}
+
 func TestCancelAllPendingSignalsConnectionLoss(t *testing.T) {
 	t.Parallel()
 

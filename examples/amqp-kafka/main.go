@@ -19,13 +19,13 @@ func main() {
 	backend := flag.String("backend", "amqp", "amqp or kafka")
 	flag.Parse()
 
-	broker, err := newBroker(*backend)
+	broker, err := newBroker(*backend, "client")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer broker.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := broker.Connect(ctx); err != nil {
 		log.Fatal(err)
@@ -74,16 +74,40 @@ func main() {
 			log.Fatal(ctx.Err())
 		}
 	}
+
+	rpcDestination := "weave.example.rpc"
+	responder, err := newBroker(*backend, "responder")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer responder.Close()
+	if err := responder.Connect(ctx); err != nil {
+		log.Fatal(err)
+	}
+	if err := responder.Subscribe(ctx, rpcDestination, func(handlerCtx context.Context, request *core.Message) error {
+		response := core.NewTextMessage("pong: " + request.BodyString()).WithCorrelationID(request.CorrelationID)
+		return responder.Publish(handlerCtx, request.ReplyTo, response)
+	}); err != nil {
+		log.Fatal(err)
+	}
+	response, err := broker.Call(ctx, rpcDestination, core.NewTextMessage("request"), core.WithTimeout(5*time.Second))
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("%s: %s\n", rpcDestination, response.BodyString())
 }
 
-func newBroker(backend string) (core.MessageBroker, error) {
+func newBroker(backend, instance string) (core.MessageBroker, error) {
 	config := core.DefaultConfig()
 	switch backend {
 	case "amqp":
+		config.AMQP = core.DefaultAMQPConfig()
+		config.AMQP.QueueDurable = true
 		return amqp.NewBroker(config)
 	case "kafka":
 		config.Kafka = core.DefaultKafkaConfig()
-		config.Kafka.ConsumerGroup = "weave-example"
+		config.Kafka.ClientID = "weave-example-" + instance
+		config.Kafka.ConsumerGroup = "weave-example-" + instance
 		config.Kafka.AutoOffsetReset = "earliest"
 		return kafka.NewBroker(config)
 	default:
