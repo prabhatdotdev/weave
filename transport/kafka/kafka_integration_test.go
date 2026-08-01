@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -411,6 +412,29 @@ func TestConfiguredReplyTopicWithLiveKafka(t *testing.T) {
 	}
 	if response.BodyString() != "response" {
 		t.Fatalf("Call() response = %q, want response", response.BodyString())
+	}
+}
+
+func TestCallPreservesRequestWithLiveKafka(t *testing.T) {
+	broker, responder, requestTopic, ctx := newLiveKafkaRPCPair(t, "fix-011")
+	if err := responder.Subscribe(ctx, requestTopic, func(_ context.Context, request *core.Message) error {
+		response := core.NewTextMessage("response").WithCorrelationID(request.CorrelationID)
+		return responder.Publish(ctx, request.ReplyTo, response)
+	}); err != nil {
+		t.Fatalf("Subscribe(%s) error = %v", requestTopic, err)
+	}
+
+	request := core.NewTextMessage("request").WithReplyTo("caller-reply").WithHeader("trace-id", "abc")
+	original := request.Clone()
+	response, err := broker.Call(ctx, requestTopic, request, core.WithTimeout(10*time.Second))
+	if err != nil {
+		t.Fatalf("Call() error = %v", err)
+	}
+	if response.BodyString() != "response" {
+		t.Fatalf("Call() response = %q, want response", response.BodyString())
+	}
+	if !reflect.DeepEqual(request, original) {
+		t.Fatalf("request after Call() = %#v, want %#v", request, original)
 	}
 }
 

@@ -3,6 +3,7 @@ package kafka
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -317,6 +318,63 @@ func TestCallTimeoutAndCorrelationFlow(t *testing.T) {
 			t.Fatalf("response.BodyString() = %q, want %q", response.BodyString(), "response")
 		}
 	})
+}
+
+func TestCallDoesNotMutateRequest(t *testing.T) {
+	tests := []struct {
+		name     string
+		sendErr  error
+		respond  bool
+		timeout  time.Duration
+		checkErr func(error) bool
+	}{
+		{name: "success", respond: true, timeout: time.Second, checkErr: func(err error) bool { return err == nil }},
+		{name: "publish failure", sendErr: errors.New("send failed"), timeout: time.Second, checkErr: func(err error) bool {
+			return errors.As(err, new(*core.ErrPublishFailed))
+		}},
+		{name: "timeout", timeout: time.Millisecond, checkErr: core.IsTimeout},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			producer := &fakeSyncProducer{sendErr: test.sendErr}
+			broker := &Broker{
+				config:      &core.Config{},
+				kafkaConfig: core.DefaultKafkaConfig(),
+				producer:    producer,
+				pending:     make(map[string]*pendingCall),
+				closeChan:   make(chan struct{}),
+				connected:   true,
+				replyTopic:  "reply-topic",
+			}
+			if test.respond {
+				producer.afterSend = func(msg *sarama.ProducerMessage) {
+					broker.pendingMu.RLock()
+					pending := broker.pending[headerValue(msg, "correlation-id")]
+					broker.pendingMu.RUnlock()
+					pending.complete(core.NewTextMessage("response"))
+				}
+			}
+
+			request := core.NewTextMessage("request").WithReplyTo("caller-reply").WithHeader("trace-id", "abc")
+			original := request.Clone()
+			_, err := broker.Call(context.Background(), "users.get", request, core.WithTimeout(test.timeout))
+			if !test.checkErr(err) {
+				t.Fatalf("Call() error = %v", err)
+			}
+			if !reflect.DeepEqual(request, original) {
+				t.Fatalf("request after Call() = %#v, want %#v", request, original)
+			}
+			if producer.lastMsg != nil {
+				if got := headerValue(producer.lastMsg, "correlation-id"); got == "" {
+					t.Fatal("published request has no correlation ID")
+				}
+				if got := headerValue(producer.lastMsg, "reply-to"); got != "reply-topic" {
+					t.Fatalf("published reply topic = %q, want reply-topic", got)
+				}
+			}
+		})
+	}
 }
 
 func TestReplyConsumerInitializationRetriesAfterFailure(t *testing.T) {

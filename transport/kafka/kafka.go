@@ -594,7 +594,8 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 		return nil, err
 	}
 
-	corrID := msg.CorrelationID
+	request := msg.Clone()
+	corrID := request.CorrelationID
 	if corrID == "" {
 		corrID = rand.Text()
 	}
@@ -620,10 +621,10 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 		defer cancel()
 	}
 
-	msg.CorrelationID = corrID
-	msg.ReplyTo = b.currentReplyTopic()
+	request.CorrelationID = corrID
+	request.ReplyTo = b.currentReplyTopic()
 
-	if err := b.Publish(ctx, destination, msg, opts...); err != nil {
+	if err := b.Publish(ctx, destination, request, opts...); err != nil {
 		return nil, err
 	}
 
