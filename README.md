@@ -43,9 +43,13 @@ Kafka uses the same interface:
 config := core.DefaultConfig()
 config.Kafka = core.DefaultKafkaConfig()
 config.Kafka.ConsumerGroup = "orders"
+config.Kafka.ReplyTopic = "orders.replies"
 
 broker, err := kafka.NewBroker(config)
 ```
+
+Provision Kafka topics explicitly. `ReplyTopic` is required for `Call` and is
+owned and cleaned up by the application.
 
 ## Interface
 

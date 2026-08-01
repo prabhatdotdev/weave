@@ -137,7 +137,7 @@ func TestDefaultsAndEdgeCases(t *testing.T) {
 	if amqp := DefaultAMQPConfig(); amqp.Host != "localhost" || amqp.Port != 5672 {
 		t.Fatalf("unexpected AMQP defaults: %#v", amqp)
 	}
-	if kafka := DefaultKafkaConfig(); len(kafka.Brokers) != 1 || kafka.AutoOffsetReset != "latest" {
+	if kafka := DefaultKafkaConfig(); len(kafka.Brokers) != 1 || kafka.AutoOffsetReset != "latest" || kafka.ReplyTopic != "" {
 		t.Fatalf("unexpected Kafka defaults: %#v", kafka)
 	}
 

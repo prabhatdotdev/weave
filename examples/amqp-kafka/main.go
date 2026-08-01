@@ -110,6 +110,7 @@ func newBroker(backend, instance string) (core.MessageBroker, error) {
 		config.Kafka = core.DefaultKafkaConfig()
 		config.Kafka.ClientID = "weave-example-" + instance
 		config.Kafka.ConsumerGroup = "weave-example-" + instance
+		config.Kafka.ReplyTopic = "weave.example." + instance + ".replies"
 		config.Kafka.AutoOffsetReset = "earliest"
 		return kafka.NewBroker(config)
 	default:

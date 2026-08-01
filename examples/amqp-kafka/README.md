@@ -4,7 +4,11 @@ Start the brokers:
 
 ```sh
 docker compose up -d
+docker compose exec kafka sh -c 'for topic in weave.example.users weave.example.orders weave.example.rpc weave.example.client.replies; do /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --if-not-exists --topic "$topic"; done'
 ```
+
+The Kafka transport disables topic auto-creation requests, so the example
+provisions every topic it uses explicitly.
 
 Run the same two-destination publish/subscribe example against either transport:
 
@@ -32,6 +36,10 @@ Kafka initializes its reply consumer on the first call. If that initialization
 fails, no reply topic is retained and the next call retries it. Later calls
 reuse the same reply consumer; after a reconnect, Kafka restores that one
 registration instead of accumulating obsolete reply-topic loops.
+
+`KafkaConfig.ReplyTopic` is required for `Call`. Applications own that topic:
+provision it before starting the broker, use a unique topic and consumer group
+per concurrently running caller, and delete the topic when that caller retires.
 
 AMQP and Kafka calls that are in flight while the broker disconnects or closes
 complete once: either with the response that won the race or with
