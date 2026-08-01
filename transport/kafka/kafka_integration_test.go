@@ -305,6 +305,76 @@ func TestDuplicateCorrelationIDWithLiveKafka(t *testing.T) {
 	}
 }
 
+func TestReplyConsumerInitializationRetryWithLiveKafka(t *testing.T) {
+	broker, topics, ctx := newLiveKafkaBroker(t, "fix-008", 1)
+	requestTopic := topics[0]
+
+	broker.closeMu.Lock()
+	consumer := broker.consumer
+	consumerGroup := broker.kafkaConfig.ConsumerGroup
+	broker.consumer = nil
+	broker.kafkaConfig.ConsumerGroup = ""
+	broker.closeMu.Unlock()
+
+	if err := broker.ensureReplyConsumer(); err == nil {
+		t.Fatal("first ensureReplyConsumer() error = nil, want failure")
+	}
+	if got := broker.currentReplyTopic(); got != "" {
+		t.Fatalf("reply topic after failed initialization = %q, want empty", got)
+	}
+
+	broker.closeMu.Lock()
+	broker.consumer = consumer
+	broker.kafkaConfig.ConsumerGroup = consumerGroup
+	broker.closeMu.Unlock()
+	if err := broker.ensureReplyConsumer(); err != nil {
+		t.Fatalf("retry ensureReplyConsumer() error = %v", err)
+	}
+
+	replyTopic := broker.currentReplyTopic()
+	admin, err := sarama.NewClusterAdmin(broker.kafkaConfig.Brokers, sarama.NewConfig())
+	if err != nil {
+		t.Fatalf("create Kafka admin: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = admin.DeleteTopic(replyTopic)
+		_ = admin.Close()
+	})
+	if err := admin.CreateTopic(replyTopic, &sarama.TopicDetail{NumPartitions: 1, ReplicationFactor: 1}, false); err != nil && !errors.Is(err, sarama.ErrTopicAlreadyExists) {
+		t.Fatalf("create reply topic: %v", err)
+	}
+
+	responderConfig := core.DefaultConfig()
+	responderConfig.Kafka = core.DefaultKafkaConfig()
+	responderConfig.Kafka.Brokers = broker.kafkaConfig.Brokers
+	responderConfig.Kafka.ClientID = broker.kafkaConfig.ClientID + "-responder"
+	responderConfig.Kafka.ConsumerGroup = broker.kafkaConfig.ConsumerGroup + "-responder"
+	responderConfig.Kafka.AutoOffsetReset = "earliest"
+	responderAny, err := NewBroker(responderConfig)
+	if err != nil {
+		t.Fatalf("create responder broker: %v", err)
+	}
+	responder := responderAny.(*Broker)
+	t.Cleanup(func() { _ = responder.Close() })
+	if err := responder.Connect(ctx); err != nil {
+		t.Fatalf("connect responder broker: %v", err)
+	}
+	if err := responder.Subscribe(ctx, requestTopic, func(_ context.Context, request *core.Message) error {
+		response := core.NewTextMessage("response").WithCorrelationID(request.CorrelationID)
+		return responder.Publish(ctx, request.ReplyTo, response)
+	}); err != nil {
+		t.Fatalf("Subscribe(%s) error = %v", requestTopic, err)
+	}
+
+	response, err := broker.Call(ctx, requestTopic, core.NewTextMessage("request"), core.WithTimeout(10*time.Second))
+	if err != nil {
+		t.Fatalf("Call() after initialization retry error = %v", err)
+	}
+	if response.BodyString() != "response" {
+		t.Fatalf("Call() response = %q, want response", response.BodyString())
+	}
+}
+
 func newLiveKafkaRPCPair(t *testing.T, name string) (*Broker, *Broker, string, context.Context) {
 	t.Helper()
 	broker, topics, ctx := newLiveKafkaBroker(t, name, 1)

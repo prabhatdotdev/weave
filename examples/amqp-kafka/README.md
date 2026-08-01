@@ -21,6 +21,15 @@ demonstrate contained failures and safe redelivery before later messages are
 processed. Handlers also select on their context so subscription cancellation,
 deadlines, and tracing values propagate into active work.
 
+Each run also completes the same request/reply round trip through `Call`:
+
+```text
+weave.example.rpc: pong: request
+```
+
+Kafka initializes its reply consumer on the first call. If that initialization
+fails, no reply topic is retained and the next call retries it.
+
 AMQP and Kafka calls that are in flight while the broker disconnects or closes
 complete once: either with the response that won the race or with
 `ErrConnectionLost`. Callers can handle shutdown without risking a stranded

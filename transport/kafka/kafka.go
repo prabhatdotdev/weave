@@ -69,6 +69,7 @@ type Broker struct {
 	newSyncProducer  func([]string, *sarama.Config) (sarama.SyncProducer, error)
 	newConsumerGroup func([]string, string, *sarama.Config) (sarama.ConsumerGroup, error)
 
+	replyMu     sync.Mutex
 	replyTopic  string
 	pending     map[string]*pendingCall
 	pendingMu   sync.RWMutex
@@ -646,19 +647,24 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 }
 
 func (b *Broker) ensureReplyConsumer() error {
-	b.closeMu.Lock()
-	if b.replyTopic != "" {
-		b.closeMu.Unlock()
+	b.replyMu.Lock()
+	defer b.replyMu.Unlock()
+
+	if b.currentReplyTopic() != "" {
 		return nil
 	}
 
 	replyTopic := fmt.Sprintf("reply-%s-%s", b.kafkaConfig.ClientID, rand.Text()[:8])
+	if err := b.subscribe(context.Background(), replyTopic, func(ctx context.Context, msg *core.Message) error {
+		return nil
+	}, false); err != nil {
+		return err
+	}
+
+	b.closeMu.Lock()
 	b.replyTopic = replyTopic
 	b.closeMu.Unlock()
-
-	return b.subscribe(context.Background(), replyTopic, func(ctx context.Context, msg *core.Message) error {
-		return nil
-	}, false)
+	return nil
 }
 
 func (b *Broker) cancelAllPending() {
