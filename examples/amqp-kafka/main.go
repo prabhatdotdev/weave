@@ -90,8 +90,9 @@ func main() {
 	}); err != nil {
 		log.Fatal(err)
 	}
-	for _, body := range []string{"request-1", "request-2"} {
-		response, err := broker.Call(ctx, rpcDestination, core.NewTextMessage(body), core.WithTimeout(5*time.Second))
+	request := core.NewTextMessage("request").WithHeader("trace-id", "example")
+	for range 2 {
+		response, err := broker.Call(ctx, rpcDestination, request, core.WithTimeout(5*time.Second))
 		if err != nil {
 			log.Fatal(err)
 		}
