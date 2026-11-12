@@ -34,6 +34,13 @@ jobs:
       - name: Run tests with race detector
         run: make test-verbose
 
+      - name: Cross-compile tests for 32-bit Linux
+        env:
+          GOOS: linux
+          GOARCH: "386"
+          CGO_ENABLED: "0"
+        run: go test -exec=true ./...
+
       - name: Run Kafka integration test
         env:
           WEAVE_KAFKA_E2E: "1"

@@ -1315,6 +1315,10 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 				return callSubscriptionHandler(handlerCtx, route.handler, msg)
 			}()
 			if err != nil {
+				// Interrupted work must remain uncommitted even under the no-retry policy.
+				if session.Context().Err() != nil || route.ctx.Err() != nil {
+					return err
+				}
 				h.emitSubscribeFailure(kafkaMsg.Topic, err)
 				if route.policy == core.HandlerErrorRetry {
 					return err

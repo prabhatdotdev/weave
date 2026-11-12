@@ -16,6 +16,8 @@ import (
 )
 
 func TestPublicOperationsRejectInvalidInputs(t *testing.T) {
+	// A runtime conversion also exercises an invalid negative partition on 32-bit hosts.
+	overflowPartition := int64(math.MaxInt32) + 1
 	for _, constructor := range []struct {
 		name string
 		new  func() (core.MessageBroker, error)
@@ -48,7 +50,7 @@ func TestPublicOperationsRejectInvalidInputs(t *testing.T) {
 				{"negative timeout", context.Background(), "orders", core.NewMessage(nil), []core.PublishOption{core.WithTimeout(-time.Second)}},
 				{"negative partition", context.Background(), "orders", core.NewMessage(nil), []core.PublishOption{core.WithPartition(-2)}},
 				{"explicit negative partition", context.Background(), "orders", core.NewMessage(nil), []core.PublishOption{core.WithPartition(-1)}},
-				{"overflow partition", context.Background(), "orders", core.NewMessage(nil), []core.PublishOption{core.WithPartition(math.MaxInt32 + 1)}},
+				{"overflow partition", context.Background(), "orders", core.NewMessage(nil), []core.PublishOption{core.WithPartition(int(overflowPartition))}},
 				{"invalid priority", context.Background(), "orders", core.NewMessage(nil), []core.PublishOption{core.WithPriority(10)}},
 				{"invalid delivery mode", context.Background(), "orders", core.NewMessage(nil), []core.PublishOption{func(o *core.PublishOptions) { o.DeliveryMode = 3 }}},
 				{"invalid expiration", context.Background(), "orders", core.NewMessage(nil), []core.PublishOption{core.WithExpiration("forever")}},

@@ -3,6 +3,7 @@ package kafka
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync"
@@ -1042,6 +1043,49 @@ func TestConsumerGroupHandlerPropagatesSubscriptionAndSessionContexts(t *testing
 			t.Fatalf("handler context error = %v, want context.Canceled", err)
 		}
 	})
+}
+
+func TestConsumerGroupHandlerDoesNotMarkCanceledWork(t *testing.T) {
+	for _, source := range []string{"session", "subscription"} {
+		for _, policy := range []core.HandlerErrorPolicy{core.HandlerErrorNoRetry, core.HandlerErrorRetry} {
+			t.Run(source+"/"+string(policy), func(t *testing.T) {
+				sessionCtx, cancelSession := context.WithCancel(context.Background())
+				defer cancelSession()
+				subscriptionCtx, cancelSubscription := context.WithCancel(context.Background())
+				defer cancelSubscription()
+				calls := 0
+				handler := &consumerGroupHandler{
+					routes: map[string]subscriptionRoute{
+						"users": {
+							ctx: subscriptionCtx, policy: policy,
+							handler: func(ctx context.Context, _ *core.Message) error {
+								calls++
+								if source == "session" {
+									cancelSession()
+								} else {
+									cancelSubscription()
+								}
+								<-ctx.Done()
+								return fmt.Errorf("interrupted work: %w", ctx.Err())
+							},
+						},
+					},
+					closeChan: make(chan struct{}),
+				}
+				claim := &fakeClaim{messages: make(chan *sarama.ConsumerMessage, 2)}
+				claim.messages <- &sarama.ConsumerMessage{Topic: "users", Offset: 10}
+				claim.messages <- &sarama.ConsumerMessage{Topic: "users", Offset: 11}
+				close(claim.messages)
+				session := &fakeSession{ctx: sessionCtx}
+				if err := handler.ConsumeClaim(session, claim); !errors.Is(err, context.Canceled) {
+					t.Errorf("ConsumeClaim() error = %v, want context.Canceled", err)
+				}
+				if len(session.marked) != 0 || calls != 1 {
+					t.Fatalf("marked messages = %d, handler calls = %d; want 0 and 1", len(session.marked), calls)
+				}
+			})
+		}
+	}
 }
 
 func TestConsumerGroupHandlerWorkerPoolLimitsClaims(t *testing.T) {

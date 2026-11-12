@@ -577,6 +577,104 @@ func TestConsumerGroupAndStartingOffsetOptionsWithLiveKafka(t *testing.T) {
 	}
 }
 
+func TestCanceledHandlerRedeliversBeforeLaterOffsetWithLiveKafka(t *testing.T) {
+	broker, topics, ctx := newLiveKafkaBrokerWithConfig(t, "canceled-handler", 2, 1, func(config *core.Config) {
+		config.Kafka.ConsumerGroup = ""
+	})
+	topic, otherTopic := topics[0], topics[1]
+	group := topic + ".alpha"
+	for _, body := range []string{"unfinished", "later"} {
+		if err := broker.Publish(ctx, topic, core.NewTextMessage(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	type delivery struct {
+		body      string
+		partition int32
+		offset    int64
+	}
+	started := make(chan delivery, 1)
+	interrupted := make(chan error, 1)
+	completed := make(chan delivery, 4)
+	var attempts atomic.Int32
+	if err := broker.Subscribe(ctx, topic, func(handlerCtx context.Context, msg *core.Message) error {
+		record := delivery{msg.BodyString(), msg.Partition, msg.Offset}
+		if record.body == "unfinished" && attempts.Add(1) == 1 {
+			started <- record
+			<-handlerCtx.Done()
+			interrupted <- handlerCtx.Err()
+			return fmt.Errorf("interrupted work: %w", handlerCtx.Err())
+		}
+		select {
+		case completed <- record:
+		case <-handlerCtx.Done():
+			return handlerCtx.Err()
+		}
+		return nil
+	}, core.WithConsumerGroup(group)); err != nil {
+		t.Fatal(err)
+	}
+	var first delivery
+	select {
+	case first = <-started:
+	case <-ctx.Done():
+		t.Fatal("first handler did not start")
+	}
+
+	// Adding another group restarts the active sessions while the first handler is working.
+	if err := broker.Subscribe(ctx, otherTopic, func(context.Context, *core.Message) error {
+		return nil
+	}, core.WithConsumerGroup(otherTopic+".beta")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-interrupted:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("handler error = %v, want context.Canceled", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("adding another group did not cancel the active handler")
+	}
+	var later delivery
+	for _, want := range []string{"unfinished", "later"} {
+		select {
+		case got := <-completed:
+			if got.body != want {
+				t.Fatalf("completed %q before %q; canceled work must be redelivered first", got.body, want)
+			}
+			if want == "unfinished" && got != first {
+				t.Fatalf("redelivery = %+v, want original record %+v", got, first)
+			}
+			later = got
+		case <-ctx.Done():
+			t.Fatalf("did not complete %q after session restart", want)
+		}
+	}
+
+	admin, err := sarama.NewClusterAdmin(broker.kafkaConfig.Brokers, broker.buildSaramaConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		offsets, err := admin.ListConsumerGroupOffsets(group, map[string][]int32{topic: {later.partition}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if block := offsets.GetBlock(topic, later.partition); block != nil && block.Err == sarama.ErrNoError && block.Offset == later.offset+1 {
+			break
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			t.Fatal("successful redelivery and later record were not committed")
+		}
+	}
+}
+
 func newLiveKafkaRPCPair(t *testing.T, name string) (*Broker, *Broker, string, context.Context) {
 	t.Helper()
 	broker, topics, ctx := newLiveKafkaBroker(t, name, 1)

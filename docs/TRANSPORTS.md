@@ -83,6 +83,11 @@ Subscriptions with the same group and starting-offset policy share a consumer
 loop. Different groups can independently consume the same topic, and their
 settings are preserved across reconnects.
 
+If a handler returns an error after its subscription or consumer session is
+canceled, Kafka leaves that record and later offsets uncommitted, regardless
+of the handler error policy. Completed handlers and ordinary errors still
+follow the configured policy.
+
 SASL supports `PLAIN` (also the default for an empty mechanism),
 `SCRAM-SHA-256`, and `SCRAM-SHA-512`. Unknown enabled mechanisms return
 `ErrInvalidConfig` from the constructor.
