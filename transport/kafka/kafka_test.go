@@ -34,6 +34,13 @@ func (p *fakeSyncProducer) SendMessage(msg *sarama.ProducerMessage) (int32, int6
 	return 0, 0, err
 }
 
+func (p *fakeSyncProducer) SendMessageContext(ctx context.Context, msg *sarama.ProducerMessage) (int32, int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, 0, err
+	}
+	return p.SendMessage(msg)
+}
+
 func (p *fakeSyncProducer) SendMessages(msgs []*sarama.ProducerMessage) error {
 	if len(msgs) > 0 {
 		_, _, err := p.SendMessage(msgs[0])
@@ -215,6 +222,9 @@ func TestPublishBuildsKafkaMessageAndErrors(t *testing.T) {
 	if key, _ := producer.lastMsg.Key.Encode(); string(key) != "user-42" {
 		t.Fatalf("key = %q, want %q", string(key), "user-42")
 	}
+	if producer.lastMsg.Partition != -1 {
+		t.Fatalf("default partition = %d, want -1", producer.lastMsg.Partition)
+	}
 	if got := headerValue(producer.lastMsg, "trace-id"); got != "abc" {
 		t.Fatalf("trace-id header = %q, want %q", got, "abc")
 	}
@@ -227,10 +237,66 @@ func TestPublishBuildsKafkaMessageAndErrors(t *testing.T) {
 	if got := headerValue(producer.lastMsg, "content-type"); got != "application/json" {
 		t.Fatalf("content-type header = %q, want %q", got, "application/json")
 	}
+	if err := broker.Publish(context.Background(), "users", msg, core.WithPartition(2)); err != nil {
+		t.Fatalf("Publish(WithPartition) error = %v", err)
+	}
+	if producer.lastMsg.Partition != 2 {
+		t.Fatalf("explicit partition = %d, want 2", producer.lastMsg.Partition)
+	}
+	if err := broker.Publish(context.Background(), "users", msg, core.WithPartition(-2)); !errors.Is(err, core.ErrInvalidConfig) {
+		t.Fatalf("Publish(negative partition) error = %v, want ErrInvalidConfig", err)
+	}
+
+	producer.sendErr = sarama.ErrInvalidPartition
+	if err := broker.Publish(context.Background(), "users", msg, core.WithPartition(3)); !errors.Is(err, sarama.ErrInvalidPartition) {
+		t.Fatalf("Publish(invalid partition) error = %v, want sarama.ErrInvalidPartition", err)
+	}
+	if !broker.IsConnected() || producer.closed {
+		t.Fatal("invalid partition was treated as a connection loss")
+	}
 
 	producer.sendErr = errors.New("send failed")
 	if err := broker.Publish(context.Background(), "users", msg); err == nil || !errors.As(err, new(*core.ErrPublishFailed)) {
 		t.Fatalf("Publish() error = %v, want ErrPublishFailed", err)
+	}
+}
+
+func TestExplicitPartitioner(t *testing.T) {
+	partitioner := newExplicitPartitioner("users")
+
+	message := &sarama.ProducerMessage{Partition: 2, Key: sarama.StringEncoder("ignored")}
+	partition, err := partitioner.Partition(message, 3)
+	if err != nil || partition != 2 {
+		t.Fatalf("explicit Partition() = %d, %v; want 2, nil", partition, err)
+	}
+
+	message.Partition = 3
+	if _, err := partitioner.Partition(message, 3); !errors.Is(err, sarama.ErrInvalidPartition) {
+		t.Fatalf("invalid Partition() error = %v, want sarama.ErrInvalidPartition", err)
+	}
+
+	message.Partition = -1
+	fallback := sarama.NewHashPartitioner("users")
+	want, err := fallback.Partition(message, 3)
+	if err != nil {
+		t.Fatalf("fallback Partition() error = %v", err)
+	}
+	got, err := partitioner.Partition(message, 3)
+	if err != nil || got != want {
+		t.Fatalf("keyed Partition() = %d, %v; want %d, nil", got, err, want)
+	}
+
+	dynamic, ok := partitioner.(sarama.DynamicConsistencyPartitioner)
+	if !ok || !dynamic.MessageRequiresConsistency(message) {
+		t.Fatal("keyed message does not require consistent partitioning")
+	}
+	message.Key = nil
+	if dynamic.MessageRequiresConsistency(message) {
+		t.Fatal("keyless fallback unexpectedly requires consistent partitioning")
+	}
+	message.Partition = 0
+	if !dynamic.MessageRequiresConsistency(message) {
+		t.Fatal("explicit partition does not require consistent partitioning")
 	}
 }
 
@@ -459,8 +525,12 @@ func TestCallRequiresConfiguredReplyTopic(t *testing.T) {
 
 func TestSaramaConfigDisablesAutoTopicCreation(t *testing.T) {
 	broker := &Broker{kafkaConfig: core.DefaultKafkaConfig()}
-	if broker.buildSaramaConfig().Metadata.AllowAutoTopicCreation {
+	config := broker.buildSaramaConfig()
+	if config.Metadata.AllowAutoTopicCreation {
 		t.Fatal("Kafka metadata requests allow topic auto-creation")
+	}
+	if _, ok := config.Producer.Partitioner("users").(*explicitPartitioner); !ok {
+		t.Fatal("Kafka producer is not configured for explicit partition selection")
 	}
 }
 
@@ -482,7 +552,7 @@ func TestReplyConsumerInitializationIsSerialized(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errs <- broker.ensureReplyConsumer()
+			errs <- broker.ensureReplyConsumer(context.Background())
 		}()
 	}
 	wg.Wait()
@@ -1049,7 +1119,7 @@ func TestPublishReconnectsWhenDisconnected(t *testing.T) {
 		pending:       make(map[string]*pendingCall),
 		closeChan:     make(chan struct{}),
 		everConnected: true,
-		newSyncProducer: func(_ []string, _ *sarama.Config) (sarama.SyncProducer, error) {
+		newProducer: func(_ []string, _ *sarama.Config) (messageProducer, error) {
 			createProducerCalls++
 			return producer, nil
 		},
@@ -1116,7 +1186,7 @@ func TestReplyConsumerSurvivesRepeatedReconnects(t *testing.T) {
 		runner:        true,
 		connected:     true,
 		everConnected: true,
-		newSyncProducer: func(_ []string, _ *sarama.Config) (sarama.SyncProducer, error) {
+		newProducer: func(_ []string, _ *sarama.Config) (messageProducer, error) {
 			producer := producers[producerIndex]
 			producerIndex++
 			return producer, nil
@@ -1129,7 +1199,7 @@ func TestReplyConsumerSurvivesRepeatedReconnects(t *testing.T) {
 	}
 	defer broker.Close()
 
-	if err := broker.ensureReplyConsumer(); err != nil {
+	if err := broker.ensureReplyConsumer(context.Background()); err != nil {
 		t.Fatalf("ensureReplyConsumer() error = %v", err)
 	}
 	replyTopic := broker.currentReplyTopic()
@@ -1141,10 +1211,10 @@ func TestReplyConsumerSurvivesRepeatedReconnects(t *testing.T) {
 		if !oldProducer.closed || !oldConsumer.closed {
 			t.Fatalf("cycle %d did not close the superseded producer and consumer", cycle+1)
 		}
-		if err := broker.ensureConnected(); err != nil {
+		if err := broker.ensureConnected(context.Background()); err != nil {
 			t.Fatalf("cycle %d ensureConnected() error = %v", cycle+1, err)
 		}
-		if err := broker.ensureReplyConsumer(); err != nil {
+		if err := broker.ensureReplyConsumer(context.Background()); err != nil {
 			t.Fatalf("cycle %d ensureReplyConsumer() error = %v", cycle+1, err)
 		}
 		if got := broker.currentReplyTopic(); got != replyTopic {
@@ -1171,7 +1241,7 @@ func TestSubscribeReconnectsAndResumesConsume(t *testing.T) {
 		return nil
 	}
 
-	producerQueue := []sarama.SyncProducer{firstProducer, secondProducer}
+	producerQueue := []messageProducer{firstProducer, secondProducer}
 	consumerQueue := []sarama.ConsumerGroup{firstGroup, secondGroup}
 
 	broker := &Broker{
@@ -1185,7 +1255,7 @@ func TestSubscribeReconnectsAndResumesConsume(t *testing.T) {
 		},
 		pending:   make(map[string]*pendingCall),
 		closeChan: make(chan struct{}),
-		newSyncProducer: func(_ []string, _ *sarama.Config) (sarama.SyncProducer, error) {
+		newProducer: func(_ []string, _ *sarama.Config) (messageProducer, error) {
 			if len(producerQueue) == 0 {
 				return nil, errors.New("no producer available")
 			}
@@ -1311,7 +1381,7 @@ func TestTrackedSubscriptionsRestoreAfterReconnectForMultipleDestinations(t *tes
 		return nil
 	}
 
-	producerQueue := []sarama.SyncProducer{firstProducer, secondProducer}
+	producerQueue := []messageProducer{firstProducer, secondProducer}
 	consumerQueue := []sarama.ConsumerGroup{firstGroup, secondGroup}
 
 	broker := &Broker{
@@ -1325,7 +1395,7 @@ func TestTrackedSubscriptionsRestoreAfterReconnectForMultipleDestinations(t *tes
 		},
 		pending:   make(map[string]*pendingCall),
 		closeChan: make(chan struct{}),
-		newSyncProducer: func(_ []string, _ *sarama.Config) (sarama.SyncProducer, error) {
+		newProducer: func(_ []string, _ *sarama.Config) (messageProducer, error) {
 			if len(producerQueue) == 0 {
 				return nil, errors.New("no producer available")
 			}

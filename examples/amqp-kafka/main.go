@@ -44,8 +44,12 @@ func main() {
 			if destination == "weave.example.orders" && !retryOrders.Swap(true) {
 				return errors.New("temporary order handler failure")
 			}
+			body := msg.BodyString()
+			if *backend == "kafka" {
+				body = fmt.Sprintf("partition=%d %s", msg.Partition, body)
+			}
 			select {
-			case received[destination] <- msg.BodyString():
+			case received[destination] <- body:
 				return nil
 			case <-handlerCtx.Done():
 				return handlerCtx.Err()
@@ -61,7 +65,11 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		if err := broker.Publish(ctx, destination, msg); err != nil {
+		publishOptions := []core.PublishOption{core.WithKey(destination)}
+		if *backend == "kafka" && destination == "weave.example.orders" {
+			publishOptions = append(publishOptions, core.WithPartition(1))
+		}
+		if err := broker.Publish(ctx, destination, msg, publishOptions...); err != nil {
 			log.Fatal(err)
 		}
 	}

@@ -98,7 +98,7 @@ func DecodeProtobuf(data []byte, v proto.Message) error {
 
 // MarshalMessage encodes a value into a weave message and sets the content type.
 func MarshalMessage(c Codec, v any) (*core.Message, error) {
-	if c == nil {
+	if isNilValue(c) {
 		return nil, errors.New("codec: nil codec")
 	}
 
@@ -112,7 +112,7 @@ func MarshalMessage(c Codec, v any) (*core.Message, error) {
 
 // UnmarshalMessage decodes a weave message body into the provided value.
 func UnmarshalMessage(c Codec, msg *core.Message, v any) error {
-	if c == nil {
+	if isNilValue(c) {
 		return errors.New("codec: nil codec")
 	}
 	if msg == nil {
@@ -124,6 +124,9 @@ func UnmarshalMessage(c Codec, msg *core.Message, v any) error {
 
 // UnmarshalAndValidate decodes a message and validates the decoded value.
 func UnmarshalAndValidate[T any](c Codec, msg *core.Message, v *T, validate func(*T) error) error {
+	if v == nil {
+		return errors.New("codec: nil output value")
+	}
 	if validate == nil {
 		return errors.New("codec: nil validator")
 	}

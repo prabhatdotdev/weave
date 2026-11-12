@@ -36,9 +36,10 @@ type Connector interface {
 	Backend() string
 }
 
-// Publisher defines message publishing operations (fire-and-forget).
+// Publisher defines publishing with broker acknowledgment.
 type Publisher interface {
-	// Publish sends a message to a destination (queue/topic/stream).
+	// Publish waits for broker acknowledgment, not consumer processing.
+	// Cancellation or connection loss after submission can leave delivery uncertain.
 	Publish(ctx context.Context, destination string, message *Message, opts ...PublishOption) error
 }
 

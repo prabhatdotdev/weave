@@ -161,3 +161,14 @@ func TestDefaultsAndEdgeCases(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestApplyingOptionsHandlesNilEntries(t *testing.T) {
+	options := ApplyPublishOptions(nil, WithTimeout(time.Second), WithPartition(0))
+	if options.Timeout != time.Second || options.Partition != 0 || !options.PartitionSet {
+		t.Fatal("nil entry prevented valid publish options from being applied")
+	}
+	subscription := ApplySubscribeOptions(nil, WithWorkerCount(2))
+	if subscription.WorkerCount != 2 || subscription.HandlerErrorPolicy != HandlerErrorNoRetry {
+		t.Fatal("nil entry prevented valid subscribe options or defaults from being applied")
+	}
+}

@@ -15,6 +15,7 @@
 package core
 
 import (
+	"context"
 	"errors"
 	"fmt"
 )
@@ -52,8 +53,13 @@ type ErrTimeout struct {
 }
 
 func (e *ErrTimeout) Error() string {
+	if e.Duration == "context deadline" {
+		return fmt.Sprintf("operation %s exceeded its context deadline", e.Operation)
+	}
 	return fmt.Sprintf("operation %s timed out after %s", e.Operation, e.Duration)
 }
+
+func (e *ErrTimeout) Unwrap() error { return context.DeadlineExceeded }
 
 // ErrCircuitOpen is returned when RPC retries are blocked by an open circuit breaker.
 type ErrCircuitOpen struct {
@@ -133,6 +139,8 @@ var (
 	ErrAlreadyConnected       = errors.New("broker is already connected")
 	ErrInvalidConfig          = errors.New("invalid configuration")
 	ErrDuplicateCorrelationID = errors.New("duplicate RPC correlation ID")
+	ErrUnroutable             = errors.New("message could not be routed to a queue")
+	ErrPublishRejected        = errors.New("broker rejected the publish")
 )
 
 // IsNotConnected returns true if the error indicates the broker is not connected.

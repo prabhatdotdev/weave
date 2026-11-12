@@ -18,14 +18,19 @@ package kafka
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
+	"net"
 	"sort"
 	"sync"
 	"time"
 
 	"github.com/IBM/sarama"
+	"github.com/xdg-go/scram"
 
 	"github.com/prabhatdotdev/weave/core"
+	"github.com/prabhatdotdev/weave/internal/connection"
+	"github.com/prabhatdotdev/weave/internal/validation"
 )
 
 const backendName = "kafka"
@@ -37,6 +42,12 @@ type subscriptionRegistration struct {
 	handler     core.Handler
 	opts        []core.SubscribeOption
 	tracked     bool
+	consumerKey consumerKey
+}
+
+type consumerKey struct {
+	group    string
+	earliest bool
 }
 
 type subscriptionRoute struct {
@@ -49,6 +60,32 @@ type subscriptionRoute struct {
 type pendingCall struct {
 	once     sync.Once
 	response chan *core.Message
+}
+
+type explicitPartitioner struct {
+	fallback sarama.Partitioner
+}
+
+func newExplicitPartitioner(topic string) sarama.Partitioner {
+	return &explicitPartitioner{fallback: sarama.NewHashPartitioner(topic)}
+}
+
+func (p *explicitPartitioner) Partition(message *sarama.ProducerMessage, partitions int32) (int32, error) {
+	if message.Partition >= 0 {
+		if message.Partition >= partitions {
+			return -1, sarama.ErrInvalidPartition
+		}
+		return message.Partition, nil
+	}
+	return p.fallback.Partition(message, partitions)
+}
+
+func (p *explicitPartitioner) RequiresConsistency() bool {
+	return true
+}
+
+func (p *explicitPartitioner) MessageRequiresConsistency(message *sarama.ProducerMessage) bool {
+	return message.Partition >= 0 || message.Key != nil
 }
 
 func newPendingCall() *pendingCall {
@@ -64,12 +101,13 @@ type Broker struct {
 	config      *core.Config
 	kafkaConfig *core.KafkaConfig
 
-	producer         sarama.SyncProducer
+	producer         messageProducer
 	consumer         sarama.ConsumerGroup
-	newSyncProducer  func([]string, *sarama.Config) (sarama.SyncProducer, error)
+	consumers        map[consumerKey]sarama.ConsumerGroup
+	newProducer      func([]string, *sarama.Config) (messageProducer, error)
 	newConsumerGroup func([]string, string, *sarama.Config) (sarama.ConsumerGroup, error)
 
-	replyMu     sync.Mutex
+	replyGate   chan struct{}
 	replyTopic  string
 	pending     map[string]*pendingCall
 	pendingMu   sync.RWMutex
@@ -86,6 +124,7 @@ type Broker struct {
 	everConnected bool
 	recovering    bool
 	closed        bool
+	connecting    chan struct{}
 	closeMu       sync.RWMutex
 	closeOnce     sync.Once
 	closeChan     chan struct{}
@@ -106,23 +145,39 @@ func (b *Broker) emitEvent(ctx context.Context, event core.Event) {
 
 // NewBroker creates a new Kafka broker instance.
 func NewBroker(config *core.Config) (core.MessageBroker, error) {
-	if config == nil {
-		config = core.DefaultConfig()
+	var err error
+	config, err = validation.Config(config)
+	if err != nil {
+		return nil, err
 	}
 	if config.Kafka == nil {
 		config.Kafka = core.DefaultKafkaConfig()
 	}
+	if err := validation.Kafka(config.Kafka); err != nil {
+		return nil, err
+	}
+	if sasl := config.Kafka.SASL; sasl != nil && sasl.Enable {
+		switch sasl.Mechanism {
+		case "", "PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512":
+		default:
+			return nil, fmt.Errorf("%w: unsupported Kafka SASL mechanism %q", core.ErrInvalidConfig, sasl.Mechanism)
+		}
+	}
 
-	return &Broker{
+	broker := &Broker{
 		config:           config,
 		kafkaConfig:      config.Kafka,
-		newSyncProducer:  sarama.NewSyncProducer,
+		newProducer:      newProducer,
 		newConsumerGroup: sarama.NewConsumerGroup,
 		pending:          make(map[string]*pendingCall),
 		subsChanged:      make(chan struct{}, 1),
 		watching:         make(map[sarama.ConsumerGroup]struct{}),
 		closeChan:        make(chan struct{}),
-	}, nil
+	}
+	if err := broker.buildSaramaConfig().Validate(); err != nil {
+		return nil, fmt.Errorf("%w: %v", core.ErrInvalidConfig, err)
+	}
+	return broker, nil
 }
 
 // Backend returns the name of this backend.
@@ -132,22 +187,102 @@ func (b *Broker) Backend() string {
 
 // Connect establishes a connection to the Kafka cluster.
 func (b *Broker) Connect(ctx context.Context) error {
-	_ = ctx
+	if err := validation.Context(ctx); err != nil {
+		return err
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		b.closeMu.Lock()
+		if b.closed {
+			b.closeMu.Unlock()
+			return core.ErrClosed
+		}
+		if b.connected {
+			b.closeMu.Unlock()
+			return nil
+		}
+		if done := b.connecting; done != nil {
+			b.closeMu.Unlock()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-b.closeChan:
+				return core.ErrClosed
+			case <-done:
+				continue
+			}
+		}
+		b.connecting = make(chan struct{})
+		b.closeMu.Unlock()
+		break
+	}
 
+	b.closeMu.RLock()
+	keys := make([]consumerKey, 0, len(b.consumers))
+	for key := range b.consumers {
+		keys = append(keys, key)
+	}
+	b.closeMu.RUnlock()
+	client, err := b.open(ctx, keys)
 	b.closeMu.Lock()
-	defer b.closeMu.Unlock()
-
 	if b.closed {
-		return core.ErrClosed
+		err = core.ErrClosed
 	}
-	if b.connected {
-		return nil
+	var previous *openedConnection
+	if err == nil {
+		previous = &openedConnection{producer: b.producer, consumer: b.consumer, consumers: b.consumers}
+		b.producer, b.consumer, b.consumers = client.producer, client.consumer, client.consumers
+		b.connected, b.everConnected, b.recovering = true, true, false
 	}
-
-	return b.connectLocked()
+	close(b.connecting)
+	b.connecting = nil
+	b.closeMu.Unlock()
+	if previous != nil {
+		_ = previous.Close()
+	}
+	if err != nil && client != nil {
+		_ = client.Close()
+	}
+	event := core.Event{
+		Level:     core.EventLevelInfo,
+		Name:      core.EventConnect,
+		Operation: "connect",
+		Err:       err,
+		Fields:    map[string]any{"outcome": "success"},
+	}
+	if err != nil {
+		event.Level = core.EventLevelError
+		event.Fields["outcome"] = "failure"
+	}
+	b.emitEvent(ctx, event)
+	return err
 }
 
-func (b *Broker) connectLocked() error {
+type openedConnection struct {
+	producer  messageProducer
+	consumer  sarama.ConsumerGroup
+	consumers map[consumerKey]sarama.ConsumerGroup
+}
+
+func (c *openedConnection) Close() error {
+	var errs []error
+	if c.producer != nil {
+		errs = append(errs, c.producer.Close())
+	}
+	if c.consumer != nil {
+		errs = append(errs, c.consumer.Close())
+	}
+	for _, consumer := range c.consumers {
+		if consumer != nil {
+			errs = append(errs, consumer.Close())
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (b *Broker) open(ctx context.Context, keys []consumerKey) (*openedConnection, error) {
 	saramaConfig := b.buildSaramaConfig()
 	retries := b.config.ConnectionRetry
 	if retries <= 0 {
@@ -156,65 +291,52 @@ func (b *Broker) connectLocked() error {
 
 	var lastErr error
 	for i := 0; i <= retries; i++ {
-		producer, err := b.newSyncProducer(b.kafkaConfig.Brokers, saramaConfig)
-		if err != nil {
-			lastErr = err
-		} else {
-			var consumer sarama.ConsumerGroup
-			consumerGroup := b.kafkaConfig.ConsumerGroup
-			if consumerGroup != "" {
-				consumer, err = b.newConsumerGroup(b.kafkaConfig.Brokers, consumerGroup, saramaConfig)
+		client, err := connection.Open(ctx, b.closeChan, net.Dialer{Timeout: saramaConfig.Net.DialTimeout, KeepAlive: saramaConfig.Net.KeepAlive}, func(dialer *connection.Dialer) (*openedConnection, error) {
+			config := *saramaConfig
+			config.Net.Proxy.Enable, config.Net.Proxy.Dialer = true, dialer
+			producer, err := b.newProducer(b.kafkaConfig.Brokers, &config)
+			if err != nil {
+				return nil, err
+			}
+			client := &openedConnection{producer: producer, consumers: make(map[consumerKey]sarama.ConsumerGroup, len(keys))}
+			if group := b.kafkaConfig.ConsumerGroup; group != "" {
+				client.consumer, err = b.newConsumerGroup(b.kafkaConfig.Brokers, group, &config)
 				if err != nil {
-					_ = producer.Close()
-					lastErr = err
-				} else {
-					lastErr = nil
+					_ = client.Close()
+					return nil, err
 				}
-			} else {
-				lastErr = nil
 			}
-
-			if lastErr == nil {
-				if b.producer != nil {
-					_ = b.producer.Close()
+			for _, key := range keys {
+				consumerConfig := config
+				if key.earliest {
+					consumerConfig.Consumer.Offsets.Initial = sarama.OffsetOldest
 				}
-				if b.consumer != nil {
-					_ = b.consumer.Close()
+				consumer, err := b.newConsumerGroup(b.kafkaConfig.Brokers, key.group, &consumerConfig)
+				if err != nil {
+					_ = client.Close()
+					return nil, err
 				}
-
-				b.producer = producer
-				b.consumer = consumer
-				b.connected = true
-				b.everConnected = true
-				b.recovering = false
-				b.emitEvent(context.Background(), core.Event{
-					Level:     core.EventLevelInfo,
-					Name:      core.EventConnect,
-					Operation: "connect",
-					Fields:    map[string]any{"outcome": "success"},
-				})
-				return nil
+				client.consumers[key] = consumer
 			}
+			return client, nil
+		})
+		if err == nil {
+			return client, nil
 		}
+		lastErr = err
 
 		if i < retries {
 			delay := b.config.RetryDelay
 			if delay == 0 {
 				delay = 2 * time.Second
 			}
-			time.Sleep(delay)
+			if err := connection.Wait(ctx, b.closeChan, delay); err != nil {
+				return nil, err
+			}
 		}
 	}
 
-	b.emitEvent(context.Background(), core.Event{
-		Level:     core.EventLevelError,
-		Name:      core.EventConnect,
-		Operation: "connect",
-		Err:       lastErr,
-		Fields:    map[string]any{"outcome": "failure"},
-	})
-
-	return &core.ErrConnectionFailed{
+	return nil, &core.ErrConnectionFailed{
 		Backend: backendName,
 		Address: fmt.Sprintf("%v", b.kafkaConfig.Brokers),
 		Cause:   lastErr,
@@ -224,9 +346,18 @@ func (b *Broker) connectLocked() error {
 func (b *Broker) buildSaramaConfig() *sarama.Config {
 	saramaConfig := sarama.NewConfig()
 	saramaConfig.Producer.Return.Successes = true
+	saramaConfig.Producer.Return.Errors = true
+	if b.kafkaConfig.ClientID != "" {
+		saramaConfig.ClientID = b.kafkaConfig.ClientID
+	}
+	if b.kafkaConfig.TLS != nil {
+		saramaConfig.Net.TLS.Enable = true
+		saramaConfig.Net.TLS.Config = b.kafkaConfig.TLS.Clone()
+	}
 	saramaConfig.Producer.RequiredAcks = sarama.RequiredAcks(b.kafkaConfig.RequiredAcks)
 	saramaConfig.Producer.Retry.Max = b.kafkaConfig.MaxRetries
 	saramaConfig.Producer.Retry.Backoff = b.kafkaConfig.RetryBackoff
+	saramaConfig.Producer.Partitioner = newExplicitPartitioner
 	saramaConfig.Metadata.AllowAutoTopicCreation = false
 
 	saramaConfig.Consumer.Group.Session.Timeout = b.kafkaConfig.SessionTimeout
@@ -245,8 +376,14 @@ func (b *Broker) buildSaramaConfig() *sarama.Config {
 		switch b.kafkaConfig.SASL.Mechanism {
 		case "SCRAM-SHA-256":
 			saramaConfig.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA256
+			saramaConfig.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient {
+				return &scramClient{hash: scram.SHA256}
+			}
 		case "SCRAM-SHA-512":
 			saramaConfig.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
+			saramaConfig.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient {
+				return &scramClient{hash: scram.SHA512}
+			}
 		default:
 			saramaConfig.Net.SASL.Mechanism = sarama.SASLTypePlaintext
 		}
@@ -271,55 +408,58 @@ func (b *Broker) IsRecovering() bool {
 
 // Close gracefully shuts down the Kafka connections.
 func (b *Broker) Close() error {
-	var errs []error
+	var err error
+	closed := false
 	b.closeOnce.Do(func() {
 		b.closeMu.Lock()
 		b.closed = true
 		b.connected = false
 		b.recovering = false
+		client := &openedConnection{producer: b.producer, consumer: b.consumer, consumers: b.consumers}
+		b.producer, b.consumer, b.consumers = nil, nil, nil
 		b.closeMu.Unlock()
 
 		close(b.closeChan)
 		b.cancelAllPending()
 
-		if b.producer != nil {
-			if err := b.producer.Close(); err != nil {
-				errs = append(errs, err)
-			}
-			b.producer = nil
-		}
-		if b.consumer != nil {
-			if err := b.consumer.Close(); err != nil {
-				errs = append(errs, err)
-			}
-			b.consumer = nil
-		}
-
+		err = client.Close()
+		closed = true
+	})
+	if closed {
 		b.emitEvent(context.Background(), core.Event{
 			Level:     core.EventLevelInfo,
 			Name:      core.EventDisconnect,
 			Operation: "close",
 			Fields:    map[string]any{"outcome": "success", "reason": "close"},
 		})
-	})
-
-	if len(errs) > 0 {
-		return errs[0]
 	}
-	return nil
+	return err
 }
 
 // Publish sends a message to the specified Kafka topic.
 func (b *Broker) Publish(ctx context.Context, destination string, msg *core.Message, opts ...core.PublishOption) error {
-	if err := b.ensureConnected(); err != nil {
+	options, err := validation.Publish(ctx, destination, msg, opts...)
+	if err != nil {
+		return validation.ContextError(err, "Publish", "context deadline")
+	}
+	if err := validation.KafkaTopic(destination); err != nil {
 		return err
 	}
+	if options.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, options.Timeout)
+		defer cancel()
+	}
+	if err := b.ensureConnected(ctx); err != nil {
+		return validation.ContextError(err, "Publish", options.Timeout.String())
+	}
 
-	options := core.ApplyPublishOptions(opts...)
+	msg = msg.Clone()
 
 	kafkaMsg := &sarama.ProducerMessage{
-		Topic: destination,
-		Value: sarama.ByteEncoder(msg.Body),
+		Topic:     destination,
+		Partition: -1,
+		Value:     sarama.ByteEncoder(msg.Body),
 	}
 
 	if options.Partition >= 0 {
@@ -367,8 +507,9 @@ func (b *Broker) Publish(ctx context.Context, destination string, msg *core.Mess
 		return &core.ErrNotConnected{Backend: backendName}
 	}
 
-	_, _, err := producer.SendMessage(kafkaMsg)
+	_, _, err = producer.SendMessageContext(ctx, kafkaMsg)
 	if err != nil {
+		err = validation.ContextError(err, "Publish", options.Timeout.String())
 		b.emitEvent(ctx, core.Event{
 			Level:       core.EventLevelError,
 			Name:        core.EventPublishFailed,
@@ -376,7 +517,9 @@ func (b *Broker) Publish(ctx context.Context, destination string, msg *core.Mess
 			Destination: destination,
 			Err:         err,
 		})
-		b.handleProducerLoss(producer, err)
+		if producerUnavailable(err) {
+			b.handleProducerLoss(producer, err)
+		}
 		return &core.ErrPublishFailed{Backend: backendName, Destination: destination, Cause: err}
 	}
 
@@ -393,21 +536,27 @@ func (b *Broker) Subscribe(ctx context.Context, destination string, handler core
 }
 
 func (b *Broker) subscribe(ctx context.Context, destination string, handler core.Handler, track bool, opts ...core.SubscribeOption) error {
-	options := core.ApplySubscribeOptions(opts...)
-	if options.WorkerCount < 0 {
-		return fmt.Errorf("%w: worker count must not be negative", core.ErrInvalidConfig)
-	}
+	return b.subscribeWithSetup(ctx, ctx, destination, handler, track, opts...)
+}
 
-	if err := b.ensureConnected(); err != nil {
+func (b *Broker) subscribeWithSetup(setupCtx, ctx context.Context, destination string, handler core.Handler, track bool, opts ...core.SubscribeOption) error {
+	options, err := validation.Subscribe(ctx, destination, handler, opts...)
+	if err != nil {
+		return err
+	}
+	if err := validation.KafkaTopic(destination); err != nil {
 		return err
 	}
 
+	if err := b.ensureConnected(setupCtx); err != nil {
+		return err
+	}
+
+	if err := b.startSubscriptionConsumer(setupCtx, destination, options); err != nil {
+		return err
+	}
 	reg := b.registerSubscription(ctx, destination, handler, opts, track)
-
-	if err := b.startSubscriptionConsumer(ctx, destination, options); err != nil {
-		b.unregisterSubscription(reg.id)
-		return err
-	}
+	b.restartSubscriptionRunner()
 
 	go func() {
 		select {
@@ -422,16 +571,12 @@ func (b *Broker) subscribe(ctx context.Context, destination string, handler core
 }
 
 func (b *Broker) startSubscriptionConsumer(ctx context.Context, destination string, options *core.SubscribeOptions) error {
-	if err := b.ensureConnected(); err != nil {
+	if err := b.ensureConnected(ctx); err != nil {
 		return err
 	}
 
-	consumerGroup := options.ConsumerGroup
-	if consumerGroup == "" {
-		consumerGroup = b.kafkaConfig.ConsumerGroup
-	}
-
-	if b.currentConsumer() == nil && consumerGroup == "" {
+	key := b.subscriptionConsumerKey(options)
+	if b.currentConsumerFor(key) == nil && key.group == "" {
 		err := fmt.Errorf("consumer group not configured")
 		b.emitEvent(ctx, core.Event{
 			Level:       core.EventLevelError,
@@ -446,9 +591,64 @@ func (b *Broker) startSubscriptionConsumer(ctx context.Context, destination stri
 			Cause:       err,
 		}
 	}
+	if b.currentConsumerFor(key) == nil {
+		config := b.buildSaramaConfig()
+		if key.earliest {
+			config.Consumer.Offsets.Initial = sarama.OffsetOldest
+		}
+		producer := b.currentProducer()
+		consumer, err := connection.Open(ctx, b.closeChan, net.Dialer{Timeout: config.Net.DialTimeout, KeepAlive: config.Net.KeepAlive}, func(dialer *connection.Dialer) (sarama.ConsumerGroup, error) {
+			config.Net.Proxy.Enable, config.Net.Proxy.Dialer = true, dialer
+			return b.newConsumerGroup(b.kafkaConfig.Brokers, key.group, config)
+		})
+		if err != nil {
+			return &core.ErrSubscribeFailed{Backend: backendName, Destination: destination, Cause: err}
+		}
+		b.closeMu.Lock()
+		if b.closed || !b.connected || b.producer != producer {
+			b.closeMu.Unlock()
+			_ = consumer.Close()
+			return &core.ErrNotConnected{Backend: backendName}
+		}
+		previous := b.consumerForLocked(key)
+		if previous == nil {
+			if key == b.subscriptionConsumerKey(&core.SubscribeOptions{}) {
+				b.consumer = consumer
+			} else {
+				if b.consumers == nil {
+					b.consumers = make(map[consumerKey]sarama.ConsumerGroup)
+				}
+				b.consumers[key] = consumer
+			}
+		}
+		b.closeMu.Unlock()
+		if previous != nil {
+			_ = consumer.Close()
+		}
+	}
 
-	b.restartSubscriptionRunner()
 	return nil
+}
+
+func (b *Broker) subscriptionConsumerKey(options *core.SubscribeOptions) consumerKey {
+	group := options.ConsumerGroup
+	if group == "" {
+		group = b.kafkaConfig.ConsumerGroup
+	}
+	return consumerKey{group: group, earliest: options.StartFromBeginning || b.kafkaConfig.AutoOffsetReset == "earliest"}
+}
+
+func (b *Broker) consumerForLocked(key consumerKey) sarama.ConsumerGroup {
+	if key == b.subscriptionConsumerKey(&core.SubscribeOptions{}) {
+		return b.consumer
+	}
+	return b.consumers[key]
+}
+
+func (b *Broker) currentConsumerFor(key consumerKey) sarama.ConsumerGroup {
+	b.closeMu.RLock()
+	defer b.closeMu.RUnlock()
+	return b.consumerForLocked(key)
 }
 
 func (b *Broker) restartSubscriptionRunner() {
@@ -479,8 +679,8 @@ func (b *Broker) runSubscriptionConsumer(changed <-chan struct{}) {
 	}()
 
 	for {
-		topics, routes := b.activeSubscriptionRoutes()
-		if len(topics) == 0 {
+		groups := b.activeSubscriptionGroups()
+		if len(groups) == 0 {
 			select {
 			case <-changed:
 				continue
@@ -489,7 +689,7 @@ func (b *Broker) runSubscriptionConsumer(changed <-chan struct{}) {
 			}
 		}
 
-		if err := b.ensureConnected(); err != nil {
+		if err := b.ensureConnected(context.Background()); err != nil {
 			b.emitEvent(context.Background(), core.Event{
 				Level:       core.EventLevelWarn,
 				Name:        core.EventConnect,
@@ -498,47 +698,55 @@ func (b *Broker) runSubscriptionConsumer(changed <-chan struct{}) {
 				Err:         err,
 				Fields:      map[string]any{"outcome": "failure"},
 			})
-			select {
-			case <-time.After(200 * time.Millisecond):
-			case <-b.closeChan:
-				return
-			}
-			continue
-		}
-
-		consumer := b.currentConsumer()
-		if consumer == nil {
-			select {
-			case <-time.After(200 * time.Millisecond):
-			case <-b.closeChan:
+			if connection.Wait(context.Background(), b.closeChan, 200*time.Millisecond) != nil {
 				return
 			}
 			continue
 		}
 
 		consumeCtx, cancel := context.WithCancel(context.Background())
-		go func() {
-			select {
-			case <-changed:
-				cancel()
-			case <-consumeCtx.Done():
-			case <-b.closeChan:
-				cancel()
-			}
-		}()
-
-		b.watchConsumerErrors(consumeCtx, "*", consumer)
-		handler := &consumerGroupHandler{
-			routes:    routes,
-			closeChan: b.closeChan,
-			pending:   b.pending,
-			pendingMu: &b.pendingMu,
-			config:    b.config,
+		type result struct {
+			consumer sarama.ConsumerGroup
+			err      error
 		}
-		err := consumer.Consume(consumeCtx, topics, handler)
-		changedTopics := consumeCtx.Err() != nil
+		results := make(chan result, len(groups))
+		for key, routes := range groups {
+			consumer := b.currentConsumerFor(key)
+			go func() {
+				if consumer == nil {
+					results <- result{err: &core.ErrNotConnected{Backend: backendName}}
+					return
+				}
+				b.watchConsumerErrors(consumeCtx, "*", consumer)
+				handler := &consumerGroupHandler{routes: routes, closeChan: b.closeChan, pending: b.pending, pendingMu: &b.pendingMu, config: b.config}
+				topics := make([]string, 0, len(routes))
+				for topic := range routes {
+					topics = append(topics, topic)
+				}
+				sort.Strings(topics)
+				var err error
+				for consumeCtx.Err() == nil {
+					err = consumer.Consume(consumeCtx, topics, handler)
+					if err != nil {
+						break
+					}
+				}
+				results <- result{consumer, err}
+			}()
+		}
+		var failed result
+		remaining := len(groups)
+		select {
+		case <-changed:
+		case <-b.closeChan:
+		case failed = <-results:
+			remaining--
+		}
 		cancel()
-		if err == nil || changedTopics || b.isClosed() {
+		for range remaining {
+			<-results
+		}
+		if failed.err == nil || b.isClosed() {
 			continue
 		}
 
@@ -547,17 +755,17 @@ func (b *Broker) runSubscriptionConsumer(changed <-chan struct{}) {
 			Name:        core.EventSubscribeFailed,
 			Operation:   "consume",
 			Destination: "*",
-			Err:         err,
+			Err:         failed.err,
 		})
-		b.handleConsumerLoss(consumer, err)
+		b.handleConsumerLoss(failed.consumer, failed.err)
 	}
 }
 
-func (b *Broker) activeSubscriptionRoutes() ([]string, map[string]subscriptionRoute) {
+func (b *Broker) activeSubscriptionGroups() map[consumerKey]map[string]subscriptionRoute {
 	b.subsMu.RLock()
 	defer b.subsMu.RUnlock()
 
-	routes := make(map[string]subscriptionRoute, len(b.subs))
+	groups := make(map[consumerKey]map[string]subscriptionRoute)
 	for _, sub := range b.subs {
 		if sub.ctx.Err() != nil {
 			continue
@@ -571,9 +779,21 @@ func (b *Broker) activeSubscriptionRoutes() ([]string, map[string]subscriptionRo
 		if options.WorkerCount > 0 {
 			route.workers = make(chan struct{}, options.WorkerCount)
 		}
-		routes[sub.destination] = route
+		if groups[sub.consumerKey] == nil {
+			groups[sub.consumerKey] = make(map[string]subscriptionRoute)
+		}
+		groups[sub.consumerKey][sub.destination] = route
 	}
+	return groups
+}
 
+func (b *Broker) activeSubscriptionRoutes() ([]string, map[string]subscriptionRoute) {
+	routes := make(map[string]subscriptionRoute)
+	for _, group := range b.activeSubscriptionGroups() {
+		for topic, route := range group {
+			routes[topic] = route
+		}
+	}
 	topics := make([]string, 0, len(routes))
 	for topic := range routes {
 		topics = append(topics, topic)
@@ -584,14 +804,24 @@ func (b *Broker) activeSubscriptionRoutes() ([]string, map[string]subscriptionRo
 
 // Call implements request-response pattern using correlation IDs and reply topics.
 func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message, opts ...core.PublishOption) (*core.Message, error) {
-	if err := b.ensureConnected(); err != nil {
+	options, err := validation.Publish(ctx, destination, msg, opts...)
+	if err != nil {
+		return nil, validation.ContextError(err, "Call", "context deadline")
+	}
+	if err := validation.KafkaTopic(destination); err != nil {
 		return nil, err
 	}
+	if options.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, options.Timeout)
+		defer cancel()
+	}
+	if err := b.ensureConnected(ctx); err != nil {
+		return nil, validation.ContextError(err, "Call", options.Timeout.String())
+	}
 
-	options := core.ApplyPublishOptions(opts...)
-
-	if err := b.ensureReplyConsumer(); err != nil {
-		return nil, err
+	if err := b.ensureReplyConsumer(ctx); err != nil {
+		return nil, validation.ContextError(err, "Call", options.Timeout.String())
 	}
 
 	request := msg.Clone()
@@ -615,12 +845,6 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 		b.pendingMu.Unlock()
 	}()
 
-	if options.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, options.Timeout)
-		defer cancel()
-	}
-
 	request.CorrelationID = corrID
 	request.ReplyTo = b.currentReplyTopic()
 
@@ -639,7 +863,7 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 				"timeout": options.Timeout.String(),
 			},
 		})
-		return nil, &core.ErrTimeout{Operation: "Call", Duration: options.Timeout.String()}
+		return nil, validation.ContextError(ctx.Err(), "Call", options.Timeout.String())
 	case response := <-pending.response:
 		if response == nil {
 			return nil, &core.ErrConnectionLost{Backend: backendName}
@@ -648,9 +872,21 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 	}
 }
 
-func (b *Broker) ensureReplyConsumer() error {
-	b.replyMu.Lock()
-	defer b.replyMu.Unlock()
+func (b *Broker) ensureReplyConsumer(ctx context.Context) error {
+	b.closeMu.Lock()
+	if b.replyGate == nil {
+		b.replyGate = make(chan struct{}, 1)
+	}
+	gate := b.replyGate
+	b.closeMu.Unlock()
+	select {
+	case gate <- struct{}{}:
+		defer func() { <-gate }()
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-b.closeChan:
+		return core.ErrClosed
+	}
 
 	if b.currentReplyTopic() != "" {
 		return nil
@@ -660,7 +896,7 @@ func (b *Broker) ensureReplyConsumer() error {
 	if replyTopic == "" {
 		return fmt.Errorf("%w: Kafka reply topic must be configured", core.ErrInvalidConfig)
 	}
-	if err := b.subscribe(context.Background(), replyTopic, func(ctx context.Context, msg *core.Message) error {
+	if err := b.subscribeWithSetup(ctx, context.Background(), replyTopic, func(ctx context.Context, msg *core.Message) error {
 		return nil
 	}, false); err != nil {
 		return err
@@ -686,7 +922,10 @@ func (b *Broker) cancelAllPending() {
 	}
 }
 
-func (b *Broker) ensureConnected() error {
+func (b *Broker) ensureConnected(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	b.closeMu.Lock()
 
 	if b.closed {
@@ -703,6 +942,7 @@ func (b *Broker) ensureConnected() error {
 		b.closeMu.Unlock()
 		return &core.ErrNotConnected{Backend: backendName}
 	}
+	b.closeMu.Unlock()
 
 	// Emit reconnect started event
 	b.emitEvent(context.Background(), core.Event{
@@ -711,8 +951,7 @@ func (b *Broker) ensureConnected() error {
 		Operation: "ensure_connected",
 	})
 
-	err := b.connectLocked()
-	b.closeMu.Unlock()
+	err := b.Connect(ctx)
 	if err != nil {
 		b.emitEvent(context.Background(), core.Event{
 			Level:     core.EventLevelError,
@@ -734,52 +973,69 @@ func (b *Broker) ensureConnected() error {
 }
 
 func (b *Broker) handleConnectionLoss(cause error) {
-	b.handleConnectionLossFor(nil, nil, cause)
+	if client := b.handleConnectionLossFor(nil, nil, cause); client != nil {
+		_ = client.Close()
+	}
 }
 
-func (b *Broker) handleProducerLoss(producer sarama.SyncProducer, cause error) {
-	b.handleConnectionLossFor(producer, nil, cause)
+func (b *Broker) handleProducerLoss(producer messageProducer, cause error) {
+	if client := b.handleConnectionLossFor(producer, nil, cause); client != nil {
+		go func() { _ = client.Close() }()
+	}
 }
 
 func (b *Broker) handleConsumerLoss(consumer sarama.ConsumerGroup, cause error) {
-	b.handleConnectionLossFor(nil, consumer, cause)
+	if client := b.handleConnectionLossFor(nil, consumer, cause); client != nil {
+		_ = client.Close()
+	}
 }
 
-func (b *Broker) handleConnectionLossFor(expectedProducer sarama.SyncProducer, expectedConsumer sarama.ConsumerGroup, cause error) {
+func producerUnavailable(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var networkError net.Error
+	return core.IsConnectionLost(err) || errors.Is(err, sarama.ErrOutOfBrokers) || errors.Is(err, sarama.ErrClosedClient) || errors.Is(err, sarama.ErrShuttingDown) || errors.As(err, &networkError)
+}
+
+func (b *Broker) handleConnectionLossFor(expectedProducer messageProducer, expectedConsumer sarama.ConsumerGroup, cause error) *openedConnection {
 	b.closeMu.Lock()
 	if b.closed {
 		b.closeMu.Unlock()
-		return
+		return nil
 	}
 	if expectedProducer != nil && b.producer != expectedProducer {
 		b.closeMu.Unlock()
-		return
+		return nil
 	}
 	if expectedConsumer != nil && b.consumer != expectedConsumer {
-		b.closeMu.Unlock()
-		return
+		found := false
+		for _, consumer := range b.consumers {
+			found = found || consumer == expectedConsumer
+		}
+		if !found {
+			b.closeMu.Unlock()
+			return nil
+		}
 	}
 	if !b.connected && b.recovering {
 		b.closeMu.Unlock()
-		return
+		return nil
 	}
 	b.connected = false
 	b.recovering = true
-	producer := b.producer
-	consumer := b.consumer
+	client := &openedConnection{producer: b.producer, consumer: b.consumer, consumers: b.consumers}
 	b.producer = nil
 	b.consumer = nil
+	b.consumers = make(map[consumerKey]sarama.ConsumerGroup, len(client.consumers))
 	b.watchMu.Lock()
-	delete(b.watching, consumer)
+	delete(b.watching, client.consumer)
+	for key, consumer := range client.consumers {
+		b.consumers[key] = nil
+		delete(b.watching, consumer)
+	}
 	b.watchMu.Unlock()
 	b.closeMu.Unlock()
-
-	if producer != nil {
-		_ = producer.Close()
-	}
-	if consumer != nil {
-		_ = consumer.Close()
-	}
 
 	b.cancelAllPending()
 	b.emitEvent(context.Background(), core.Event{
@@ -789,6 +1045,7 @@ func (b *Broker) handleConnectionLossFor(expectedProducer sarama.SyncProducer, e
 		Err:       cause,
 		Fields:    map[string]any{"outcome": "failure"},
 	})
+	return client
 }
 
 func (b *Broker) registerSubscription(ctx context.Context, destination string, handler core.Handler, opts []core.SubscribeOption, tracked bool) subscriptionRegistration {
@@ -802,6 +1059,7 @@ func (b *Broker) registerSubscription(ctx context.Context, destination string, h
 		handler:     handler,
 		opts:        append([]core.SubscribeOption(nil), opts...),
 		tracked:     tracked,
+		consumerKey: b.subscriptionConsumerKey(core.ApplySubscribeOptions(opts...)),
 	}
 	b.subs = append(b.subs, reg)
 	return reg
@@ -856,7 +1114,7 @@ func (b *Broker) restoreTrackedSubscriptions() {
 	}
 }
 
-func (b *Broker) currentProducer() sarama.SyncProducer {
+func (b *Broker) currentProducer() messageProducer {
 	b.closeMu.RLock()
 	defer b.closeMu.RUnlock()
 	return b.producer
@@ -929,6 +1187,7 @@ func (b *Broker) watchConsumerErrors(ctx context.Context, destination string, co
 				})
 				if !b.isClosed() {
 					b.handleConsumerLoss(consumer, err)
+					b.restartSubscriptionRunner()
 				}
 			}
 		}

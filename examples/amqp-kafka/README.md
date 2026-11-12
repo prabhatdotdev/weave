@@ -4,7 +4,7 @@ Start the brokers:
 
 ```sh
 docker compose up -d
-docker compose exec kafka sh -c 'for topic in weave.example.users weave.example.orders weave.example.rpc weave.example.client.replies; do /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --if-not-exists --topic "$topic"; done'
+docker compose exec kafka sh -c 'for topic in weave.example.users weave.example.orders weave.example.rpc weave.example.client.replies; do /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --if-not-exists --partitions 3 --topic "$topic"; done'
 ```
 
 The Kafka transport disables topic auto-creation requests, so the example
@@ -24,6 +24,11 @@ returns an error once for both transports. Both use `WithHandlerErrorRetry` to
 demonstrate contained failures and safe redelivery before later messages are
 processed. Handlers also select on their context so subscription cancellation,
 deadlines, and tracing values propagate into active work.
+
+Both messages use a stable Kafka key. The orders message also uses
+`WithPartition(1)`, so its Kafka output starts with `partition=1`; the users
+message demonstrates the normal key-based fallback. AMQP ignores these
+Kafka-specific publish options.
 
 Each run also completes the same request/reply round trip through `Call`:
 

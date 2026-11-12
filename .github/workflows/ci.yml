@@ -48,6 +48,20 @@ jobs:
           docker compose -f examples/amqp-kafka/compose.yaml up -d --wait rabbitmq
           go test -race ./transport/amqp -run 'WithLiveRabbitMQ$' -count=1
 
+      - name: Run Kafka SCRAM integration tests
+        env:
+          WEAVE_KAFKA_SCRAM_E2E: "1"
+        run: |
+          docker compose -f transport/kafka/testdata/scram/compose.yaml up -d --wait
+          go test -race ./transport/kafka -run 'SCRAMAuthenticationWithLiveKafka$' -count=1
+
+      - name: Run TLS integration tests
+        env:
+          WEAVE_TLS_E2E: "1"
+        run: |
+          docker compose -f testdata/tls/compose.yaml up -d --build --wait
+          go test -race ./transport/amqp ./transport/kafka -run 'TLSWithLive' -count=1
+
       - name: Enforce critical package coverage
         env:
           COVERAGE_MIN: "75.0"

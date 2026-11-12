@@ -173,3 +173,20 @@ func TestUnmarshalAndValidateRejectsNilValidatorBeforeDecode(t *testing.T) {
 		t.Fatalf("decoded value changed before rejecting nil validator: %#v", decoded)
 	}
 }
+
+func TestMessageHelpersRejectTypedNilCodecs(t *testing.T) {
+	var codec *jsonCodec
+	if _, err := MarshalMessage(codec, "payload"); err == nil {
+		t.Fatal("typed nil codec was accepted for marshaling")
+	}
+	var value string
+	if err := UnmarshalMessage(codec, core.NewTextMessage(`"payload"`), &value); err == nil {
+		t.Fatal("typed nil codec was accepted for unmarshaling")
+	}
+	if err := UnmarshalAndValidate(JSON, core.NewTextMessage("null"), (*string)(nil), func(*string) error {
+		t.Fatal("validator called with a nil output value")
+		return nil
+	}); err == nil {
+		t.Fatal("nil decode target was accepted")
+	}
+}

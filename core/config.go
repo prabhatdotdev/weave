@@ -14,7 +14,10 @@
 
 package core
 
-import "time"
+import (
+	"crypto/tls"
+	"time"
+)
 
 // Config holds the configuration for a message broker.
 type Config struct {
@@ -28,6 +31,8 @@ type Config struct {
 
 // AMQPConfig holds AMQP/RabbitMQ-specific configuration.
 type AMQPConfig struct {
+	// TLS enables AMQPS when non-nil. Certificates are verified by default.
+	TLS             *tls.Config
 	Host            string
 	Port            int
 	Username        string
@@ -42,10 +47,13 @@ type AMQPConfig struct {
 
 // KafkaConfig holds Apache Kafka-specific configuration.
 type KafkaConfig struct {
-	Brokers           []string
-	ClientID          string
-	ConsumerGroup     string
-	ReplyTopic        string
+	// TLS enables TLS when non-nil and can be combined with SASL.
+	TLS           *tls.Config
+	Brokers       []string
+	ClientID      string
+	ConsumerGroup string
+	ReplyTopic    string
+	// RequiredAcks must be 1 (leader) or -1 (all in-sync replicas).
 	RequiredAcks      int
 	MaxRetries        int
 	RetryBackoff      time.Duration

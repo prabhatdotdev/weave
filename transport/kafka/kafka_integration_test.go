@@ -317,7 +317,7 @@ func TestReplyConsumerInitializationRetryWithLiveKafka(t *testing.T) {
 	broker.kafkaConfig.ConsumerGroup = ""
 	broker.closeMu.Unlock()
 
-	if err := broker.ensureReplyConsumer(); err == nil {
+	if err := broker.ensureReplyConsumer(context.Background()); err == nil {
 		t.Fatal("first ensureReplyConsumer() error = nil, want failure")
 	}
 	if got := broker.currentReplyTopic(); got != "" {
@@ -328,7 +328,7 @@ func TestReplyConsumerInitializationRetryWithLiveKafka(t *testing.T) {
 	broker.consumer = consumer
 	broker.kafkaConfig.ConsumerGroup = consumerGroup
 	broker.closeMu.Unlock()
-	if err := broker.ensureReplyConsumer(); err != nil {
+	if err := broker.ensureReplyConsumer(context.Background()); err != nil {
 		t.Fatalf("retry ensureReplyConsumer() error = %v", err)
 	}
 
@@ -438,10 +438,149 @@ func TestCallPreservesRequestWithLiveKafka(t *testing.T) {
 	}
 }
 
+func TestExplicitPartitionSelectionWithLiveKafka(t *testing.T) {
+	broker, topics, ctx := newLiveKafkaBrokerWithPartitions(t, "fix-012", 1, 3)
+	topic := topics[0]
+
+	type delivery struct {
+		body      string
+		partition int32
+	}
+	received := make(chan delivery, 3)
+	if err := broker.Subscribe(ctx, topic, func(_ context.Context, msg *core.Message) error {
+		received <- delivery{body: msg.BodyString(), partition: msg.Partition}
+		return nil
+	}); err != nil {
+		t.Fatalf("Subscribe(%s) error = %v", topic, err)
+	}
+
+	if err := broker.Publish(ctx, topic, core.NewTextMessage("explicit"), core.WithPartition(2)); err != nil {
+		t.Fatalf("Publish(explicit partition) error = %v", err)
+	}
+	for _, body := range []string{"keyed-1", "keyed-2"} {
+		if err := broker.Publish(ctx, topic, core.NewTextMessage(body), core.WithKey("same-key")); err != nil {
+			t.Fatalf("Publish(%s) error = %v", body, err)
+		}
+	}
+
+	err := broker.Publish(ctx, topic, core.NewTextMessage("invalid"), core.WithPartition(3))
+	var publishErr *core.ErrPublishFailed
+	if !errors.As(err, &publishErr) || !errors.Is(err, sarama.ErrInvalidPartition) {
+		t.Fatalf("Publish(invalid partition) error = %v, want ErrPublishFailed wrapping sarama.ErrInvalidPartition", err)
+	}
+	if !broker.IsConnected() {
+		t.Fatal("broker disconnected after rejecting an invalid partition")
+	}
+
+	partitions := make(map[string]int32, 3)
+	for range 3 {
+		select {
+		case delivery := <-received:
+			partitions[delivery.body] = delivery.partition
+		case <-ctx.Done():
+			t.Fatal("consumer did not receive all partitioned messages")
+		}
+	}
+	if got := partitions["explicit"]; got != 2 {
+		t.Fatalf("explicit message partition = %d, want 2", got)
+	}
+	if partitions["keyed-1"] != partitions["keyed-2"] {
+		t.Fatalf("same-key partitions = %d and %d, want equal", partitions["keyed-1"], partitions["keyed-2"])
+	}
+}
+
+func TestSCRAMAuthenticationWithLiveKafka(t *testing.T) {
+	if os.Getenv("WEAVE_KAFKA_SCRAM_E2E") == "" {
+		t.Skip("set WEAVE_KAFKA_SCRAM_E2E=1 and start testdata/scram/compose.yaml to test authenticated Kafka")
+	}
+	for _, mechanism := range []string{"SCRAM-SHA-256", "SCRAM-SHA-512"} {
+		t.Run(mechanism, func(t *testing.T) {
+			config := core.DefaultConfig()
+			config.Kafka = core.DefaultKafkaConfig()
+			config.Kafka.Brokers = []string{"localhost:19094"}
+			config.Kafka.ConsumerGroup = fmt.Sprintf("weave-scram-%d", time.Now().UnixNano())
+			config.Kafka.SASL = &core.SASLConfig{Enable: true, Mechanism: mechanism, Username: "weave", Password: "weave-test-password"}
+			brokerAny, err := NewBroker(config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			broker := brokerAny.(*Broker)
+			admin, err := sarama.NewClusterAdmin(config.Kafka.Brokers, broker.buildSaramaConfig())
+			if err != nil {
+				t.Fatalf("authenticate admin: %v", err)
+			}
+			topic := config.Kafka.ConsumerGroup
+			t.Cleanup(func() { _ = admin.DeleteTopic(topic); _ = admin.Close() })
+			if err := admin.CreateTopic(topic, &sarama.TopicDetail{NumPartitions: 1, ReplicationFactor: 1}, false); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = broker.Close() })
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			if err := broker.Connect(ctx); err != nil {
+				t.Fatalf("authenticate broker: %v", err)
+			}
+			if err := broker.Publish(ctx, topic, core.NewTextMessage("authenticated")); err != nil {
+				t.Fatal(err)
+			}
+			received := make(chan string, 1)
+			if err := broker.Subscribe(ctx, topic, func(handlerCtx context.Context, msg *core.Message) error {
+				select {
+				case received <- msg.BodyString():
+				case <-handlerCtx.Done():
+				}
+				return nil
+			}, core.WithStartFromBeginning()); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case body := <-received:
+				if body != "authenticated" {
+					t.Fatalf("received %q", body)
+				}
+			case <-ctx.Done():
+				t.Fatal("authenticated consumer did not receive the message")
+			}
+		})
+	}
+}
+
+func TestConsumerGroupAndStartingOffsetOptionsWithLiveKafka(t *testing.T) {
+	broker, topics, ctx := newLiveKafkaBrokerWithConfig(t, "subscription-options", 1, 1, func(config *core.Config) {
+		config.Kafka.ConsumerGroup = ""
+		config.Kafka.AutoOffsetReset = "latest"
+	})
+	topic := topics[0]
+	if err := broker.Publish(ctx, topic, core.NewTextMessage("existing-record")); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"alpha", "beta"} {
+		received := make(chan string, 1)
+		group := topic + "." + name
+		if err := broker.Subscribe(ctx, topic, func(handlerCtx context.Context, msg *core.Message) error {
+			select {
+			case received <- msg.BodyString():
+			case <-handlerCtx.Done():
+			}
+			return nil
+		}, core.WithConsumerGroup(group), core.WithStartFromBeginning()); err != nil {
+			t.Fatalf("Subscribe(group %s): %v", name, err)
+		}
+		select {
+		case body := <-received:
+			if body != "existing-record" {
+				t.Fatalf("group %s received %q", name, body)
+			}
+		case <-ctx.Done():
+			t.Fatalf("group %s did not consume existing records", name)
+		}
+	}
+}
+
 func newLiveKafkaRPCPair(t *testing.T, name string) (*Broker, *Broker, string, context.Context) {
 	t.Helper()
 	broker, topics, ctx := newLiveKafkaBroker(t, name, 1)
-	if err := broker.ensureReplyConsumer(); err != nil {
+	if err := broker.ensureReplyConsumer(context.Background()); err != nil {
 		t.Fatalf("initialize reply consumer: %v", err)
 	}
 	responderConfig := core.DefaultConfig()
@@ -463,6 +602,14 @@ func newLiveKafkaRPCPair(t *testing.T, name string) (*Broker, *Broker, string, c
 }
 
 func newLiveKafkaBroker(t *testing.T, name string, topicCount int) (*Broker, []string, context.Context) {
+	return newLiveKafkaBrokerWithPartitions(t, name, topicCount, 1)
+}
+
+func newLiveKafkaBrokerWithPartitions(t *testing.T, name string, topicCount int, partitions int32) (*Broker, []string, context.Context) {
+	return newLiveKafkaBrokerWithConfig(t, name, topicCount, partitions, nil)
+}
+
+func newLiveKafkaBrokerWithConfig(t *testing.T, name string, topicCount int, partitions int32, configure func(*core.Config)) (*Broker, []string, context.Context) {
 	t.Helper()
 	if os.Getenv("WEAVE_KAFKA_E2E") == "" {
 		t.Skip("set WEAVE_KAFKA_E2E=1 to run the live Kafka test")
@@ -492,7 +639,7 @@ func newLiveKafkaBroker(t *testing.T, name string, topicCount int) (*Broker, []s
 		_ = admin.Close()
 	})
 	for _, topic := range managedTopics {
-		if err := admin.CreateTopic(topic, &sarama.TopicDetail{NumPartitions: 1, ReplicationFactor: 1}, false); err != nil {
+		if err := admin.CreateTopic(topic, &sarama.TopicDetail{NumPartitions: partitions, ReplicationFactor: 1}, false); err != nil {
 			t.Fatalf("create topic %s: %v", topic, err)
 		}
 	}
@@ -504,6 +651,9 @@ func newLiveKafkaBroker(t *testing.T, name string, topicCount int) (*Broker, []s
 	config.Kafka.ConsumerGroup = fmt.Sprintf("weave-%s-%d", name, suffix)
 	config.Kafka.ReplyTopic = replyTopic
 	config.Kafka.AutoOffsetReset = "earliest"
+	if configure != nil {
+		configure(config)
+	}
 
 	brokerAny, err := NewBroker(config)
 	if err != nil {

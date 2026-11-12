@@ -79,12 +79,13 @@ func WithQueueBind(exchange, routingKey string) SubscribeOption {
 	}
 }
 
-// WithConsumerGroup sets the consumer group (Kafka/Redis/NATS).
+// WithConsumerGroup selects the Kafka consumer group for this subscription.
 func WithConsumerGroup(group string) SubscribeOption {
 	return func(o *SubscribeOptions) { o.ConsumerGroup = group }
 }
 
-// WithStartFromBeginning starts consuming from the earliest offset.
+// WithStartFromBeginning selects the earliest Kafka offset when the consumer
+// group has no committed offset. It does not reset existing group offsets.
 func WithStartFromBeginning() SubscribeOption {
 	return func(o *SubscribeOptions) { o.StartFromBeginning = true }
 }
@@ -101,11 +102,13 @@ func WithHandlerErrorNoRetry() SubscribeOption {
 
 // PublishOptions holds configuration for publish operations.
 type PublishOptions struct {
-	Timeout      time.Duration
-	Mandatory    bool
-	Immediate    bool
-	Exchange     string
-	Partition    int
+	Timeout   time.Duration
+	Mandatory bool
+	Immediate bool
+	Exchange  string
+	Partition int
+	// PartitionSet distinguishes WithPartition from automatic partition selection.
+	PartitionSet bool
 	Key          string
 	DeliveryMode uint8
 	Priority     uint8
@@ -115,12 +118,13 @@ type PublishOptions struct {
 // PublishOption is a functional option for configuring publish operations.
 type PublishOption func(*PublishOptions)
 
-// WithTimeout sets the publish timeout.
+// WithTimeout bounds a Publish or Call, including setup, queueing, and
+// acknowledgment waits. Zero uses only the caller's context deadline.
 func WithTimeout(timeout time.Duration) PublishOption {
 	return func(o *PublishOptions) { o.Timeout = timeout }
 }
 
-// WithMandatory requires message routing to a queue.
+// WithMandatory makes AMQP Publish return ErrUnroutable if no queue matches.
 func WithMandatory() PublishOption {
 	return func(o *PublishOptions) { o.Mandatory = true }
 }
@@ -130,9 +134,9 @@ func WithExchange(exchange string) PublishOption {
 	return func(o *PublishOptions) { o.Exchange = exchange }
 }
 
-// WithPartition specifies the target partition (Kafka).
+// WithPartition specifies a non-negative target partition (Kafka).
 func WithPartition(partition int) PublishOption {
-	return func(o *PublishOptions) { o.Partition = partition }
+	return func(o *PublishOptions) { o.Partition, o.PartitionSet = partition, true }
 }
 
 // WithKey sets the message key for partitioning (Kafka).
@@ -140,7 +144,8 @@ func WithKey(key string) PublishOption {
 	return func(o *PublishOptions) { o.Key = key }
 }
 
-// WithPersistent makes the message persistent (AMQP delivery mode 2).
+// WithPersistent selects AMQP delivery mode 2. Durable delivery also requires a
+// durable queue and a successful publisher confirmation.
 func WithPersistent() PublishOption {
 	return func(o *PublishOptions) { o.DeliveryMode = 2 }
 }
@@ -159,7 +164,9 @@ func WithExpiration(ttl string) PublishOption {
 func ApplySubscribeOptions(opts ...SubscribeOption) *SubscribeOptions {
 	options := &SubscribeOptions{HandlerErrorPolicy: HandlerErrorNoRetry}
 	for _, opt := range opts {
-		opt(options)
+		if opt != nil {
+			opt(options)
+		}
 	}
 	return options
 }
@@ -171,7 +178,9 @@ func ApplyPublishOptions(opts ...PublishOption) *PublishOptions {
 		DeliveryMode: 1,
 	}
 	for _, opt := range opts {
-		opt(options)
+		if opt != nil {
+			opt(options)
+		}
 	}
 	return options
 }

@@ -1,0 +1,27 @@
+name: weave-tls-regressions
+
+services:
+  rabbitmq:
+    build:
+      context: ../..
+      dockerfile: testdata/tls/rabbitmq.Dockerfile
+    ports:
+      - "127.0.0.1:5671:5671"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  kafka:
+    build:
+      context: ../..
+      dockerfile: testdata/tls/kafka.Dockerfile
+    ports:
+      - "127.0.0.1:19095:9095"
+      - "127.0.0.1:19096:9096"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 2s
+      timeout: 5s
+      retries: 30

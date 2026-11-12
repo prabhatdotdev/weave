@@ -18,13 +18,18 @@ package amqp
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"sync"
 	"time"
 
 	amqplib "github.com/rabbitmq/amqp091-go"
 
 	"github.com/prabhatdotdev/weave/core"
+	"github.com/prabhatdotdev/weave/internal/connection"
+	"github.com/prabhatdotdev/weave/internal/validation"
 )
 
 const backendName = "amqp"
@@ -53,7 +58,12 @@ func (a *amqpConnectionAdapter) Channel() (amqpChannel, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &amqpChannelAdapter{channel: channel}, nil
+	publisher, err := newConfirmedPublisher(channel)
+	if err != nil {
+		_ = channel.Close()
+		return nil, err
+	}
+	return &amqpChannelAdapter{channel: channel, publisher: publisher}, nil
 }
 
 func (a *amqpConnectionAdapter) NotifyClose(ch chan *amqplib.Error) chan *amqplib.Error {
@@ -61,15 +71,16 @@ func (a *amqpConnectionAdapter) NotifyClose(ch chan *amqplib.Error) chan *amqpli
 }
 
 func (a *amqpConnectionAdapter) Close() error {
-	return a.conn.Close()
+	return a.conn.CloseDeadline(time.Now().Add(5 * time.Second))
 }
 
 type amqpChannelAdapter struct {
-	channel *amqplib.Channel
+	channel   *amqplib.Channel
+	publisher *confirmedPublisher
 }
 
 func (a *amqpChannelAdapter) PublishWithContext(ctx context.Context, exchange, key string, mandatory, immediate bool, msg amqplib.Publishing) error {
-	return a.channel.PublishWithContext(ctx, exchange, key, mandatory, immediate, msg)
+	return a.publisher.publish(ctx, exchange, key, mandatory, immediate, msg)
 }
 
 func (a *amqpChannelAdapter) QueueDeclare(name string, durable, autoDelete, exclusive, noWait bool, args amqplib.Table) (amqplib.Queue, error) {
@@ -122,6 +133,7 @@ type Broker struct {
 
 	replyQueue        string
 	replyConsumerStop chan struct{}
+	replyGate         chan struct{}
 	pending           map[string]*pendingCall
 	pendingMu         sync.RWMutex
 	subs              []subscriptionRegistration
@@ -130,6 +142,7 @@ type Broker struct {
 	connected  bool
 	recovering bool
 	closed     bool
+	connecting chan struct{}
 	closeMu    sync.RWMutex
 	closeOnce  sync.Once
 	closeChan  chan struct{}
@@ -150,11 +163,16 @@ func (b *Broker) emitEvent(ctx context.Context, event core.Event) {
 
 // NewBroker creates a new AMQP broker instance.
 func NewBroker(config *core.Config) (core.MessageBroker, error) {
-	if config == nil {
-		config = core.DefaultConfig()
+	var err error
+	config, err = validation.Config(config)
+	if err != nil {
+		return nil, err
 	}
 	if config.AMQP == nil {
 		config.AMQP = core.DefaultAMQPConfig()
+	}
+	if err := validation.AMQP(config.AMQP); err != nil {
+		return nil, err
 	}
 
 	return &Broker{
@@ -179,106 +197,159 @@ func (b *Broker) Backend() string {
 
 // Connect establishes a connection to the AMQP broker.
 func (b *Broker) Connect(ctx context.Context) error {
-	b.closeMu.Lock()
-	defer b.closeMu.Unlock()
-
-	if b.closed {
-		return core.ErrClosed
-	}
-	if b.connected {
-		return nil
-	}
-
-	if err := b.connect(); err != nil {
+	if err := validation.Context(ctx); err != nil {
 		return err
 	}
-	return nil
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		b.closeMu.Lock()
+		if b.closed {
+			b.closeMu.Unlock()
+			return core.ErrClosed
+		}
+		if b.connected {
+			b.closeMu.Unlock()
+			return nil
+		}
+		if done := b.connecting; done != nil {
+			b.closeMu.Unlock()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-b.closeChan:
+				return core.ErrClosed
+			case <-done:
+				continue
+			}
+		}
+		b.connecting = make(chan struct{})
+		b.closeMu.Unlock()
+		break
+	}
+
+	client, err := b.open(ctx)
+	b.closeMu.Lock()
+	if b.closed {
+		err = core.ErrClosed
+	}
+	if err == nil {
+		b.conn, b.channel = client.conn, client.channel
+		b.connected = true
+		b.replyQueue = ""
+	}
+	close(b.connecting)
+	b.connecting = nil
+	b.closeMu.Unlock()
+	if err != nil && client != nil {
+		_ = client.Close()
+	}
+	if err == nil {
+		go b.monitorConnection(client.conn)
+	}
+	event := core.Event{
+		Level:     core.EventLevelInfo,
+		Name:      core.EventConnect,
+		Operation: "connect",
+		Err:       err,
+		Fields:    map[string]any{"outcome": "success"},
+	}
+	if err != nil {
+		event.Level = core.EventLevelError
+		event.Fields["outcome"] = "failure"
+		event.Fields["address"] = fmt.Sprintf("%s:%d", b.amqpConfig.Host, b.amqpConfig.Port)
+	}
+	b.emitEvent(ctx, event)
+	return err
 }
 
-func (b *Broker) connect() error {
-	var conn amqpConnection
-	var err error
+type openedConnection struct {
+	conn    amqpConnection
+	channel amqpChannel
+}
 
+func (c *openedConnection) Close() error { return c.conn.Close() }
+
+func (b *Broker) open(ctx context.Context) (*openedConnection, error) {
 	connString := b.connectionString()
 	retries := b.config.ConnectionRetry
 	if retries <= 0 {
 		retries = 3
 	}
 
+	var err error
 	for i := 0; i <= retries; i++ {
-		conn, err = b.dial(connString, amqplib.Config{
-			Heartbeat: b.amqpConfig.Heartbeat,
-			Properties: amqplib.Table{
-				"connection_name": b.config.ConnectionName,
-			},
+		var client *openedConnection
+		client, err = connection.Open(ctx, b.closeChan, net.Dialer{Timeout: 30 * time.Second}, func(dialer *connection.Dialer) (*openedConnection, error) {
+			tlsConfig := b.amqpConfig.TLS
+			if tlsConfig != nil {
+				tlsConfig = tlsConfig.Clone()
+			}
+			conn, err := b.dial(connString, amqplib.Config{
+				Heartbeat:       b.amqpConfig.Heartbeat,
+				TLSClientConfig: tlsConfig,
+				Properties:      amqplib.Table{"connection_name": b.config.ConnectionName},
+				Dial: func(network, address string) (net.Conn, error) {
+					conn, err := dialer.Dial(network, address)
+					if err != nil {
+						return nil, err
+					}
+					if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+						_ = conn.Close()
+						return nil, err
+					}
+					return conn, nil
+				},
+			})
+			if err != nil {
+				return nil, err
+			}
+			channel, err := conn.Channel()
+			if err != nil {
+				_ = conn.Close()
+				return nil, fmt.Errorf("failed to open channel: %w", err)
+			}
+			return &openedConnection{conn: conn, channel: channel}, nil
 		})
 		if err == nil {
-			break
+			return client, nil
 		}
 		if i < retries {
 			delay := b.config.RetryDelay
 			if delay == 0 {
 				delay = 2 * time.Second
 			}
-			time.Sleep(delay)
+			if waitErr := connection.Wait(ctx, b.closeChan, delay); waitErr != nil {
+				return nil, waitErr
+			}
 		}
 	}
 
-	if err != nil || conn == nil {
-		b.emitEvent(context.Background(), core.Event{
-			Level:     core.EventLevelError,
-			Name:      core.EventConnect,
-			Operation: "connect",
-			Err:       err,
-			Fields: map[string]any{
-				"address": fmt.Sprintf("%s:%d", b.amqpConfig.Host, b.amqpConfig.Port),
-				"outcome": "failure",
-			},
-		})
-		return &core.ErrConnectionFailed{
-			Backend: backendName,
-			Address: fmt.Sprintf("%s:%d", b.amqpConfig.Host, b.amqpConfig.Port),
-			Cause:   err,
-		}
+	return nil, &core.ErrConnectionFailed{
+		Backend: backendName,
+		Address: fmt.Sprintf("%s:%d", b.amqpConfig.Host, b.amqpConfig.Port),
+		Cause:   err,
 	}
-
-	channel, err := conn.Channel()
-	if err != nil {
-		b.emitEvent(context.Background(), core.Event{
-			Level:     core.EventLevelError,
-			Name:      core.EventConnect,
-			Operation: "connect",
-			Err:       err,
-			Fields:    map[string]any{"outcome": "failure", "stage": "open_channel"},
-		})
-		conn.Close()
-		return fmt.Errorf("failed to open channel: %w", err)
-	}
-
-	b.conn = conn
-	b.channel = channel
-	b.connected = true
-	b.replyQueue = ""
-	b.emitEvent(context.Background(), core.Event{
-		Level:     core.EventLevelInfo,
-		Name:      core.EventConnect,
-		Operation: "connect",
-		Fields:    map[string]any{"outcome": "success"},
-	})
-
-	go b.monitorConnection(conn)
-
-	return nil
 }
 
 func (b *Broker) connectionString() string {
-	return fmt.Sprintf("amqp://%s:%s@%s:%d/%s",
-		b.amqpConfig.Username,
-		b.amqpConfig.Password,
-		b.amqpConfig.Host,
-		b.amqpConfig.Port,
-		b.amqpConfig.VHost,
-	)
+	scheme := "amqp"
+	if b.amqpConfig.TLS != nil {
+		scheme = "amqps"
+	}
+	vhost := b.amqpConfig.VHost
+	if vhost == "" {
+		vhost = "/"
+	}
+	address := url.URL{
+		Scheme:  scheme,
+		User:    url.UserPassword(b.amqpConfig.Username, b.amqpConfig.Password),
+		Host:    net.JoinHostPort(b.amqpConfig.Host, fmt.Sprint(b.amqpConfig.Port)),
+		Path:    "/" + vhost,
+		RawPath: "/" + url.PathEscape(vhost),
+	}
+	return address.String()
 }
 
 func (b *Broker) monitorConnection(conn amqpConnection) {
@@ -349,12 +420,6 @@ func (b *Broker) reconnectLoop() {
 		b.closeMu.RUnlock()
 
 		attempt++
-		b.closeMu.Lock()
-		if b.closed || b.connected {
-			b.closeMu.Unlock()
-			return
-		}
-
 		// Emit reconnect attempt event
 		b.emitEvent(context.Background(), core.Event{
 			Level:     core.EventLevelDebug,
@@ -365,8 +430,7 @@ func (b *Broker) reconnectLoop() {
 			},
 		})
 
-		err := b.connect()
-		b.closeMu.Unlock()
+		err := b.Connect(context.Background())
 		if err == nil {
 			if restoreErr := b.restoreSubscriptions(); restoreErr != nil {
 				b.emitEvent(context.Background(), core.Event{
@@ -487,46 +551,64 @@ func (b *Broker) IsRecovering() bool {
 // Close gracefully shuts down the broker connection.
 func (b *Broker) Close() error {
 	var err error
+	closed := false
 	b.closeOnce.Do(func() {
 		b.closeMu.Lock()
 		b.stopReplyConsumerLocked()
 		b.closed = true
 		b.connected = false
 		b.recovering = false
+		channel, conn := b.channel, b.conn
+		b.channel, b.conn = nil, nil
 		b.closeMu.Unlock()
 
 		close(b.closeChan)
 		b.cancelAllPending()
 
-		if b.channel != nil {
-			if e := b.channel.Close(); e != nil {
+		if conn != nil {
+			if e := conn.Close(); e != nil && err == nil {
 				err = e
 			}
 		}
-		if b.conn != nil {
-			if e := b.conn.Close(); e != nil && err == nil {
+		if channel != nil {
+			if e := channel.Close(); e != nil && !errors.Is(e, amqplib.ErrClosed) && err == nil {
 				err = e
 			}
 		}
 
+		closed = true
+	})
+	if closed {
 		b.emitEvent(context.Background(), core.Event{
 			Level:     core.EventLevelInfo,
 			Name:      core.EventDisconnect,
 			Operation: "close",
 			Fields:    map[string]any{"outcome": "success", "reason": "close"},
 		})
-	})
+	}
 	return err
 }
 
 // Publish sends a message to the specified queue.
 func (b *Broker) Publish(ctx context.Context, destination string, msg *core.Message, opts ...core.PublishOption) error {
+	options, err := validation.Publish(ctx, destination, msg, opts...)
+	if err != nil {
+		return validation.ContextError(err, "Publish", "context deadline")
+	}
+	if err := validatePublishing(destination, msg, options); err != nil {
+		return err
+	}
+	if options.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, options.Timeout)
+		defer cancel()
+	}
 	channel, err := b.currentChannel(false)
 	if err != nil {
 		return err
 	}
 
-	options := core.ApplyPublishOptions(opts...)
+	msg = msg.Clone()
 
 	publishing := amqplib.Publishing{
 		ContentType:   msg.ContentType,
@@ -563,6 +645,7 @@ func (b *Broker) Publish(ctx context.Context, destination string, msg *core.Mess
 
 	err = channel.PublishWithContext(ctx, exchange, routingKey, options.Mandatory, options.Immediate, publishing)
 	if err != nil {
+		err = validation.ContextError(err, "Publish", options.Timeout.String())
 		b.emitEvent(ctx, core.Event{
 			Level:       core.EventLevelError,
 			Name:        core.EventPublishFailed,
@@ -576,6 +659,21 @@ func (b *Broker) Publish(ctx context.Context, destination string, msg *core.Mess
 	return nil
 }
 
+func validatePublishing(destination string, msg *core.Message, options *core.PublishOptions) error {
+	if options.Immediate {
+		return &core.ErrUnsupportedOperation{Backend: backendName, Operation: "immediate publishing"}
+	}
+	if err := validation.ShortStrings(destination, options.Exchange, msg.Subject, msg.ContentType, msg.CorrelationID, msg.ReplyTo, msg.MessageID); err != nil {
+		return err
+	}
+	for key := range msg.Headers {
+		if err := validation.ShortStrings(key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Subscribe registers a handler for messages from the specified queue.
 func (b *Broker) Subscribe(ctx context.Context, destination string, handler core.Handler, opts ...core.SubscribeOption) error {
 	if err := b.subscribe(ctx, destination, handler, true, false, opts...); err != nil {
@@ -586,9 +684,15 @@ func (b *Broker) Subscribe(ctx context.Context, destination string, handler core
 }
 
 func (b *Broker) subscribe(ctx context.Context, destination string, handler core.Handler, track bool, allowRecovering bool, opts ...core.SubscribeOption) error {
-	options := core.ApplySubscribeOptions(opts...)
-	if options.WorkerCount < 0 {
-		return fmt.Errorf("%w: worker count must not be negative", core.ErrInvalidConfig)
+	options, err := validation.Subscribe(ctx, destination, handler, opts...)
+	if err != nil {
+		return err
+	}
+	if err := validation.ShortStrings(destination, options.Exchange, options.RoutingKey, options.ConsumerTag); err != nil {
+		return err
+	}
+	if options.AutoAck && options.HandlerErrorPolicy == core.HandlerErrorRetry {
+		return fmt.Errorf("%w: automatic acknowledgement cannot be combined with handler retries", core.ErrInvalidConfig)
 	}
 
 	channel, err := b.currentChannel(allowRecovering)
@@ -749,15 +853,25 @@ func (b *Broker) handleMessage(ctx context.Context, msg amqplib.Delivery, handle
 
 // Call implements the request-response pattern.
 func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message, opts ...core.PublishOption) (*core.Message, error) {
+	options, err := validation.Publish(ctx, destination, msg, opts...)
+	if err != nil {
+		return nil, validation.ContextError(err, "Call", "context deadline")
+	}
+	if err := validatePublishing(destination, msg, options); err != nil {
+		return nil, err
+	}
+	if options.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, options.Timeout)
+		defer cancel()
+	}
 	channel, err := b.currentChannel(false)
 	if err != nil {
 		return nil, err
 	}
 
-	options := core.ApplyPublishOptions(opts...)
-
-	if err := b.ensureReplyQueue(channel); err != nil {
-		return nil, err
+	if err := b.ensureReplyQueue(ctx, channel); err != nil {
+		return nil, validation.ContextError(err, "Call", options.Timeout.String())
 	}
 
 	corrID := msg.CorrelationID
@@ -780,39 +894,10 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 		b.pendingMu.Unlock()
 	}()
 
-	if options.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, options.Timeout)
-		defer cancel()
-	}
-
-	exchange := options.Exchange
-	if exchange == "" {
-		exchange = b.amqpConfig.Exchange
-	}
-
-	publishing := amqplib.Publishing{
-		ContentType:   msg.ContentType,
-		CorrelationId: corrID,
-		ReplyTo:       b.currentReplyQueue(),
-		Body:          msg.Body,
-	}
-	if len(msg.Headers) > 0 {
-		publishing.Headers = make(amqplib.Table, len(msg.Headers))
-		for key, value := range msg.Headers {
-			publishing.Headers[key] = value
-		}
-	}
-	err = channel.PublishWithContext(ctx, exchange, destination, false, false, publishing)
-	if err != nil {
-		b.emitEvent(ctx, core.Event{
-			Level:       core.EventLevelError,
-			Name:        core.EventPublishFailed,
-			Operation:   "call_publish",
-			Destination: destination,
-			Err:         err,
-		})
-		return nil, &core.ErrPublishFailed{Backend: backendName, Destination: destination, Cause: err}
+	request := msg.Clone()
+	request.CorrelationID, request.ReplyTo = corrID, b.currentReplyQueue()
+	if err := b.Publish(ctx, destination, request, opts...); err != nil {
+		return nil, err
 	}
 
 	select {
@@ -826,7 +911,7 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 				"timeout": options.Timeout.String(),
 			},
 		})
-		return nil, &core.ErrTimeout{Operation: "Call", Duration: options.Timeout.String()}
+		return nil, validation.ContextError(ctx.Err(), "Call", options.Timeout.String())
 	case response := <-pending.response:
 		if response == nil {
 			return nil, &core.ErrConnectionLost{Backend: backendName}
@@ -840,7 +925,36 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 	}
 }
 
-func (b *Broker) ensureReplyQueue(channel amqpChannel) error {
+func (b *Broker) ensureReplyQueue(ctx context.Context, channel amqpChannel) error {
+	b.closeMu.Lock()
+	if b.replyGate == nil {
+		b.replyGate = make(chan struct{}, 1)
+	}
+	gate := b.replyGate
+	b.closeMu.Unlock()
+	select {
+	case gate <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-b.closeChan:
+		return core.ErrClosed
+	}
+	result := make(chan error, 1)
+	go func() {
+		defer func() { <-gate }()
+		result <- b.initReplyQueue(channel)
+	}()
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-b.closeChan:
+		return core.ErrClosed
+	}
+}
+
+func (b *Broker) initReplyQueue(channel amqpChannel) error {
 	b.closeMu.RLock()
 	if b.replyQueue != "" {
 		b.closeMu.RUnlock()
@@ -860,6 +974,10 @@ func (b *Broker) ensureReplyQueue(channel amqpChannel) error {
 
 	stop := make(chan struct{})
 	b.closeMu.Lock()
+	if b.closed || b.channel != channel {
+		b.closeMu.Unlock()
+		return &core.ErrConnectionLost{Backend: backendName}
+	}
 	if b.replyQueue != "" {
 		b.closeMu.Unlock()
 		close(stop)

@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	"github.com/prabhatdotdev/weave/core"
+	"github.com/prabhatdotdev/weave/internal/validation"
 )
 
 // MockBroker is a mock implementation of core.MessageBroker for testing.
@@ -54,6 +55,9 @@ func NewMockBroker() *MockBroker {
 func (m *MockBroker) Backend() string { return "mock" }
 
 func (m *MockBroker) Connect(ctx context.Context) error {
+	if err := validation.Context(ctx); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
@@ -84,6 +88,9 @@ func (m *MockBroker) IsRecovering() bool {
 }
 
 func (m *MockBroker) Publish(ctx context.Context, destination string, msg *core.Message, opts ...core.PublishOption) error {
+	if _, err := validation.Publish(ctx, destination, msg, opts...); err != nil {
+		return validation.ContextError(err, "Publish", "context deadline")
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -99,6 +106,9 @@ func (m *MockBroker) Publish(ctx context.Context, destination string, msg *core.
 }
 
 func (m *MockBroker) Subscribe(ctx context.Context, destination string, handler core.Handler, opts ...core.SubscribeOption) error {
+	if _, err := validation.Subscribe(ctx, destination, handler, opts...); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -111,6 +121,9 @@ func (m *MockBroker) Subscribe(ctx context.Context, destination string, handler 
 }
 
 func (m *MockBroker) Call(ctx context.Context, destination string, msg *core.Message, opts ...core.PublishOption) (*core.Message, error) {
+	if _, err := validation.Publish(ctx, destination, msg, opts...); err != nil {
+		return nil, validation.ContextError(err, "Call", "context deadline")
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -212,6 +225,9 @@ func (m *MockBroker) AssertNotPublished(t testing.TB, destination string) {
 
 // SimulateMessage simulates receiving a message on a subscribed destination.
 func (m *MockBroker) SimulateMessage(ctx context.Context, destination string, msg *core.Message) error {
+	if _, err := validation.Publish(ctx, destination, msg); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	handler, ok := m.subscriptions[destination]
 	m.mu.Unlock()

@@ -41,6 +41,7 @@ Subscribe options:
 - `WithConsumerGroup`
 - `WithStartFromBeginning`
 - `WithHandlerErrorRetry`
+- `WithHandlerErrorNoRetry`
 
 `core.RetryHandler` adds bounded, context-aware retries around a handler.
 
@@ -69,3 +70,9 @@ and `ErrConnectionLost`. The `IsNotConnected`, `IsTimeout`, and
 `IsConnectionLost` helpers use `errors.As`. `ErrDuplicateCorrelationID` is a
 sentinel matched with `errors.Is` when another RPC call already has the same
 caller-supplied correlation ID in flight.
+
+`ErrInvalidConfig` identifies invalid public inputs. Publish failures wrap their
+cause: AMQP mandatory returns match `ErrUnroutable`, and negative confirmations
+match `ErrPublishRejected`. Deadline errors match both `IsTimeout` and
+`context.DeadlineExceeded`; explicit cancellation matches `context.Canceled`.
+See [transport guarantees and deadlines](TRANSPORTS.md#deadlines-and-delivery-outcomes).
