@@ -34,9 +34,14 @@ type MockBroker struct {
 	connected     bool
 	closed        bool
 	published     []PublishedMessage
-	subscriptions map[string]core.Handler
+	subscriptions map[string]mockSubscription
 	callResponses map[string]*core.Message
 	callErrors    map[string]error
+}
+
+type mockSubscription struct {
+	ctx     context.Context
+	handler core.Handler
 }
 
 // PublishedMessage records a message that was published.
@@ -48,7 +53,7 @@ type PublishedMessage struct {
 // NewMockBroker creates a new mock broker.
 func NewMockBroker() *MockBroker {
 	return &MockBroker{
-		subscriptions: make(map[string]core.Handler),
+		subscriptions: make(map[string]mockSubscription),
 		callResponses: make(map[string]*core.Message),
 		callErrors:    make(map[string]error),
 	}
@@ -113,7 +118,7 @@ func (m *MockBroker) Publish(ctx context.Context, destination string, msg *core.
 
 	m.published = append(m.published, PublishedMessage{
 		Destination: destination,
-		Message:     msg,
+		Message:     msg.Clone(),
 	})
 	return nil
 }
@@ -134,7 +139,7 @@ func (m *MockBroker) Subscribe(ctx context.Context, destination string, handler 
 		return &core.ErrNotConnected{Backend: "mock"}
 	}
 
-	m.subscriptions[destination] = handler
+	m.subscriptions[destination] = mockSubscription{ctx: ctx, handler: handler}
 	return nil
 }
 
@@ -165,11 +170,15 @@ func (m *MockBroker) Call(ctx context.Context, destination string, msg *core.Mes
 	return nil, &core.ErrTimeout{Operation: "Call", Duration: "mock"}
 }
 
-// SetCallResponse sets a mock response for Call on a destination.
+// SetCallResponse snapshots a mock response. A nil response clears it.
 func (m *MockBroker) SetCallResponse(destination string, response *core.Message) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.callResponses[destination] = response
+	if response == nil {
+		delete(m.callResponses, destination)
+		return
+	}
+	m.callResponses[destination] = response.Clone()
 }
 
 // SetCallError sets an error response for Call on a destination.
@@ -184,7 +193,9 @@ func (m *MockBroker) PublishedMessages() []PublishedMessage {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	result := make([]PublishedMessage, len(m.published))
-	copy(result, m.published)
+	for i, published := range m.published {
+		result[i] = PublishedMessage{Destination: published.Destination, Message: published.Message.Clone()}
+	}
 	return result
 }
 
@@ -195,7 +206,7 @@ func (m *MockBroker) PublishedTo(destination string) []PublishedMessage {
 	var result []PublishedMessage
 	for _, pub := range m.published {
 		if pub.Destination == destination {
-			result = append(result, pub)
+			result = append(result, PublishedMessage{Destination: pub.Destination, Message: pub.Message.Clone()})
 		}
 	}
 	return result
@@ -251,20 +262,34 @@ func (m *MockBroker) SimulateMessage(ctx context.Context, destination string, ms
 	if _, err := validation.Publish(ctx, destination, msg); err != nil {
 		return err
 	}
-	ctx, finish, err := m.work.Handler(ctx)
-	if err != nil {
-		return err
-	}
-	defer finish()
 	m.mu.Lock()
-	handler, ok := m.subscriptions[destination]
+	if m.closed {
+		m.mu.Unlock()
+		return core.ErrClosed
+	}
+	if !m.connected {
+		m.mu.Unlock()
+		return &core.ErrNotConnected{Backend: "mock"}
+	}
+	subscription, ok := m.subscriptions[destination]
 	m.mu.Unlock()
 
 	if !ok {
 		return &core.ErrSubscribeFailed{Backend: "mock", Destination: destination}
 	}
 
-	return handler(ctx, msg)
+	handlerCtx, cancel := context.WithCancel(subscription.ctx)
+	stop := context.AfterFunc(ctx, cancel)
+	defer func() { stop(); cancel() }()
+	if ctx.Err() != nil {
+		cancel()
+	}
+	handlerCtx, finish, err := m.work.Handler(handlerCtx)
+	if err != nil {
+		return err
+	}
+	defer finish()
+	return subscription.handler(handlerCtx, msg.Clone())
 }
 
 // Reset clears all recorded messages and call responses.

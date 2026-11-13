@@ -4,6 +4,7 @@ import (
 	"context"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/prabhatdotdev/weave/core"
 )
@@ -19,6 +20,7 @@ func TestMessageIdentityWithLiveKafka(t *testing.T) {
 	}
 	message := core.NewTextMessage("order created").WithHeader("trace-id", "trace-1")
 	message.MessageID = "order-created-42"
+	message.Timestamp = time.Now().UTC().Truncate(time.Millisecond)
 	original := message.Clone()
 	for range 2 {
 		if err := broker.Publish(ctx, topics[0], message); err != nil {
@@ -38,7 +40,7 @@ func TestMessageIdentityWithLiveKafka(t *testing.T) {
 			if msg.MessageID != want || msg.Offset <= previousOffset {
 				t.Fatalf("received ID=%q offset=%d, want ID=%q after offset=%d", msg.MessageID, msg.Offset, want, previousOffset)
 			}
-			if want != "" && (msg.BodyString() != "order created" || msg.GetHeader("trace-id") != "trace-1") {
+			if want != "" && (msg.BodyString() != "order created" || msg.GetHeader("trace-id") != "trace-1" || !msg.Timestamp.Equal(original.Timestamp)) {
 				t.Fatalf("message metadata changed: %+v", msg)
 			}
 			previousOffset = msg.Offset

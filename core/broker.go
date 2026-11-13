@@ -40,12 +40,14 @@ type Connector interface {
 type Publisher interface {
 	// Publish waits for broker acknowledgment, not consumer processing.
 	// Cancellation or connection loss after submission can leave delivery uncertain.
+	// Publish leaves the caller's message unchanged and owns retained body/header copies.
 	Publish(ctx context.Context, destination string, message *Message, opts ...PublishOption) error
 }
 
 // Caller defines request-reply operations (synchronous RPC).
 type Caller interface {
 	// Call performs a synchronous request-reply operation.
+	// It leaves the request unchanged and returns a response owned by the caller.
 	Call(ctx context.Context, destination string, message *Message, opts ...PublishOption) (*Message, error)
 }
 

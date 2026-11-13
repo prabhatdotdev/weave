@@ -29,6 +29,22 @@ the same logical event. No ID is generated automatically, and it is separate
 from the RPC `CorrelationID`. See the runnable
 [duplicate-handling example](../examples/deduplication).
 
+`Publish` and `Call` leave caller-owned messages unchanged. Publish retains its
+own body and header copies, so callers may reuse or change their input after
+the operation returns. Handler deliveries and RPC responses belong to the
+receiver. Portable metadata includes correlation ID, reply destination, string
+headers, content type, message ID, and timestamp. Timestamp precision follows
+the protocol: AMQP uses whole seconds and Kafka uses milliseconds. `Subject`,
+partition, and offset have transport-specific routing or delivery meanings.
+
+`testkit.MockBroker` follows the same ownership and subscription-context
+contract. It snapshots published messages and configured responses, returns
+independent copies from `PublishedMessages` and `PublishedTo`, and passes an
+owned copy to simulated handlers. Handler values come from the subscription
+context; cancellation of that context, the simulation context, or the broker
+interrupts the handler. Mock RPC responses remain explicitly configured,
+immediate results rather than a simulated network wait.
+
 Set `Config.MaxPendingCalls` to cap concurrent RPCs on either transport:
 
 ```go

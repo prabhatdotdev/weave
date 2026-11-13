@@ -491,6 +491,7 @@ func (b *Broker) Publish(ctx context.Context, destination string, msg *core.Mess
 		Topic:     destination,
 		Partition: -1,
 		Value:     sarama.ByteEncoder(msg.Body),
+		Timestamp: msg.Timestamp,
 	}
 
 	if options.Partition >= 0 {

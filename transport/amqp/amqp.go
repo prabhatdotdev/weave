@@ -928,6 +928,20 @@ func (b *Broker) handleMessage(ctx context.Context, msg amqplib.Delivery, handle
 		}
 	}()
 
+	err := handler(ctx, messageFromDelivery(msg))
+
+	if !autoAck {
+		if err != nil {
+			// Interrupted work is unfinished even when ordinary handler errors are not retried.
+			interrupted := b.work.IsClosed() || ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+			msg.Nack(false, interrupted || policy == core.HandlerErrorRetry || core.IsDeadLetterFailed(err))
+		} else {
+			msg.Ack(false)
+		}
+	}
+}
+
+func messageFromDelivery(msg amqplib.Delivery) *core.Message {
 	coreMsg := &core.Message{
 		Body:          msg.Body,
 		CorrelationID: msg.CorrelationId,
@@ -946,17 +960,7 @@ func (b *Broker) handleMessage(ctx context.Context, msg amqplib.Delivery, handle
 		}
 	}
 
-	err := handler(ctx, coreMsg)
-
-	if !autoAck {
-		if err != nil {
-			// Interrupted work is unfinished even when ordinary handler errors are not retried.
-			interrupted := b.work.IsClosed() || ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
-			msg.Nack(false, interrupted || policy == core.HandlerErrorRetry || core.IsDeadLetterFailed(err))
-		} else {
-			msg.Ack(false)
-		}
-	}
+	return coreMsg
 }
 
 // Call implements the request-response pattern.
@@ -1045,12 +1049,7 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 		if response == nil {
 			return nil, &core.ErrConnectionLost{Backend: backendName}
 		}
-		return &core.Message{
-			Body:          response.Body,
-			CorrelationID: response.CorrelationId,
-			ContentType:   response.ContentType,
-			Timestamp:     response.Timestamp,
-		}, nil
+		return messageFromDelivery(*response), nil
 	}
 }
 

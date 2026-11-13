@@ -3,7 +3,9 @@ package testkit
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
+	"time"
 
 	"github.com/prabhatdotdev/weave/core"
 )
@@ -82,5 +84,69 @@ func TestMockBrokerLifecycleAndMessaging(t *testing.T) {
 	}
 	if err := broker.Connect(ctx); !errors.Is(err, core.ErrClosed) {
 		t.Fatalf("Connect() after Close() error = %v, want ErrClosed", err)
+	}
+}
+
+func TestRecordedMessageInspectionReturnsOwnedCopies(t *testing.T) {
+	broker := NewMockBroker()
+	defer broker.Close()
+	if err := broker.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	msg := core.NewTextMessage("body").WithHeader("trace", "original")
+	if err := broker.Publish(context.Background(), "orders", msg); err != nil {
+		t.Fatal(err)
+	}
+	for _, records := range []func() []PublishedMessage{broker.PublishedMessages, func() []PublishedMessage { return broker.PublishedTo("orders") }} {
+		returned := records()
+		returned[0].Message.Body[0] = 'X'
+		returned[0].Message.Headers["trace"] = "changed"
+		returned[0].Destination = "changed"
+		if next := records(); len(next) != 1 || next[0].Destination != "orders" || !reflect.DeepEqual(next[0].Message, msg) {
+			t.Fatalf("inspection mutated recorded messages: %+v", next)
+		}
+	}
+}
+
+func TestNilCallResponseClearsConfiguredReply(t *testing.T) {
+	broker := NewMockBroker()
+	defer broker.Close()
+	if err := broker.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	broker.SetCallResponse("orders", core.NewTextMessage("reply"))
+	broker.SetCallResponse("orders", nil)
+	if _, err := broker.Call(context.Background(), "orders", core.NewMessage(nil)); !core.IsTimeout(err) {
+		t.Fatalf("cleared reply returned %v", err)
+	}
+}
+
+func TestSimulationContextCancelsActiveHandler(t *testing.T) {
+	broker := NewMockBroker()
+	defer broker.Close()
+	if err := broker.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	if err := broker.Subscribe(context.Background(), "orders", func(ctx context.Context, _ *core.Message) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- broker.SimulateMessage(ctx, "orders", core.NewMessage(nil)) }()
+	<-started
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("simulation cancellation did not reach the handler")
 	}
 }
