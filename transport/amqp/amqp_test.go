@@ -612,11 +612,64 @@ func waitForNotifyClose(t *testing.T, conn *fakeAMQPConnection) {
 	}
 }
 
+func TestHandleMessageRequeuesInterruptedWork(t *testing.T) {
+	for _, input := range []struct {
+		name   string
+		err    error
+		cancel bool
+	}{
+		{"cancellation", context.Canceled, false},
+		{"wrapped cancellation", fmt.Errorf("interrupted: %w", context.Canceled), false},
+		{"deadline", context.DeadlineExceeded, false},
+		{"wrapped deadline", fmt.Errorf("interrupted: %w", context.DeadlineExceeded), false},
+		{"canceled subscription with handler failure", errors.New("unfinished work"), true},
+	} {
+		t.Run(input.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ack := &ackRecorder{}
+			broker := &Broker{}
+			broker.handleMessage(ctx, amqplib.Delivery{Acknowledger: ack, DeliveryTag: 1}, func(context.Context, *core.Message) error {
+				if input.cancel {
+					cancel()
+				}
+				return input.err
+			}, false, core.HandlerErrorNoRetry)
+			if ack.ackCalls != 0 || ack.nackCalls != 1 || !ack.lastRequeue || ack.lastMultiple {
+				t.Fatalf("ack=%d nack=%d requeue=%v multiple=%v; want 0, 1, true, false", ack.ackCalls, ack.nackCalls, ack.lastRequeue, ack.lastMultiple)
+			}
+		})
+	}
+}
+
 func TestHandleMessageAckAndNackBehavior(t *testing.T) {
 	t.Parallel()
 
 	brokerAny, _ := NewBroker(core.DefaultConfig())
 	broker := brokerAny.(*Broker)
+
+	t.Run("completed work acknowledges after cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		ack := &ackRecorder{}
+		broker.handleMessage(ctx, amqplib.Delivery{Acknowledger: ack, DeliveryTag: 1}, func(context.Context, *core.Message) error {
+			cancel()
+			return nil
+		}, false, core.HandlerErrorNoRetry)
+		if ack.ackCalls != 1 || ack.nackCalls != 0 {
+			t.Fatalf("ack=%d nack=%d; want 1 and 0", ack.ackCalls, ack.nackCalls)
+		}
+	})
+
+	t.Run("automatic acknowledgment leaves canceled work acknowledged", func(t *testing.T) {
+		ack := &ackRecorder{}
+		broker.handleMessage(context.Background(), amqplib.Delivery{Acknowledger: ack, DeliveryTag: 1}, func(context.Context, *core.Message) error {
+			return context.Canceled
+		}, true, core.HandlerErrorNoRetry)
+		if ack.ackCalls != 0 || ack.nackCalls != 0 {
+			t.Fatalf("ack=%d nack=%d; want no manual acknowledgments", ack.ackCalls, ack.nackCalls)
+		}
+	})
 
 	t.Run("success acknowledges message", func(t *testing.T) {
 		ack := &ackRecorder{}

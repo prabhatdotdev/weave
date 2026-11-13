@@ -843,8 +843,9 @@ func (b *Broker) handleMessage(ctx context.Context, msg amqplib.Delivery, handle
 
 	if !autoAck {
 		if err != nil {
-			requeue := policy == core.HandlerErrorRetry
-			msg.Nack(false, requeue)
+			// Interrupted work is unfinished even when ordinary handler errors are not retried.
+			interrupted := ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+			msg.Nack(false, interrupted || policy == core.HandlerErrorRetry)
 		} else {
 			msg.Ack(false)
 		}

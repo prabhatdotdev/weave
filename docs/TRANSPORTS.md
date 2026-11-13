@@ -25,6 +25,12 @@ option, RabbitMQ can acknowledge a message that has no matching queue.
 For durable delivery, provision durable queues and use `WithPersistent()`.
 Publisher confirmation means broker acceptance, not consumer processing.
 
+With manual acknowledgments, handler cancellation and deadline errors requeue
+unfinished work, even under `HandlerErrorNoRetry`. An error returned after the
+subscription context is canceled also requeues the message. A nil handler result
+acknowledges completed work. `WithAutoAck()` acknowledges delivery before handler
+completion, so interrupted work cannot be requeued by the handler.
+
 AMQP confirmations are currently serialized per broker connection. A timed-out
 publish retains its slot until the late receipt arrives or the channel closes,
 so another message cannot accidentally receive its acknowledgment.

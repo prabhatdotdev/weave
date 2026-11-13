@@ -17,7 +17,9 @@ package amqp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -129,6 +131,80 @@ func TestDuplicateCorrelationIDWithLiveRabbitMQ(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatal("first call was stranded by the duplicate")
+	}
+}
+
+func TestCanceledHandlerRedeliversWithLiveRabbitMQ(t *testing.T) {
+	if os.Getenv("WEAVE_AMQP_E2E") != "1" {
+		t.Skip("set WEAVE_AMQP_E2E=1 to run the RabbitMQ integration test")
+	}
+	conn := dialLiveRabbitMQ(t)
+	t.Cleanup(func() { _ = conn.Close() })
+	admin, err := conn.Channel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = admin.Close() })
+	queue, err := admin.QueueDeclare(fmt.Sprintf("weave-cancel-%d", time.Now().UnixNano()), true, false, false, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = admin.QueueDelete(queue.Name, false, false, false) })
+	config := core.DefaultConfig()
+	config.AMQP = core.DefaultAMQPConfig()
+	config.AMQP.QueueDurable = true
+	broker, err := NewBroker(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = broker.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	t.Cleanup(cancel)
+	if err := broker.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	workCtx, interrupt := context.WithCancel(ctx)
+	defer interrupt()
+	started := make(chan struct{}, 1)
+	redelivered := make(chan *core.Message, 1)
+	var attempts atomic.Int32
+	if err := broker.Subscribe(ctx, queue.Name, func(handlerCtx context.Context, msg *core.Message) error {
+		if attempts.Add(1) == 1 {
+			started <- struct{}{}
+			<-workCtx.Done()
+			return fmt.Errorf("unfinished work: %w", workCtx.Err())
+		}
+		select {
+		case redelivered <- msg:
+		case <-handlerCtx.Done():
+			return handlerCtx.Err()
+		}
+		return nil
+	}, core.WithWorkerCount(1)); err != nil {
+		t.Fatal(err)
+	}
+	message := core.NewTextMessage("unfinished").WithHeader("trace-id", "cancel-regression")
+	message.MessageID = "unfinished-message"
+	if err := broker.Publish(ctx, queue.Name, message); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("handler did not start")
+	}
+	interrupt()
+	select {
+	case got := <-redelivered:
+		if got.BodyString() != message.BodyString() || got.MessageID != message.MessageID || got.GetHeader("trace-id") != message.GetHeader("trace-id") {
+			t.Fatalf("redelivery lost the original message: %+v", got)
+		}
+		if attempts.Load() != 2 {
+			t.Fatalf("handler attempts = %d, want 2", attempts.Load())
+		}
+	case <-ctx.Done():
+		t.Fatal("canceled work was not redelivered under the default handler error policy")
 	}
 }
 
