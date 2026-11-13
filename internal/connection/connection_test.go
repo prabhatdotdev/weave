@@ -133,20 +133,20 @@ func listenForConnection(t *testing.T) (net.Listener, <-chan net.Conn) {
 func TestRetryWaitStopsForCancellationDeadlineAndClose(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := Wait(ctx, nil, time.Hour); !errors.Is(err, context.Canceled) {
+	if err := Wait(ctx, nil, nil, time.Hour); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled retry wait returned %v", err)
 	}
 	ctx, cancel = context.WithTimeout(context.Background(), time.Millisecond)
 	defer cancel()
-	if err := Wait(ctx, nil, time.Hour); !errors.Is(err, context.DeadlineExceeded) {
+	if err := Wait(ctx, nil, nil, time.Hour); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expired retry wait returned %v", err)
 	}
 	closed := make(chan struct{})
 	close(closed)
-	if err := Wait(context.Background(), closed, time.Hour); !errors.Is(err, core.ErrClosed) {
+	if err := Wait(context.Background(), closed, nil, time.Hour); !errors.Is(err, core.ErrClosed) {
 		t.Fatalf("closed broker retry wait returned %v", err)
 	}
-	if err := Wait(context.Background(), nil, time.Millisecond); err != nil {
+	if err := Wait(context.Background(), nil, nil, time.Millisecond); err != nil {
 		t.Fatalf("elapsed retry wait returned %v", err)
 	}
 }

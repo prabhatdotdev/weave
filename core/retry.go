@@ -2,6 +2,8 @@ package core
 
 import (
 	"context"
+	"math"
+	"math/rand/v2"
 	"time"
 )
 
@@ -10,6 +12,7 @@ type retryAttemptKey struct{}
 // BackoffStrategy returns the delay to wait before the next retry attempt.
 // The attempt argument is one-based and represents the retry count after the
 // initial attempt has already failed.
+// Shared strategies must be safe for concurrent calls; the built-in strategies are.
 type BackoffStrategy func(attempt int) time.Duration
 
 // RetryPredicate decides whether another retry should be attempted.
@@ -57,29 +60,42 @@ func ExponentialBackoff(initialDelay, maxDelay time.Duration, multiplier float64
 	if maxDelay <= 0 {
 		maxDelay = initialDelay
 	}
-	if multiplier < 1 {
+	if multiplier < 1 || math.IsNaN(multiplier) {
 		multiplier = 2
 	}
 
 	return func(attempt int) time.Duration {
-		if attempt <= 1 {
+		if attempt <= 1 || multiplier == 1 {
 			if initialDelay > maxDelay {
 				return maxDelay
 			}
 			return initialDelay
 		}
 
-		delay := float64(initialDelay)
-		for i := 1; i < attempt; i++ {
-			delay *= multiplier
-			if time.Duration(delay) >= maxDelay {
-				return maxDelay
-			}
-		}
-		if time.Duration(delay) > maxDelay {
+		delay := float64(initialDelay) * math.Pow(multiplier, float64(attempt-1))
+		if delay >= float64(maxDelay) {
 			return maxDelay
 		}
 		return time.Duration(delay)
+	}
+}
+
+// JitteredBackoff applies full jitter: a uniformly sampled delay from zero through
+// the base strategy's delay, inclusive. Nil and nonpositive base delays yield zero.
+func JitteredBackoff(base BackoffStrategy) BackoffStrategy {
+	return jitteredBackoff(base, rand.Uint64N)
+}
+
+func jitteredBackoff(base BackoffStrategy, sample func(uint64) uint64) BackoffStrategy {
+	return func(attempt int) time.Duration {
+		if base == nil {
+			return 0
+		}
+		delay := base(attempt)
+		if delay <= 0 {
+			return 0
+		}
+		return time.Duration(sample(uint64(delay) + 1))
 	}
 }
 

@@ -346,11 +346,8 @@ func (b *Broker) open(ctx context.Context, keys []consumerKey) (*openedConnectio
 		lastErr = err
 
 		if i < retries {
-			delay := b.config.RetryDelay
-			if delay == 0 {
-				delay = 2 * time.Second
-			}
-			if err := connection.Wait(ctx, b.closeChan, delay); err != nil {
+			delay := connection.Backoff(b.config, i+1, 2*time.Second)
+			if err := connection.Wait(ctx, b.closeChan, b.work.Stopping(), delay); err != nil {
 				return nil, err
 			}
 		}
@@ -748,6 +745,7 @@ func (b *Broker) runSubscriptionConsumer(changed <-chan struct{}) {
 		b.runnersMu.Unlock()
 	}()
 
+	failedConnections := 0
 	for {
 		groups := b.activeSubscriptionGroups()
 		if len(groups) == 0 {
@@ -771,11 +769,17 @@ func (b *Broker) runSubscriptionConsumer(changed <-chan struct{}) {
 				Err:         err,
 				Fields:      map[string]any{"outcome": "failure"},
 			})
-			if connection.Wait(context.Background(), b.closeChan, 200*time.Millisecond) != nil {
+			failedConnections++
+			delay := 200 * time.Millisecond
+			if b.config.ConnectionBackoff != nil {
+				delay = connection.Backoff(b.config, failedConnections, delay)
+			}
+			if connection.Wait(context.Background(), b.closeChan, b.work.Stopping(), delay) != nil {
 				return
 			}
 			continue
 		}
+		failedConnections = 0
 
 		consumeCtx, cancel := context.WithCancel(context.Background())
 		type result struct {

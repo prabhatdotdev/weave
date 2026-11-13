@@ -24,7 +24,11 @@ type Config struct {
 	ConnectionName  string
 	ConnectionRetry int
 	RetryDelay      time.Duration
-	EventHook       EventHook
+	// ConnectionBackoff overrides RetryDelay for connection retries and recovery.
+	// Attempts are one-based and reset for each connect/recovery loop. Nil preserves
+	// existing fixed delays. Negative strategy results are treated as zero.
+	ConnectionBackoff BackoffStrategy
+	EventHook         EventHook
 	// MaxPendingCalls bounds concurrent RPCs per broker; zero leaves them unlimited.
 	MaxPendingCalls int
 	AMQP            *AMQPConfig

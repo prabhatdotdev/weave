@@ -2,6 +2,7 @@ package kafka
 
 import (
 	"testing"
+	"time"
 
 	"github.com/prabhatdotdev/weave/core"
 	"github.com/prabhatdotdev/weave/internal/brokerstress"
@@ -10,7 +11,10 @@ import (
 func newStressKafkaFixture(t *testing.T) brokerstress.Fixture {
 	t.Helper()
 	brokerstress.Enabled(t)
-	broker, topics, _ := newLiveKafkaBrokerWithConfig(t, "stress", 2, 1, func(config *core.Config) { config.MaxPendingCalls = 16 })
+	broker, topics, _ := newLiveKafkaBrokerWithConfig(t, "stress", 2, 1, func(config *core.Config) {
+		config.MaxPendingCalls = 16
+		config.ConnectionBackoff = core.JitteredBackoff(core.ExponentialBackoff(50*time.Millisecond, time.Second, 2))
+	})
 	return brokerstress.Fixture{
 		Broker: broker, Events: topics[0], Requests: topics[1],
 		Idle: func() bool {

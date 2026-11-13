@@ -344,11 +344,8 @@ func (b *Broker) open(ctx context.Context) (*openedConnection, error) {
 			return client, nil
 		}
 		if i < retries {
-			delay := b.config.RetryDelay
-			if delay == 0 {
-				delay = 2 * time.Second
-			}
-			if waitErr := connection.Wait(ctx, b.closeChan, delay); waitErr != nil {
+			delay := connection.Backoff(b.config, i+1, 2*time.Second)
+			if waitErr := connection.Wait(ctx, b.closeChan, b.work.Stopping(), delay); waitErr != nil {
 				return nil, waitErr
 			}
 		}
@@ -480,6 +477,10 @@ func (b *Broker) reconnectLoop() {
 				if conn != nil {
 					b.handleConnectionLoss(conn, nil)
 				}
+				delay := connection.Backoff(b.config, attempt, 2*time.Second)
+				if connection.Wait(context.Background(), b.closeChan, b.work.Stopping(), delay) != nil {
+					return
+				}
 				continue
 			}
 			b.closeMu.Lock()
@@ -510,16 +511,8 @@ func (b *Broker) reconnectLoop() {
 			},
 		})
 
-		delay := b.config.RetryDelay
-		if delay == 0 {
-			delay = 2 * time.Second
-		}
-
-		select {
-		case <-time.After(delay):
-		case <-b.closeChan:
-			return
-		case <-b.work.Stopping():
+		delay := connection.Backoff(b.config, attempt, 2*time.Second)
+		if connection.Wait(context.Background(), b.closeChan, b.work.Stopping(), delay) != nil {
 			return
 		}
 	}

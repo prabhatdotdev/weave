@@ -223,6 +223,12 @@ connection waits, and retry backoff. Closing the broker interrupts setup and
 reconnect waits. Once connected, cancelling the setup context does not close
 the established connection; use `Close` to end its lifetime.
 
+Set `Config.ConnectionBackoff` to an optional `core.BackoffStrategy` for
+connection retries and recovery. Wrap `core.ExponentialBackoff` with
+`core.JitteredBackoff` to spread retries across instances after an outage.
+Backoff waits honor cancellation, closure, and graceful shutdown, even when
+the chosen jitter delay is zero. See [backoff configuration](API.md#core).
+
 ## Deadlines and delivery outcomes
 
 `WithTimeout(d)` bounds Publish and Call, including connection/reply setup,

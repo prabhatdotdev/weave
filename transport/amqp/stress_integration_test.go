@@ -32,6 +32,7 @@ func stressAMQPConfig(t testing.TB) *core.Config {
 	}
 	config := core.DefaultConfig()
 	config.MaxPendingCalls = 16
+	config.ConnectionBackoff = core.JitteredBackoff(core.ExponentialBackoff(50*time.Millisecond, time.Second, 2))
 	config.AMQP = core.DefaultAMQPConfig()
 	config.AMQP.Host, config.AMQP.Port = host, portNumber
 	config.AMQP.QueueDurable = true

@@ -118,6 +118,37 @@ is omitted or zero. A context already done before the first attempt returns its
 context error without calling the handler. Interruption after a failed attempt
 preserves the last handler error.
 
+`core.JitteredBackoff(base)` wraps any backoff strategy with full jitter. Each
+call samples uniformly from zero through the base delay, inclusive. Nil or
+nonpositive base delays yield zero. The built-in strategies support concurrent
+use and handle duration limits without overflowing.
+
+```go
+policy := core.DefaultRetryPolicy()
+policy.Backoff = core.JitteredBackoff(policy.Backoff)
+handler := core.RetryHandler(processOrder, policy)
+
+config := core.DefaultConfig()
+config.ConnectionBackoff = core.JitteredBackoff(
+    core.ExponentialBackoff(100*time.Millisecond, 30*time.Second, 2),
+)
+```
+
+`Config.ConnectionBackoff` overrides `RetryDelay` for initial connection retries
+and connection recovery in both transports. Its argument is a one-based retry
+number. A `Connect` call resets its own retry count; a background recovery loop
+counts its consecutive failed connection cycles separately and resets on success.
+AMQP also backs off after failed subscription restoration. Each `Connect` call's
+retry budget remains controlled by `ConnectionRetry`; background recovery keeps
+retrying until it succeeds or the broker stops. The policy calculates delays,
+not retry counts. Negative strategy results are treated as zero.
+
+Leaving this field nil preserves existing fixed delays, including Kafka's
+200 ms recovery-loop pause. `DefaultRetryPolicy` also keeps its existing
+deterministic exponential delay until explicitly wrapped with jitter. Kafka's
+`RetryBackoff` continues to control Sarama's internal producer retries.
+Custom strategies must return promptly and support concurrent calls if shared.
+
 `core.DeadLetterHandler` composes retries with a confirmed dead-letter publish:
 
 ```go

@@ -17,6 +17,8 @@ Both transports run the same workload: four publishers and four RPC callers,
 approximately 1 KiB bodies, message identity and payload verification, manual
 consumer acknowledgments, persistent AMQP messages, and a pending RPC limit
 of 16. The sustained phase must complete without publish or RPC errors.
+The fixtures use full-jitter connection backoff from 50 ms up to a 1 s cap so
+the crash/recovery phase exercises configurable reconnect timing.
 The Kafka fixture has one broker and one partition per topic.
 Every confirmed event must reach its handler before the final drain. The
 delivery ledger retains unfinished attempts rather than the full run history.
@@ -72,6 +74,9 @@ CI runs one short sample per scenario and checks correctness. Throughput has no
 hard CI threshold because runner resources and storage latency vary.
 
 ## Local verification, 13 November 2026
+
+This archived run used the original fixed reconnect delays. Current stress
+fixtures enable jittered backoff; reruns can have different recovery timings.
 
 The one-minute run used an Apple M4 host (10 cores, 24 GiB RAM), macOS 27.0.1,
 Go 1.25.5 on arm64, and Docker Engine 29.8.0 on Linux/aarch64. Docker had ten

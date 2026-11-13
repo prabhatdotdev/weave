@@ -130,16 +130,38 @@ func Open[T io.Closer](ctx context.Context, closed <-chan struct{}, base net.Dia
 	}
 }
 
-// Wait interrupts retry backoff when the caller cancels or the broker closes.
-func Wait(ctx context.Context, closed <-chan struct{}, delay time.Duration) error {
+// Wait interrupts backoff on cancellation, closure, or graceful shutdown, including zero delays.
+func Wait(ctx context.Context, closed, stopping <-chan struct{}, delay time.Duration) error {
+	if err := interrupted(ctx, closed, stopping); err != nil {
+		return err
+	}
+	if delay <= 0 {
+		return interrupted(ctx, closed, stopping)
+	}
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+	case <-closed:
+	case <-stopping:
+	case <-timer.C:
+	}
+	return interrupted(ctx, closed, stopping)
+}
+
+func interrupted(ctx context.Context, closed, stopping <-chan struct{}) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
 	case <-closed:
 		return core.ErrClosed
-	case <-timer.C:
-		return ctx.Err()
+	default:
 	}
+	select {
+	case <-stopping:
+		return core.ErrShuttingDown
+	default:
+	}
+	return nil
 }
