@@ -83,6 +83,11 @@ func (g *fakeConsumerGroup) Consume(ctx context.Context, topics []string, handle
 	}
 
 	if err == nil {
+		session := &fakeSession{ctx: ctx}
+		if err := handler.Setup(session); err != nil {
+			return err
+		}
+		defer handler.Cleanup(session)
 		select {
 		case <-ctx.Done():
 			return nil

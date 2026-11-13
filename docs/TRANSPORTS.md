@@ -147,8 +147,42 @@ if err := broker.Connect(ctx); err != nil {
 defer broker.Close()
 ```
 
-`IsConnected` reports readiness. `IsRecovering` distinguishes an active
+`IsConnected` reports transport connectivity. `IsRecovering` distinguishes an active
 reconnect from a closed or never-connected broker.
+
+Both transports and `MockBroker` implement the optional `core.ConsumerReadiness`
+interface. Register business subscriptions, then wait for consumer setup:
+
+```go
+if err := broker.Subscribe(ctx, "orders", handleOrder); err != nil {
+    return err
+}
+startupCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+defer cancel()
+if ready, ok := broker.(core.ConsumerReadiness); ok {
+    if err := ready.WaitReady(startupCtx); err != nil {
+        return err
+    }
+}
+```
+
+`IsReady()` requires connectivity and setup of all active business subscriptions.
+AMQP becomes ready after the broker accepts each consumer. Kafka becomes ready
+after Sarama session setup for every current subscription group. A joined Kafka
+member with no assigned partitions is ready; readiness describes group setup,
+not record processing or ownership of a partition. Canceled subscriptions are
+excluded, and a connected publisher with no business subscriptions is ready.
+Internal RPC reply consumers are not independently included in readiness.
+
+Readiness changes during connection loss, consumer teardown, and rebalances.
+`WaitReady` observes the existing setup/recovery lifecycle and respects its own
+context without canceling subscriptions or holding up shutdown. Call `Connect`
+first; a wait before the first connection returns `ErrNotConnected`. Shutdown
+and closure interrupt waits with `ErrShuttingDown` and `ErrClosed`. A successful
+wait is a snapshot, so health checks should continue using `IsReady()`.
+
+Kafka emits assignment and rebalance events through `EventHook`; AMQP and the
+mock emit consumer assignment/revocation events. See [event fields](API.md#events).
 
 `Shutdown(ctx)` is available through the optional `core.Shutdowner` interface:
 

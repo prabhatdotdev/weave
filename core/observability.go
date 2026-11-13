@@ -28,6 +28,10 @@ const (
 	EventHandlerFinished    = "handler_finished"
 	EventCallStarted        = "call_started"
 	EventCallFinished       = "call_finished"
+	EventConsumerAssigned   = "consumer_assigned"
+	EventConsumerRevoked    = "consumer_revoked"
+	EventRebalanceStarted   = "rebalance_started"
+	EventRebalanceCompleted = "rebalance_completed"
 )
 
 // Event is a structured transport signal.

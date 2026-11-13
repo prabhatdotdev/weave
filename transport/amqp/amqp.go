@@ -31,6 +31,7 @@ import (
 	"github.com/prabhatdotdev/weave/internal/connection"
 	"github.com/prabhatdotdev/weave/internal/lifecycle"
 	"github.com/prabhatdotdev/weave/internal/observability"
+	"github.com/prabhatdotdev/weave/internal/readiness"
 	"github.com/prabhatdotdev/weave/internal/rpclimit"
 	"github.com/prabhatdotdev/weave/internal/validation"
 )
@@ -118,6 +119,7 @@ type subscriptionRegistration struct {
 	destination string
 	handler     core.Handler
 	opts        []core.SubscribeOption
+	readiness   *readiness.State
 }
 
 type pendingCall struct {
@@ -136,6 +138,7 @@ func (p *pendingCall) complete(response *amqplib.Delivery) {
 // Broker implements the core.MessageBroker interface for AMQP/RabbitMQ.
 type Broker struct {
 	work       lifecycle.Group
+	ready      readiness.Signal
 	metrics    observability.Metrics
 	rpcSlots   rpclimit.Limiter
 	config     *core.Config
@@ -152,13 +155,14 @@ type Broker struct {
 	subs              []subscriptionRegistration
 	subsMu            sync.RWMutex
 
-	connected  bool
-	recovering bool
-	closed     bool
-	connecting chan struct{}
-	closeMu    sync.RWMutex
-	closeOnce  sync.Once
-	closeChan  chan struct{}
+	connected     bool
+	everConnected bool
+	recovering    bool
+	closed        bool
+	connecting    chan struct{}
+	closeMu       sync.RWMutex
+	closeOnce     sync.Once
+	closeChan     chan struct{}
 }
 
 func (b *Broker) emitEvent(ctx context.Context, event core.Event) {
@@ -258,11 +262,13 @@ func (b *Broker) Connect(ctx context.Context) error {
 	if err == nil {
 		b.conn, b.channel = client.conn, client.channel
 		b.connected = true
+		b.everConnected = true
 		b.replyQueue = ""
 	}
 	close(b.connecting)
 	b.connecting = nil
 	b.closeMu.Unlock()
+	b.ready.Notify()
 	if err != nil && client != nil {
 		_ = client.Close()
 	}
@@ -409,7 +415,10 @@ func (b *Broker) handleConnectionLoss(conn amqpConnection, connErr *amqplib.Erro
 	b.conn = nil
 	b.channel = nil
 	b.replyQueue = ""
+	revoked := b.invalidateConsumers()
 	b.closeMu.Unlock()
+	b.ready.Notify()
+	revoked()
 
 	b.cancelAllPending()
 
@@ -476,6 +485,7 @@ func (b *Broker) reconnectLoop() {
 			b.closeMu.Lock()
 			b.recovering = false
 			b.closeMu.Unlock()
+			b.ready.Notify()
 
 			// Emit reconnect success event
 			b.emitEvent(context.Background(), core.Event{
@@ -535,7 +545,7 @@ func (b *Broker) restoreSubscriptions() error {
 		if sub.ctx.Err() != nil {
 			continue
 		}
-		if err := b.subscribe(sub.ctx, sub.destination, sub.handler, false, true, sub.opts...); err != nil {
+		if err := b.subscribeWithReadiness(sub.ctx, sub.destination, sub.handler, false, true, sub.readiness, sub.opts...); err != nil {
 			b.emitEvent(context.Background(), core.Event{
 				Level:       core.EventLevelError,
 				Name:        "subscription_restore_failed",
@@ -579,6 +589,7 @@ func (b *Broker) IsRecovering() bool {
 // A deadline forces closure; handlers must observe their contexts to stop.
 func (b *Broker) Shutdown(ctx context.Context) error {
 	return b.work.Shutdown(ctx, func(ctx context.Context) error {
+		b.invalidateConsumers()()
 		b.closeMu.RLock()
 		channel := b.channel
 		b.closeMu.RUnlock()
@@ -596,6 +607,7 @@ func (b *Broker) Close() error {
 	b.work.Close()
 	var err error
 	closed := false
+	revoked := func() {}
 	b.closeOnce.Do(func() {
 		b.closeMu.Lock()
 		b.stopReplyConsumerLocked()
@@ -604,7 +616,9 @@ func (b *Broker) Close() error {
 		b.recovering = false
 		channel, conn := b.channel, b.conn
 		b.channel, b.conn = nil, nil
+		revoked = b.invalidateConsumers()
 		b.closeMu.Unlock()
+		b.ready.Notify()
 
 		close(b.closeChan)
 		b.cancelAllPending()
@@ -622,6 +636,7 @@ func (b *Broker) Close() error {
 
 		closed = true
 	})
+	revoked()
 	if closed {
 		b.emitEvent(context.Background(), core.Event{
 			Level:     core.EventLevelInfo,
@@ -738,6 +753,10 @@ func (b *Broker) Subscribe(ctx context.Context, destination string, handler core
 }
 
 func (b *Broker) subscribe(ctx context.Context, destination string, handler core.Handler, track bool, allowRecovering bool, opts ...core.SubscribeOption) error {
+	return b.subscribeWithReadiness(ctx, destination, handler, track, allowRecovering, &readiness.State{}, opts...)
+}
+
+func (b *Broker) subscribeWithReadiness(ctx context.Context, destination string, handler core.Handler, track bool, allowRecovering bool, state *readiness.State, opts ...core.SubscribeOption) error {
 	options, err := validation.Subscribe(ctx, destination, handler, opts...)
 	if err != nil {
 		return err
@@ -834,11 +853,37 @@ func (b *Broker) subscribe(ctx context.Context, destination string, handler core
 		return err
 	}
 
+	if state == nil {
+		state = &readiness.State{}
+	}
+	b.closeMu.RLock()
+	var stopped error
+	switch {
+	case b.work.IsClosed():
+		stopped = core.ErrClosed
+	case b.work.IsStopping():
+		stopped = core.ErrShuttingDown
+	case b.channel != channel || !b.connected:
+		stopped = &core.ErrNotConnected{Backend: backendName}
+	}
+	if stopped != nil {
+		b.closeMu.RUnlock()
+		finishConsumer()
+		go func() { _ = channel.Cancel(tag, false) }()
+		return stopped
+	}
 	if track {
 		b.subsMu.Lock()
-		b.subs = append(b.subs, subscriptionRegistration{ctx: ctx, destination: destination, handler: handler, opts: append([]core.SubscribeOption(nil), opts...)})
+		b.subs = append(b.subs, subscriptionRegistration{ctx: ctx, destination: destination, handler: handler, opts: append([]core.SubscribeOption(nil), opts...), readiness: state})
 		b.subsMu.Unlock()
 	}
+	assignment, previous := state.Assign(ctx, func(generation uint64) {
+		b.ready.Notify()
+		b.emitEvent(ctx, core.Event{Level: core.EventLevelInfo, Name: core.EventConsumerRevoked, Operation: "consume", Destination: destination, Fields: map[string]any{"consumer_tag": tag, "consumer_generation": generation}})
+	})
+	b.closeMu.RUnlock()
+	previous()
+	b.ready.Notify()
 
 	var workers sync.WaitGroup
 	cancelDone := make(chan struct{})
@@ -892,6 +937,7 @@ func (b *Broker) subscribe(ctx context.Context, destination string, handler core
 	go func() { workers.Wait(); close(consumerDone) }()
 	go func() {
 		defer finishConsumer()
+		defer assignment.Release()
 		select {
 		case <-ctx.Done():
 		case <-b.work.Stopping():
@@ -909,6 +955,9 @@ func (b *Broker) subscribe(ctx context.Context, destination string, handler core
 		case <-b.closeChan:
 		}
 	}()
+	if assignment != nil {
+		b.emitEvent(ctx, core.Event{Level: core.EventLevelInfo, Name: core.EventConsumerAssigned, Operation: "consume", Destination: destination, Fields: map[string]any{"consumer_tag": tag, "consumer_generation": assignment.Generation}})
+	}
 
 	return nil
 }

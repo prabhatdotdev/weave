@@ -74,5 +74,18 @@ type Shutdowner interface {
 	Shutdown(ctx context.Context) error
 }
 
+// ConsumerReadiness is an optional capability for startup and health checks.
+// Readiness requires a usable connection and setup of every active business
+// subscription. With no active subscriptions, connection readiness is sufficient.
+// Internal RPC reply consumers are not independently included in this check.
+type ConsumerReadiness interface {
+	// IsReady reports a snapshot; cancellation, reconnects, and rebalances can change it.
+	IsReady() bool
+	// WaitReady waits through consumer setup and recovery until ready or ctx expires.
+	// Before the first connection it returns ErrNotConnected. Shutdown and closure
+	// interrupt the wait with ErrShuttingDown and ErrClosed, respectively.
+	WaitReady(ctx context.Context) error
+}
+
 // Handler is a function that processes incoming messages.
 type Handler func(ctx context.Context, msg *Message) error

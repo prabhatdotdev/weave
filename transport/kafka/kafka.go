@@ -32,6 +32,7 @@ import (
 	"github.com/prabhatdotdev/weave/internal/connection"
 	"github.com/prabhatdotdev/weave/internal/lifecycle"
 	"github.com/prabhatdotdev/weave/internal/observability"
+	"github.com/prabhatdotdev/weave/internal/readiness"
 	"github.com/prabhatdotdev/weave/internal/rpclimit"
 	"github.com/prabhatdotdev/weave/internal/validation"
 )
@@ -46,6 +47,7 @@ type subscriptionRegistration struct {
 	opts        []core.SubscribeOption
 	tracked     bool
 	consumerKey consumerKey
+	readiness   *readiness.State
 }
 
 type consumerKey struct {
@@ -54,10 +56,11 @@ type consumerKey struct {
 }
 
 type subscriptionRoute struct {
-	ctx     context.Context
-	handler core.Handler
-	workers chan struct{}
-	policy  core.HandlerErrorPolicy
+	ctx       context.Context
+	handler   core.Handler
+	workers   chan struct{}
+	policy    core.HandlerErrorPolicy
+	readiness *readiness.State
 }
 
 type pendingCall struct {
@@ -102,6 +105,7 @@ func (p *pendingCall) complete(response *core.Message) {
 // Broker implements the core.MessageBroker interface for Apache Kafka.
 type Broker struct {
 	work        lifecycle.Group
+	ready       readiness.Signal
 	metrics     observability.Metrics
 	rpcSlots    rpclimit.Limiter
 	config      *core.Config
@@ -253,6 +257,7 @@ func (b *Broker) Connect(ctx context.Context) error {
 	close(b.connecting)
 	b.connecting = nil
 	b.closeMu.Unlock()
+	b.ready.Notify()
 	if previous != nil {
 		_ = previous.Close()
 	}
@@ -425,7 +430,7 @@ func (b *Broker) IsRecovering() bool {
 // Shutdown drains admitted operations and handlers before closing the clients.
 // A deadline interrupts handlers and bounds the caller's wait for client closure.
 func (b *Broker) Shutdown(ctx context.Context) error {
-	return b.work.Shutdown(ctx, nil, b.Close)
+	return b.work.Shutdown(ctx, func(context.Context) error { b.invalidateConsumers()(); return nil }, b.Close)
 }
 
 var _ core.Shutdowner = (*Broker)(nil)
@@ -435,6 +440,7 @@ func (b *Broker) Close() error {
 	b.work.Close()
 	var err error
 	closed := false
+	revoked := func() {}
 	b.closeOnce.Do(func() {
 		b.closeMu.Lock()
 		b.closed = true
@@ -442,7 +448,9 @@ func (b *Broker) Close() error {
 		b.recovering = false
 		client := &openedConnection{producer: b.producer, consumer: b.consumer, consumers: b.consumers}
 		b.producer, b.consumer, b.consumers = nil, nil, nil
+		revoked = b.invalidateConsumers()
 		b.closeMu.Unlock()
+		b.ready.Notify()
 
 		close(b.closeChan)
 		b.cancelAllPending()
@@ -450,6 +458,7 @@ func (b *Broker) Close() error {
 		err = client.Close()
 		closed = true
 	})
+	revoked()
 	if closed {
 		b.emitEvent(context.Background(), core.Event{
 			Level:     core.EventLevelInfo,
@@ -712,6 +721,7 @@ func (b *Broker) currentConsumerFor(key consumerKey) sarama.ConsumerGroup {
 }
 
 func (b *Broker) restartSubscriptionRunner() {
+	b.invalidateConsumers()()
 	b.runnersMu.Lock()
 	if b.subsChanged == nil {
 		b.subsChanged = make(chan struct{}, 1)
@@ -781,9 +791,12 @@ func (b *Broker) runSubscriptionConsumer(changed <-chan struct{}) {
 					return
 				}
 				b.watchConsumerErrors(consumeCtx, "*", consumer)
+				observer := &consumerReadiness{broker: b, consumer: consumer, key: key, routes: routes, ctx: consumeCtx}
+				defer observer.stop()
 				handler := &consumerGroupHandler{
 					routes: routes, closeChan: b.closeChan, replyTopic: b.kafkaConfig.ReplyTopic,
 					pending: b.pending, pendingMu: &b.pendingMu, config: b.config, work: &b.work, metrics: &b.metrics,
+					onSetup: observer.setup, onCleanup: observer.cleanup,
 				}
 				topics := make([]string, 0, len(routes))
 				for topic := range routes {
@@ -791,6 +804,7 @@ func (b *Broker) runSubscriptionConsumer(changed <-chan struct{}) {
 				}
 				sort.Strings(topics)
 				var err error
+				observer.beginRebalance(nil)
 				for consumeCtx.Err() == nil {
 					err = consumer.Consume(consumeCtx, topics, handler)
 					if err != nil {
@@ -838,9 +852,10 @@ func (b *Broker) activeSubscriptionGroups() map[consumerKey]map[string]subscript
 		}
 		options := core.ApplySubscribeOptions(sub.opts...)
 		route := subscriptionRoute{
-			ctx:     sub.ctx,
-			handler: sub.handler,
-			policy:  options.HandlerErrorPolicy,
+			ctx:       sub.ctx,
+			handler:   sub.handler,
+			policy:    options.HandlerErrorPolicy,
+			readiness: sub.readiness,
 		}
 		if options.WorkerCount > 0 {
 			route.workers = make(chan struct{}, options.WorkerCount)
@@ -1125,7 +1140,10 @@ func (b *Broker) handleConnectionLossFor(expectedProducer messageProducer, expec
 		delete(b.watching, consumer)
 	}
 	b.watchMu.Unlock()
+	revoked := b.invalidateConsumers()
 	b.closeMu.Unlock()
+	b.ready.Notify()
+	revoked()
 
 	b.cancelAllPending()
 	b.emitEvent(context.Background(), core.Event{
@@ -1151,7 +1169,11 @@ func (b *Broker) registerSubscription(ctx context.Context, destination string, h
 		tracked:     tracked,
 		consumerKey: b.subscriptionConsumerKey(core.ApplySubscribeOptions(opts...)),
 	}
+	if tracked {
+		reg.readiness = &readiness.State{}
+	}
 	b.subs = append(b.subs, reg)
+	b.ready.Notify()
 	return reg
 }
 
@@ -1160,13 +1182,19 @@ func (b *Broker) unregisterSubscription(id uint64) {
 		return
 	}
 	b.subsMu.Lock()
-	defer b.subsMu.Unlock()
+	var revoked func()
 	for i, sub := range b.subs {
 		if sub.id == id {
+			revoked = sub.readiness.Invalidate()
 			b.subs = append(b.subs[:i], b.subs[i+1:]...)
-			return
+			break
 		}
 	}
+	b.subsMu.Unlock()
+	if revoked != nil {
+		revoked()
+	}
+	b.ready.Notify()
 }
 
 func (b *Broker) restoreTrackedSubscriptions() {
@@ -1296,6 +1324,8 @@ type consumerGroupHandler struct {
 	pendingMu  *sync.RWMutex
 	config     *core.Config
 	policy     core.HandlerErrorPolicy
+	onSetup    func(sarama.ConsumerGroupSession) error
+	onCleanup  func(sarama.ConsumerGroupSession) error
 }
 
 func (h *consumerGroupHandler) route(topic string) (subscriptionRoute, bool) {
@@ -1333,11 +1363,17 @@ func (h *consumerGroupHandler) emitSubscribeFailure(destination string, err erro
 	h.config.EmitEvent(context.Background(), event)
 }
 
-func (h *consumerGroupHandler) Setup(sarama.ConsumerGroupSession) error {
+func (h *consumerGroupHandler) Setup(session sarama.ConsumerGroupSession) error {
+	if h.onSetup != nil {
+		return h.onSetup(session)
+	}
 	return nil
 }
 
-func (h *consumerGroupHandler) Cleanup(sarama.ConsumerGroupSession) error {
+func (h *consumerGroupHandler) Cleanup(session sarama.ConsumerGroupSession) error {
+	if h.onCleanup != nil {
+		return h.onCleanup(session)
+	}
 	return nil
 }
 

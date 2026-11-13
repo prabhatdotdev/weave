@@ -98,6 +98,20 @@ Subscribe options:
 - `WithHandlerErrorRetry`
 - `WithHandlerErrorNoRetry`
 
+`core.ConsumerReadiness` is an optional capability implemented by both transports
+and `MockBroker`:
+
+```go
+type ConsumerReadiness interface {
+    IsReady() bool
+    WaitReady(context.Context) error
+}
+```
+
+Readiness covers all current business subscriptions and resets during recovery
+and Kafka session changes. See [consumer readiness](TRANSPORTS.md#common-lifecycle)
+for startup, cancellation, and zero-partition member semantics.
+
 `core.RetryHandler` adds bounded, context-aware retries around a handler.
 Cancellation and expired deadlines prevent new attempts, including when backoff
 is omitted or zero. A context already done before the first attempt returns its
@@ -176,6 +190,9 @@ dead-letter publishing if those wrappers are used.
 | `EventConnect` with operation `connect` | connection attempt | Inspect `Err` for the outcome; an already-connected no-op emits no event. |
 | `EventPublishSucceeded` | confirmed publish | Successful broker acknowledgment, not consumer processing. |
 | `EventSubscribeSucceeded` | registration | Successful setup, not a guarantee that a Kafka partition is already assigned. |
+| `EventConsumerAssigned` | none | An AMQP consumer was accepted, a Kafka subscription joined its group, or a mock subscription was registered. |
+| `EventConsumerRevoked` | none | That consumer assignment ended, was replaced, or was invalidated by loss or shutdown. |
+| `EventRebalanceStarted` / `EventRebalanceCompleted` | none | Kafka only: initial join/session teardown and completion of session setup. |
 | `EventHandlerStarted` / `EventHandlerFinished` | finish only | One callback invocation; a finish with `Err == nil` records successful handling. |
 | `EventCallStarted` / `EventCallFinished` | finish only | One registered RPC; a finish with `Err == nil` records successful request/reply. |
 
@@ -194,6 +211,18 @@ snapshots rather than an ordered stream of gauge updates. Use bounded metric
 labels; keep correlation IDs in logs or traces. The
 [observability example](../examples/observability) logs the metrics as JSON.
 
+Consumer assignment/revocation events identify their destination and carry a
+`consumer_generation` (`uint64`) scoped to the subscription registration. AMQP
+also supplies `consumer_tag`. Kafka supplies `consumer_group`, `member_id`,
+`generation_id` (`int32`), and `partitions` (`[]int32`), which can be empty.
+Kafka rebalance events target `"*"` and include the group; completed events and
+teardown-start events also include member/generation IDs and an `assignments`
+snapshot (`map[string][]int32`). Initial-start events have no prior assignment.
+These slice/map snapshots are owned by the callback. Event delivery can overlap
+and arrive out of order; use `IsReady()` for a current readiness snapshot.
+`MockBroker.SetEventHook` installs a collector for mock assignment/revocation;
+the mock does not simulate a Kafka coordinator or emit rebalance events.
+
 ## Errors
 
 Transport errors use concrete types such as `ErrNotConnected`, `ErrTimeout`,
@@ -204,7 +233,7 @@ caller-supplied correlation ID in flight.
 
 `ErrInvalidConfig` identifies invalid public inputs. Publish failures wrap their
 cause: AMQP mandatory returns match `ErrUnroutable`, and negative confirmations
-match `ErrPublishRejected`. Deadline errors match both `IsTimeout` and
+match `ErrPublishRejected`. Publish and RPC deadline errors match both `IsTimeout` and
 `context.DeadlineExceeded`; explicit cancellation matches `context.Canceled`.
 See [transport guarantees and deadlines](TRANSPORTS.md#deadlines-and-delivery-outcomes).
 

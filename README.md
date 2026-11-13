@@ -70,6 +70,10 @@ Both transports and `testkit.MockBroker` also implement the optional
 `core.Shutdowner` interface. `Shutdown(ctx)` drains admitted work before closing;
 see [graceful shutdown](docs/TRANSPORTS.md#common-lifecycle).
 
+They also implement `core.ConsumerReadiness`: `WaitReady(ctx)` waits for all
+active business consumers to finish setup, and `IsReady()` supports health
+checks through reconnects and Kafka rebalances.
+
 Use `codec.JSON` or `codec.Protobuf` when payload encoding should be shared:
 
 ```go

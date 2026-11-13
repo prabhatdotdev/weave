@@ -93,6 +93,12 @@ func RepeatedFailures(t *testing.T, f Fixture, service string) {
 		broker.start(t, w.ctx)
 		resume()
 		wait(t, w.ctx, 30*time.Second, "RPC recovery", func() bool { return w.call(time.Second) == nil })
+		readyCtx, cancel := context.WithTimeout(w.ctx, 30*time.Second)
+		if err := f.Broker.(core.ConsumerReadiness).WaitReady(readyCtx); err != nil {
+			cancel()
+			t.Fatalf("consumer readiness after recovery: %v", err)
+		}
+		cancel()
 		wait(t, w.ctx, 30*time.Second, "confirmed marker completion after recovery", func() bool { return !w.ledger.contains(marker) })
 		if w.failures.Load() == before {
 			t.Fatal("background traffic did not observe the broker outage")
@@ -228,6 +234,9 @@ func start(t *testing.T, f Fixture, timeout time.Duration, tolerateFailures bool
 		return f.Broker.Publish(handlerCtx, msg.ReplyTo, response, core.WithTimeout(2*time.Second))
 	}, core.WithWorkerCount(8), core.WithHandlerErrorRetry()); err != nil {
 		t.Fatal(err)
+	}
+	if err := f.Broker.(core.ConsumerReadiness).WaitReady(ctx); err != nil {
+		t.Fatalf("consumer setup failed: %v", err)
 	}
 	if err := w.call(15 * time.Second); err != nil {
 		t.Fatalf("warm-up RPC failed: %v", err)

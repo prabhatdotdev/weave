@@ -82,6 +82,51 @@ func Run(t *testing.T, newFixture func(*testing.T) Fixture) {
 		}
 		metadata(t, published[0], original)
 	})
+	run("consumer readiness", func(t *testing.T, ctx context.Context, h Fixture) {
+		ready, ok := h.Broker.(core.ConsumerReadiness)
+		if !ok {
+			t.Fatal("broker does not implement ConsumerReadiness")
+		}
+		if !ready.IsReady() {
+			t.Fatal("connected publisher-only broker is not ready")
+		}
+		if err := ready.WaitReady(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := ready.WaitReady(nil); !errors.Is(err, core.ErrInvalidConfig) {
+			t.Fatalf("nil wait context = %v", err)
+		}
+		canceled, cancel := context.WithCancel(ctx)
+		cancel()
+		if err := ready.WaitReady(canceled); !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled readiness wait = %v", err)
+		}
+		expired, stop := context.WithDeadline(ctx, time.Now().Add(-time.Second))
+		defer stop()
+		if err := ready.WaitReady(expired); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("expired readiness wait = %v", err)
+		}
+		subCtx, unsubscribe := context.WithCancel(ctx)
+		if err := h.Broker.Subscribe(subCtx, "contract", func(context.Context, *core.Message) error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+		if err := ready.WaitReady(ctx); err != nil {
+			t.Fatalf("consumer never became ready: %v", err)
+		}
+		unsubscribe()
+		if err := ready.WaitReady(ctx); err != nil || !ready.IsReady() {
+			t.Fatalf("canceled subscription prevented publisher readiness: %v", err)
+		}
+		if err := h.Broker.(core.Shutdowner).Shutdown(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if ready.IsReady() {
+			t.Fatal("closed broker reports ready")
+		}
+		if err := ready.WaitReady(ctx); !errors.Is(err, core.ErrClosed) {
+			t.Fatalf("closed readiness wait = %v", err)
+		}
+	})
 	run("RPC ownership and reply metadata", func(t *testing.T, ctx context.Context, h Fixture) {
 		response := sample()
 		response.Body, response.MessageID = []byte("reply body"), "reply-message"

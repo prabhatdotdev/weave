@@ -75,6 +75,9 @@ func run(ctx context.Context, backend string, logger *slog.Logger) error {
 	}, core.WithHandlerErrorRetry()); err != nil {
 		return err
 	}
+	if err := responder.(core.ConsumerReadiness).WaitReady(ctx); err != nil {
+		return err
+	}
 	response, err := client.Call(ctx, "weave.example.observability", core.NewTextMessage("observe me"), core.WithTimeout(10*time.Second), core.WithMandatory())
 	if err != nil {
 		return err

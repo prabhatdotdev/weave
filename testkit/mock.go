@@ -22,17 +22,20 @@ import (
 
 	"github.com/prabhatdotdev/weave/core"
 	"github.com/prabhatdotdev/weave/internal/lifecycle"
+	"github.com/prabhatdotdev/weave/internal/readiness"
 	"github.com/prabhatdotdev/weave/internal/validation"
 )
 
 // MockBroker is a mock implementation of core.MessageBroker for testing.
 // It can be used to test both client and server code.
 type MockBroker struct {
-	work lifecycle.Group
-	mu   sync.Mutex
+	work  lifecycle.Group
+	ready readiness.Signal
+	mu    sync.Mutex
 
 	connected     bool
 	closed        bool
+	eventHook     core.EventHook
 	published     []PublishedMessage
 	subscriptions map[string]mockSubscription
 	callResponses map[string]*core.Message
@@ -40,8 +43,9 @@ type MockBroker struct {
 }
 
 type mockSubscription struct {
-	ctx     context.Context
-	handler core.Handler
+	ctx       context.Context
+	handler   core.Handler
+	readiness *readiness.State
 }
 
 // PublishedMessage records a message that was published.
@@ -76,15 +80,18 @@ func (m *MockBroker) Connect(ctx context.Context) error {
 		return core.ErrClosed
 	}
 	m.connected = true
+	m.ready.Notify()
 	return nil
 }
 
 func (m *MockBroker) Close() error {
 	m.work.Close()
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.closed = true
 	m.connected = false
+	revoked := m.invalidateConsumersLocked()
+	m.mu.Unlock()
+	revoked()
 	return nil
 }
 
@@ -133,13 +140,26 @@ func (m *MockBroker) Subscribe(ctx context.Context, destination string, handler 
 	}
 	defer finish()
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	if !m.connected {
+		m.mu.Unlock()
 		return &core.ErrNotConnected{Backend: "mock"}
 	}
 
-	m.subscriptions[destination] = mockSubscription{ctx: ctx, handler: handler}
+	old := m.subscriptions[destination].readiness.Invalidate()
+	state := &readiness.State{}
+	m.subscriptions[destination] = mockSubscription{ctx: ctx, handler: handler, readiness: state}
+	assignment, previous := state.Assign(ctx, func(generation uint64) {
+		m.ready.Notify()
+		m.emitEvent(ctx, core.Event{Name: core.EventConsumerRevoked, Operation: "consume", Destination: destination, Fields: map[string]any{"consumer_generation": generation}})
+	})
+	m.mu.Unlock()
+	old()
+	previous()
+	m.ready.Notify()
+	if assignment != nil {
+		m.emitEvent(ctx, core.Event{Name: core.EventConsumerAssigned, Operation: "consume", Destination: destination, Fields: map[string]any{"consumer_generation": assignment.Generation}})
+	}
 	return nil
 }
 
@@ -325,7 +345,13 @@ var _ core.MessageBroker = (*MockBroker)(nil)
 
 // Shutdown rejects new operations and waits for simulated handlers to finish.
 func (m *MockBroker) Shutdown(ctx context.Context) error {
-	return m.work.Shutdown(ctx, nil, m.Close)
+	return m.work.Shutdown(ctx, func(context.Context) error {
+		m.mu.Lock()
+		revoked := m.invalidateConsumersLocked()
+		m.mu.Unlock()
+		revoked()
+		return nil
+	}, m.Close)
 }
 
 var _ core.Shutdowner = (*MockBroker)(nil)
