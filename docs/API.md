@@ -12,6 +12,9 @@ Canonical package documentation:
 
 `core.MessageBroker` composes connection, publish, call, and subscribe
 operations. `core.Message` carries the body plus broker-neutral metadata.
+AMQP, Kafka, and `testkit.MockBroker` also implement the optional
+`core.Shutdowner` interface, whose `Shutdown(ctx)` drains admitted work before
+closing. Existing `MessageBroker` implementations do not need a new method.
 
 ```go
 msg := core.NewMessage(body).
@@ -80,3 +83,6 @@ cause: AMQP mandatory returns match `ErrUnroutable`, and negative confirmations
 match `ErrPublishRejected`. Deadline errors match both `IsTimeout` and
 `context.DeadlineExceeded`; explicit cancellation matches `context.Canceled`.
 See [transport guarantees and deadlines](TRANSPORTS.md#deadlines-and-delivery-outcomes).
+
+`ErrShuttingDown` rejects new work during graceful shutdown. `ErrClosed`
+identifies operations on a closed broker.

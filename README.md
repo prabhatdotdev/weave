@@ -66,6 +66,10 @@ type MessageBroker interface {
 }
 ```
 
+Both transports and `testkit.MockBroker` also implement the optional
+`core.Shutdowner` interface. `Shutdown(ctx)` drains admitted work before closing;
+see [graceful shutdown](docs/TRANSPORTS.md#common-lifecycle).
+
 Use `codec.JSON` or `codec.Protobuf` when payload encoding should be shared:
 
 ```go

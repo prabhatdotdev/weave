@@ -40,6 +40,22 @@ func newConfirmedPublisher(channel confirmChannel) (*confirmedPublisher, error) 
 	return p, nil
 }
 
+// flush waits for receipts retained after a caller canceled its publish.
+func (p *confirmedPublisher) flush(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case p.gate <- struct{}{}:
+		<-p.gate
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.closed:
+		return &core.ErrConnectionLost{Backend: backendName}
+	}
+}
+
 func (p *confirmedPublisher) publish(ctx context.Context, exchange, key string, mandatory, immediate bool, message amqplib.Publishing) error {
 	if err := ctx.Err(); err != nil {
 		return err

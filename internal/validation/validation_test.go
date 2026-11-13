@@ -122,6 +122,41 @@ func TestPublicOperationsRejectInvalidInputs(t *testing.T) {
 	}
 }
 
+func TestOptionalShutdownLifecycle(t *testing.T) {
+	amqpBroker, err := amqp.NewBroker(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kafkaBroker, err := kafka.NewBroker(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, broker := range []core.MessageBroker{amqpBroker, kafkaBroker, testkit.NewMockBroker()} {
+		t.Run(broker.Backend(), func(t *testing.T) {
+			defer broker.Close()
+			drainer, ok := broker.(core.Shutdowner)
+			if !ok {
+				t.Fatal("broker does not implement optional Shutdowner")
+			}
+			if err := drainer.Shutdown(nil); !errors.Is(err, core.ErrInvalidConfig) {
+				t.Fatalf("Shutdown(nil) = %v", err)
+			}
+			if err := drainer.Shutdown(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if broker.IsConnected() {
+				t.Fatal("closed broker reports readiness")
+			}
+			if err := broker.Connect(context.Background()); !errors.Is(err, core.ErrClosed) {
+				t.Fatalf("Connect() after shutdown = %v", err)
+			}
+			if err := drainer.Shutdown(context.Background()); err != nil {
+				t.Fatalf("repeated shutdown = %v", err)
+			}
+		})
+	}
+}
+
 func TestConstructorsRejectInvalidConfiguration(t *testing.T) {
 	for _, scenario := range []struct {
 		name   string

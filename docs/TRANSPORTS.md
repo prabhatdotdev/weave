@@ -134,6 +134,40 @@ defer broker.Close()
 `IsConnected` reports readiness. `IsRecovering` distinguishes an active
 reconnect from a closed or never-connected broker.
 
+`Shutdown(ctx)` is available through the optional `core.Shutdowner` interface:
+
+```go
+shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+if drainer, ok := broker.(core.Shutdowner); ok {
+    return drainer.Shutdown(shutdownCtx)
+}
+return broker.Close()
+```
+
+Shutdown makes `IsConnected()` false and rejects new operations with
+`ErrShuttingDown`. Admitted handlers, publishes, and RPC calls drain before
+clients close. Handlers can finish publishing replies using the context passed
+to them; a saved context cannot admit more work after its handler returns.
+RabbitMQ business consumers are canceled at the broker, and buffered manually
+acknowledged deliveries without an admitted handler are requeued. Reply consumers
+remain available for admitted RPC calls. Kafka marks completed records before
+closing its consumers; records without an admitted handler remain uncommitted.
+
+If the shutdown context expires or is canceled, Shutdown returns its context
+error promptly, cancels active handler contexts, and starts closing remaining
+clients. Client cleanup can continue in the background; Go cannot stop a handler
+that ignores its context. Expiry of any concurrent shutdown call forces closure
+for the broker. Repeated shutdown calls share one drain and close operation.
+After closure, new operations return `ErrClosed`. `Shutdown(nil)` returns
+`ErrInvalidConfig` without starting shutdown.
+
+Call Shutdown from the application's owner, outside handlers and event hooks.
+Keep subscription contexts alive during draining and use a fresh shutdown
+context; canceling a subscription context first interrupts its handlers.
+`Close()` remains the immediate-close path. Automatic acknowledgments cannot
+restore deliveries that were already acknowledged before handling.
+
 `Connect(ctx)` observes cancellation during connection setup, concurrent
 connection waits, and retry backoff. Closing the broker interrupts setup and
 reconnect waits. Once connected, cancelling the setup context does not close

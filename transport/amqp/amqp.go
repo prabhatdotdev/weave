@@ -29,6 +29,7 @@ import (
 
 	"github.com/prabhatdotdev/weave/core"
 	"github.com/prabhatdotdev/weave/internal/connection"
+	"github.com/prabhatdotdev/weave/internal/lifecycle"
 	"github.com/prabhatdotdev/weave/internal/validation"
 )
 
@@ -46,6 +47,7 @@ type amqpChannel interface {
 	QueueBind(string, string, string, bool, amqplib.Table) error
 	Qos(int, int, bool) error
 	Consume(string, string, bool, bool, bool, bool, amqplib.Table) (<-chan amqplib.Delivery, error)
+	Cancel(string, bool) error
 	Close() error
 }
 
@@ -99,6 +101,12 @@ func (a *amqpChannelAdapter) Consume(queue, consumer string, autoAck, exclusive,
 	return a.channel.Consume(queue, consumer, autoAck, exclusive, noLocal, noWait, args)
 }
 
+func (a *amqpChannelAdapter) Cancel(consumer string, noWait bool) error {
+	return a.channel.Cancel(consumer, noWait)
+}
+
+func (a *amqpChannelAdapter) Flush(ctx context.Context) error { return a.publisher.flush(ctx) }
+
 func (a *amqpChannelAdapter) Close() error {
 	return a.channel.Close()
 }
@@ -125,6 +133,7 @@ func (p *pendingCall) complete(response *amqplib.Delivery) {
 
 // Broker implements the core.MessageBroker interface for AMQP/RabbitMQ.
 type Broker struct {
+	work       lifecycle.Group
 	config     *core.Config
 	amqpConfig *core.AMQPConfig
 	conn       amqpConnection
@@ -200,6 +209,11 @@ func (b *Broker) Connect(ctx context.Context) error {
 	if err := validation.Context(ctx); err != nil {
 		return err
 	}
+	ctx, finish, err := b.work.Continue(ctx)
+	if err != nil {
+		return err
+	}
+	defer finish()
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -413,7 +427,7 @@ func (b *Broker) reconnectLoop() {
 	attempt := 0
 	for {
 		b.closeMu.RLock()
-		if b.closed || b.connected {
+		if b.closed || b.connected || b.work.IsStopping() {
 			b.closeMu.RUnlock()
 			return
 		}
@@ -433,6 +447,9 @@ func (b *Broker) reconnectLoop() {
 		err := b.Connect(context.Background())
 		if err == nil {
 			if restoreErr := b.restoreSubscriptions(); restoreErr != nil {
+				if b.work.IsStopping() {
+					return
+				}
 				b.emitEvent(context.Background(), core.Event{
 					Level:       core.EventLevelError,
 					Name:        core.EventSubscribeFailed,
@@ -483,6 +500,8 @@ func (b *Broker) reconnectLoop() {
 		select {
 		case <-time.After(delay):
 		case <-b.closeChan:
+			return
+		case <-b.work.Stopping():
 			return
 		}
 	}
@@ -538,7 +557,7 @@ func (b *Broker) restoreSubscriptions() error {
 func (b *Broker) IsConnected() bool {
 	b.closeMu.RLock()
 	defer b.closeMu.RUnlock()
-	return b.connected && !b.recovering && !b.closed
+	return b.connected && !b.recovering && !b.closed && !b.work.IsStopping()
 }
 
 // IsRecovering returns true if the broker is actively recovering from a connection loss.
@@ -548,8 +567,25 @@ func (b *Broker) IsRecovering() bool {
 	return b.recovering
 }
 
-// Close gracefully shuts down the broker connection.
+// Shutdown drains admitted work and cancels business consumers at RabbitMQ.
+// A deadline forces closure; handlers must observe their contexts to stop.
+func (b *Broker) Shutdown(ctx context.Context) error {
+	return b.work.Shutdown(ctx, func(ctx context.Context) error {
+		b.closeMu.RLock()
+		channel := b.channel
+		b.closeMu.RUnlock()
+		if publisher, ok := channel.(interface{ Flush(context.Context) error }); ok {
+			return publisher.Flush(ctx)
+		}
+		return nil
+	}, b.Close)
+}
+
+var _ core.Shutdowner = (*Broker)(nil)
+
+// Close closes the connection and interrupts handlers without draining work.
 func (b *Broker) Close() error {
+	b.work.Close()
 	var err error
 	closed := false
 	b.closeOnce.Do(func() {
@@ -598,6 +634,11 @@ func (b *Broker) Publish(ctx context.Context, destination string, msg *core.Mess
 	if err := validatePublishing(destination, msg, options); err != nil {
 		return err
 	}
+	ctx, finish, err := b.work.Continue(ctx)
+	if err != nil {
+		return err
+	}
+	defer finish()
 	if options.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, options.Timeout)
@@ -694,6 +735,11 @@ func (b *Broker) subscribe(ctx context.Context, destination string, handler core
 	if options.AutoAck && options.HandlerErrorPolicy == core.HandlerErrorRetry {
 		return fmt.Errorf("%w: automatic acknowledgement cannot be combined with handler retries", core.ErrInvalidConfig)
 	}
+	setupCtx, finish, err := b.work.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer finish()
 
 	channel, err := b.currentChannel(allowRecovering)
 	if err != nil {
@@ -754,7 +800,11 @@ func (b *Broker) subscribe(ctx context.Context, destination string, handler core
 		return fmt.Errorf("failed to set QoS: %w", err)
 	}
 
-	msgs, err := channel.Consume(q.Name, options.ConsumerTag, options.AutoAck, options.Exclusive, false, false, nil)
+	tag := options.ConsumerTag
+	if tag == "" {
+		tag = "weave-" + rand.Text()
+	}
+	msgs, err := channel.Consume(q.Name, tag, options.AutoAck, options.Exclusive, false, false, nil)
 	if err != nil {
 		b.emitEvent(ctx, core.Event{
 			Level:       core.EventLevelError,
@@ -765,6 +815,11 @@ func (b *Broker) subscribe(ctx context.Context, destination string, handler core
 		})
 		return &core.ErrSubscribeFailed{Backend: backendName, Destination: destination, Cause: err}
 	}
+	_, finishConsumer, err := b.work.Continue(context.WithoutCancel(setupCtx))
+	if err != nil {
+		go func() { _ = channel.Cancel(tag, false) }()
+		return err
+	}
 
 	if track {
 		b.subsMu.Lock()
@@ -772,36 +827,75 @@ func (b *Broker) subscribe(ctx context.Context, destination string, handler core
 		b.subsMu.Unlock()
 	}
 
+	var workers sync.WaitGroup
+	cancelDone := make(chan struct{})
 	consume := func(concurrent bool) {
+		defer workers.Done()
 		for {
 			select {
 			case <-b.closeChan:
-				return
-			case <-ctx.Done():
 				return
 			case msg, ok := <-msgs:
 				if !ok {
 					return
 				}
-				if ctx.Err() != nil {
-					return
+				handlerCtx, finishHandler, err := b.work.Handler(ctx)
+				if err != nil {
+					select {
+					case <-cancelDone:
+					case <-b.closeChan:
+						return
+					}
+					if !options.AutoAck {
+						if err := msg.Nack(false, true); err != nil {
+							b.emitEvent(ctx, core.Event{Level: core.EventLevelError, Name: core.EventSubscribeFailed, Operation: "requeue", Destination: destination, Err: err})
+						}
+					}
+					continue
+				}
+				handle := func() {
+					defer finishHandler()
+					b.handleMessage(handlerCtx, msg, handler, options.AutoAck, options.HandlerErrorPolicy)
 				}
 				if concurrent {
-					go b.handleMessage(ctx, msg, handler, options.AutoAck, options.HandlerErrorPolicy)
+					go handle()
 				} else {
-					b.handleMessage(ctx, msg, handler, options.AutoAck, options.HandlerErrorPolicy)
+					handle()
 				}
 			}
 		}
 	}
 
 	if options.WorkerCount == 0 {
+		workers.Add(1)
 		go consume(true)
 	} else {
+		workers.Add(options.WorkerCount)
 		for range options.WorkerCount {
 			go consume(false)
 		}
 	}
+	consumerDone := make(chan struct{})
+	go func() { workers.Wait(); close(consumerDone) }()
+	go func() {
+		defer finishConsumer()
+		select {
+		case <-ctx.Done():
+		case <-b.work.Stopping():
+		case <-consumerDone:
+			return
+		case <-b.closeChan:
+			return
+		}
+		if err := channel.Cancel(tag, false); err != nil && !errors.Is(err, amqplib.ErrClosed) {
+			b.emitEvent(ctx, core.Event{Level: core.EventLevelError, Name: core.EventSubscribeFailed, Operation: "cancel", Destination: destination, Err: err})
+		}
+		close(cancelDone)
+		select {
+		case <-consumerDone:
+		case <-b.closeChan:
+		}
+	}()
 
 	return nil
 }
@@ -816,7 +910,7 @@ func (b *Broker) handleMessage(ctx context.Context, msg amqplib.Delivery, handle
 				Err:       fmt.Errorf("panic: %v", r),
 			})
 			if !autoAck {
-				msg.Nack(false, false)
+				msg.Nack(false, b.work.IsClosed() || ctx.Err() != nil)
 			}
 		}
 	}()
@@ -844,7 +938,7 @@ func (b *Broker) handleMessage(ctx context.Context, msg amqplib.Delivery, handle
 	if !autoAck {
 		if err != nil {
 			// Interrupted work is unfinished even when ordinary handler errors are not retried.
-			interrupted := ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+			interrupted := b.work.IsClosed() || ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 			msg.Nack(false, interrupted || policy == core.HandlerErrorRetry)
 		} else {
 			msg.Ack(false)
@@ -861,6 +955,11 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 	if err := validatePublishing(destination, msg, options); err != nil {
 		return nil, err
 	}
+	ctx, finish, err := b.work.Continue(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
 	if options.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, options.Timeout)

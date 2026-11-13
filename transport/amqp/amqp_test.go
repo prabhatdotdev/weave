@@ -47,6 +47,8 @@ type fakeAMQPChannel struct {
 	consumers       []string
 	published       []amqplib.Publishing
 	consumerStreams map[string]chan amqplib.Delivery
+	consumerTags    map[string]chan amqplib.Delivery
+	canceled        []string
 	prefetch        int
 	publishErr      error
 	closeErr        error
@@ -54,7 +56,7 @@ type fakeAMQPChannel struct {
 }
 
 func newFakeAMQPChannel() *fakeAMQPChannel {
-	return &fakeAMQPChannel{consumerStreams: make(map[string]chan amqplib.Delivery)}
+	return &fakeAMQPChannel{consumerStreams: make(map[string]chan amqplib.Delivery), consumerTags: make(map[string]chan amqplib.Delivery)}
 }
 
 func (c *fakeAMQPChannel) PublishWithContext(_ context.Context, _ string, _ string, _ bool, _ bool, msg amqplib.Publishing) error {
@@ -103,10 +105,36 @@ func (c *fakeAMQPChannel) Consume(queue, consumer string, autoAck, exclusive, no
 		stream = make(chan amqplib.Delivery)
 		c.consumerStreams[queue] = stream
 	}
+	for _, existing := range c.consumerTags {
+		if existing == stream {
+			stream = make(chan amqplib.Delivery)
+			c.consumerStreams[queue] = stream
+			break
+		}
+	}
+	c.consumerTags[consumer] = stream
 	return stream, nil
 }
 
+func (c *fakeAMQPChannel) Cancel(consumer string, _ bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.canceled = append(c.canceled, consumer)
+	if stream, ok := c.consumerTags[consumer]; ok {
+		delete(c.consumerTags, consumer)
+		for queue, current := range c.consumerStreams {
+			if current == stream {
+				delete(c.consumerStreams, queue)
+			}
+		}
+		close(stream)
+	}
+	return nil
+}
+
 func (c *fakeAMQPChannel) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.closed = true
 	return c.closeErr
 }

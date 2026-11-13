@@ -135,6 +135,7 @@ func (e *ErrConnectionFailed) Unwrap() error {
 // Sentinel errors for common conditions.
 var (
 	ErrClosed                 = errors.New("broker is closed")
+	ErrShuttingDown           = errors.New("broker is shutting down")
 	ErrNoReplyTo              = errors.New("no reply-to destination specified")
 	ErrAlreadyConnected       = errors.New("broker is already connected")
 	ErrInvalidConfig          = errors.New("invalid configuration")

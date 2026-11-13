@@ -21,13 +21,15 @@ import (
 	"testing"
 
 	"github.com/prabhatdotdev/weave/core"
+	"github.com/prabhatdotdev/weave/internal/lifecycle"
 	"github.com/prabhatdotdev/weave/internal/validation"
 )
 
 // MockBroker is a mock implementation of core.MessageBroker for testing.
 // It can be used to test both client and server code.
 type MockBroker struct {
-	mu sync.Mutex
+	work lifecycle.Group
+	mu   sync.Mutex
 
 	connected     bool
 	closed        bool
@@ -58,6 +60,11 @@ func (m *MockBroker) Connect(ctx context.Context) error {
 	if err := validation.Context(ctx); err != nil {
 		return err
 	}
+	_, finish, err := m.work.Continue(ctx)
+	if err != nil {
+		return err
+	}
+	defer finish()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
@@ -68,6 +75,7 @@ func (m *MockBroker) Connect(ctx context.Context) error {
 }
 
 func (m *MockBroker) Close() error {
+	m.work.Close()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.closed = true
@@ -78,7 +86,7 @@ func (m *MockBroker) Close() error {
 func (m *MockBroker) IsConnected() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.connected && !m.closed
+	return m.connected && !m.closed && !m.work.IsStopping()
 }
 
 func (m *MockBroker) IsRecovering() bool {
@@ -91,6 +99,11 @@ func (m *MockBroker) Publish(ctx context.Context, destination string, msg *core.
 	if _, err := validation.Publish(ctx, destination, msg, opts...); err != nil {
 		return validation.ContextError(err, "Publish", "context deadline")
 	}
+	_, finish, err := m.work.Continue(ctx)
+	if err != nil {
+		return err
+	}
+	defer finish()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -109,6 +122,11 @@ func (m *MockBroker) Subscribe(ctx context.Context, destination string, handler 
 	if _, err := validation.Subscribe(ctx, destination, handler, opts...); err != nil {
 		return err
 	}
+	_, finish, err := m.work.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer finish()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -124,6 +142,11 @@ func (m *MockBroker) Call(ctx context.Context, destination string, msg *core.Mes
 	if _, err := validation.Publish(ctx, destination, msg, opts...); err != nil {
 		return nil, validation.ContextError(err, "Call", "context deadline")
 	}
+	_, finish, err := m.work.Continue(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -228,6 +251,11 @@ func (m *MockBroker) SimulateMessage(ctx context.Context, destination string, ms
 	if _, err := validation.Publish(ctx, destination, msg); err != nil {
 		return err
 	}
+	ctx, finish, err := m.work.Handler(ctx)
+	if err != nil {
+		return err
+	}
+	defer finish()
 	m.mu.Lock()
 	handler, ok := m.subscriptions[destination]
 	m.mu.Unlock()
@@ -269,3 +297,10 @@ func (m *MockBroker) HasSubscription(destination string) bool {
 
 // Verify that MockBroker implements core.MessageBroker.
 var _ core.MessageBroker = (*MockBroker)(nil)
+
+// Shutdown rejects new operations and waits for simulated handlers to finish.
+func (m *MockBroker) Shutdown(ctx context.Context) error {
+	return m.work.Shutdown(ctx, nil, m.Close)
+}
+
+var _ core.Shutdowner = (*MockBroker)(nil)

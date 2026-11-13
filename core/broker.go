@@ -22,7 +22,7 @@ type Connector interface {
 	// Connect establishes a connection to the message broker.
 	Connect(ctx context.Context) error
 
-	// Close gracefully closes the connection to the broker.
+	// Close closes the broker without waiting for active work to drain.
 	Close() error
 
 	// IsConnected returns true if the broker connection is active.
@@ -62,6 +62,14 @@ type MessageBroker interface {
 	Publisher
 	Caller
 	Subscriber
+}
+
+// Shutdowner is an optional capability implemented by brokers that can drain
+// active work before closing. It does not change the MessageBroker interface.
+type Shutdowner interface {
+	// Shutdown rejects new work, drains admitted work, and closes the broker.
+	// Expiry of ctx interrupts handlers and starts closing remaining resources.
+	Shutdown(ctx context.Context) error
 }
 
 // Handler is a function that processes incoming messages.

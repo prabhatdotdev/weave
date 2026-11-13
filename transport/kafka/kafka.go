@@ -30,6 +30,7 @@ import (
 
 	"github.com/prabhatdotdev/weave/core"
 	"github.com/prabhatdotdev/weave/internal/connection"
+	"github.com/prabhatdotdev/weave/internal/lifecycle"
 	"github.com/prabhatdotdev/weave/internal/validation"
 )
 
@@ -98,6 +99,7 @@ func (p *pendingCall) complete(response *core.Message) {
 
 // Broker implements the core.MessageBroker interface for Apache Kafka.
 type Broker struct {
+	work        lifecycle.Group
 	config      *core.Config
 	kafkaConfig *core.KafkaConfig
 
@@ -190,6 +192,11 @@ func (b *Broker) Connect(ctx context.Context) error {
 	if err := validation.Context(ctx); err != nil {
 		return err
 	}
+	ctx, finish, err := b.work.Continue(ctx)
+	if err != nil {
+		return err
+	}
+	defer finish()
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -397,7 +404,7 @@ func (b *Broker) buildSaramaConfig() *sarama.Config {
 func (b *Broker) IsConnected() bool {
 	b.closeMu.RLock()
 	defer b.closeMu.RUnlock()
-	return b.connected && !b.recovering && !b.closed
+	return b.connected && !b.recovering && !b.closed && !b.work.IsStopping()
 }
 
 // IsRecovering returns true if the broker is actively recovering from a connection loss.
@@ -407,8 +414,17 @@ func (b *Broker) IsRecovering() bool {
 	return b.recovering
 }
 
-// Close gracefully shuts down the Kafka connections.
+// Shutdown drains admitted operations and handlers before closing the clients.
+// A deadline interrupts handlers and bounds the caller's wait for client closure.
+func (b *Broker) Shutdown(ctx context.Context) error {
+	return b.work.Shutdown(ctx, nil, b.Close)
+}
+
+var _ core.Shutdowner = (*Broker)(nil)
+
+// Close closes clients and interrupts handlers without draining work.
 func (b *Broker) Close() error {
+	b.work.Close()
 	var err error
 	closed := false
 	b.closeOnce.Do(func() {
@@ -446,6 +462,11 @@ func (b *Broker) Publish(ctx context.Context, destination string, msg *core.Mess
 	if err := validation.KafkaTopic(destination); err != nil {
 		return err
 	}
+	ctx, finish, err := b.work.Continue(ctx)
+	if err != nil {
+		return err
+	}
+	defer finish()
 	if options.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, options.Timeout)
@@ -548,6 +569,16 @@ func (b *Broker) subscribeWithSetup(setupCtx, ctx context.Context, destination s
 	if err := validation.KafkaTopic(destination); err != nil {
 		return err
 	}
+	var finish func()
+	if track {
+		setupCtx, finish, err = b.work.Begin(setupCtx)
+	} else {
+		setupCtx, finish, err = b.work.Continue(setupCtx)
+	}
+	if err != nil {
+		return err
+	}
+	defer finish()
 
 	if err := b.ensureConnected(setupCtx); err != nil {
 		return err
@@ -557,13 +588,17 @@ func (b *Broker) subscribeWithSetup(setupCtx, ctx context.Context, destination s
 		return err
 	}
 	reg := b.registerSubscription(ctx, destination, handler, opts, track)
-	b.restartSubscriptionRunner()
+	if !b.work.IsStopping() || !track {
+		b.restartSubscriptionRunner()
+	}
 
 	go func() {
 		select {
 		case <-ctx.Done():
 			b.unregisterSubscription(reg.id)
-			b.restartSubscriptionRunner()
+			if !b.work.IsStopping() {
+				b.restartSubscriptionRunner()
+			}
 		case <-b.closeChan:
 		}
 	}()
@@ -691,6 +726,9 @@ func (b *Broker) runSubscriptionConsumer(changed <-chan struct{}) {
 		}
 
 		if err := b.ensureConnected(context.Background()); err != nil {
+			if b.work.IsStopping() {
+				return
+			}
 			b.emitEvent(context.Background(), core.Event{
 				Level:       core.EventLevelWarn,
 				Name:        core.EventConnect,
@@ -719,7 +757,7 @@ func (b *Broker) runSubscriptionConsumer(changed <-chan struct{}) {
 					return
 				}
 				b.watchConsumerErrors(consumeCtx, "*", consumer)
-				handler := &consumerGroupHandler{routes: routes, closeChan: b.closeChan, pending: b.pending, pendingMu: &b.pendingMu, config: b.config}
+				handler := &consumerGroupHandler{routes: routes, closeChan: b.closeChan, pending: b.pending, pendingMu: &b.pendingMu, config: b.config, work: &b.work}
 				topics := make([]string, 0, len(routes))
 				for topic := range routes {
 					topics = append(topics, topic)
@@ -812,6 +850,11 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 	if err := validation.KafkaTopic(destination); err != nil {
 		return nil, err
 	}
+	ctx, finish, err := b.work.Continue(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
 	if options.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, options.Timeout)
@@ -1196,6 +1239,7 @@ func (b *Broker) watchConsumerErrors(ctx context.Context, destination string, co
 }
 
 type consumerGroupHandler struct {
+	work      *lifecycle.Group
 	handler   core.Handler
 	routes    map[string]subscriptionRoute
 	closeChan chan struct{}
@@ -1307,26 +1351,56 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 					return nil
 				}
 			}
+			handlerCtx, release := mergeHandlerContexts(session.Context(), route.ctx)
+			var finishHandler func()
+			if h.work != nil {
+				var err error
+				handlerCtx, finishHandler, err = h.work.Handler(handlerCtx)
+				if err != nil {
+					release()
+					if route.workers != nil {
+						<-route.workers
+					}
+					if h.work.IsStopping() {
+						select {
+						case <-session.Context().Done():
+						case <-h.closeChan:
+						}
+					}
+					return nil
+				}
+			}
+			interrupted := false
 			err := func() error {
 				if route.workers != nil {
 					defer func() { <-route.workers }()
 				}
-				handlerCtx, release := mergeHandlerContexts(session.Context(), route.ctx)
 				defer release()
-				return callSubscriptionHandler(handlerCtx, route.handler, msg)
+				err := callSubscriptionHandler(handlerCtx, route.handler, msg)
+				interrupted = handlerCtx.Err() != nil
+				return err
 			}()
 			if err != nil {
 				// Interrupted work must remain uncommitted even under the no-retry policy.
-				if session.Context().Err() != nil || route.ctx.Err() != nil {
+				if interrupted || session.Context().Err() != nil || route.ctx.Err() != nil || h.work != nil && h.work.IsClosed() {
+					if finishHandler != nil {
+						finishHandler()
+					}
 					return err
 				}
 				h.emitSubscribeFailure(kafkaMsg.Topic, err)
 				if route.policy == core.HandlerErrorRetry {
+					if finishHandler != nil {
+						finishHandler()
+					}
 					return err
 				}
 			}
 
 			session.MarkMessage(kafkaMsg, "")
+			if finishHandler != nil {
+				finishHandler()
+			}
 		}
 	}
 }
