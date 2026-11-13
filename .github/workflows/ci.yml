@@ -85,6 +85,19 @@ jobs:
           docker compose -f examples/amqp-kafka/compose.yaml up -d --wait rabbitmq
           go test -race ./transport/amqp -run 'WithLiveRabbitMQ$' -count=1
 
+      - name: Run sustained load and broker failure tests
+        timeout-minutes: 15
+        env:
+          WEAVE_STRESS_DURATION: 30s
+          WEAVE_STRESS_CYCLES: "3"
+        run: ./scripts/test_stress.sh
+
+      - name: Benchmark confirmed AMQP publishing
+        env:
+          WEAVE_AMQP_BENCH_TIME: 1s
+          WEAVE_AMQP_BENCH_COUNT: "1"
+        run: ./scripts/test_stress.sh bench
+
       - name: Run Kafka SCRAM integration tests
         env:
           WEAVE_KAFKA_SCRAM_E2E: "1"

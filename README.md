@@ -102,4 +102,7 @@ go test -race ./...
 AMQP and Kafka recovery paths have focused tests under their transport
 packages. Runnable examples live in [`examples`](examples).
 
+See [load tests and throughput measurements](docs/PERFORMANCE.md) for sustained
+traffic, repeated broker crashes, and confirmed AMQP publishing benchmarks.
+
 Apache-2.0 licensed.

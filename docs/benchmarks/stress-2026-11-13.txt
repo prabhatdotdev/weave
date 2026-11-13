@@ -1,0 +1,22 @@
+=== RUN   TestSustainedLoadWithLiveRabbitMQ
+    stress_integration_test.go:97: elapsed=1m0.018s publishers=4 callers=4 confirmed=23171 rpc_successes=11585 errors=0 pending_deliveries=0
+--- PASS: TestSustainedLoadWithLiveRabbitMQ (60.05s)
+=== RUN   TestRepeatedBrokerFailuresWithLiveRabbitMQ
+    stress_integration_test.go:101: cycle=1 recovered=5.842s confirmed_marker_delivered=true failures=4574
+    stress_integration_test.go:101: cycle=2 recovered=5.931s confirmed_marker_delivered=true failures=4520
+    stress_integration_test.go:101: cycle=3 recovered=5.915s confirmed_marker_delivered=true failures=4568
+    stress_integration_test.go:101: elapsed=18.247s publishers=4 callers=4 confirmed=108 rpc_successes=47 errors=13662 pending_deliveries=0
+--- PASS: TestRepeatedBrokerFailuresWithLiveRabbitMQ (18.31s)
+PASS
+ok  	github.com/prabhatdotdev/weave/transport/amqp	79.824s
+=== RUN   TestSustainedLoadWithLiveKafka
+    stress_integration_test.go:28: elapsed=1m0.508s publishers=4 callers=4 confirmed=255082 rpc_successes=58364 errors=0 pending_deliveries=0
+--- PASS: TestSustainedLoadWithLiveKafka (63.43s)
+=== RUN   TestRepeatedBrokerFailuresWithLiveKafka
+    stress_integration_test.go:32: cycle=1 recovered=25.068s confirmed_marker_delivered=true failures=84
+    stress_integration_test.go:32: cycle=2 recovered=27.481s confirmed_marker_delivered=true failures=88
+    stress_integration_test.go:32: cycle=3 recovered=28.535s confirmed_marker_delivered=true failures=84
+    stress_integration_test.go:32: elapsed=1m24.538s publishers=4 callers=4 confirmed=214200 rpc_successes=364 errors=256 pending_deliveries=0
+--- PASS: TestRepeatedBrokerFailuresWithLiveKafka (84.80s)
+PASS
+ok  	github.com/prabhatdotdev/weave/transport/kafka	149.676s

@@ -1,0 +1,21 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/prabhatdotdev/weave/transport/amqp
+cpu: Apple M4
+BenchmarkConfirmedPublishWithLiveRabbitMQ/bytes=1024/concurrency=1/connections=1-4         	    8175	    383714 ns/op	   2.67 MB/s	      2606 msg/s	    3736 B/op	      59 allocs/op
+BenchmarkConfirmedPublishWithLiveRabbitMQ/bytes=1024/concurrency=1/connections=1-4         	   10000	    381567 ns/op	   2.68 MB/s	      2621 msg/s	    3736 B/op	      59 allocs/op
+BenchmarkConfirmedPublishWithLiveRabbitMQ/bytes=1024/concurrency=1/connections=1-4         	    9668	    384266 ns/op	   2.66 MB/s	      2602 msg/s	    3736 B/op	      59 allocs/op
+BenchmarkConfirmedPublishWithLiveRabbitMQ/bytes=1024/concurrency=8/connections=1-4         	   10000	    391100 ns/op	   2.62 MB/s	      2557 msg/s	    3624 B/op	      58 allocs/op
+BenchmarkConfirmedPublishWithLiveRabbitMQ/bytes=1024/concurrency=8/connections=1-4         	   10000	    385992 ns/op	   2.65 MB/s	      2591 msg/s	    3624 B/op	      58 allocs/op
+BenchmarkConfirmedPublishWithLiveRabbitMQ/bytes=1024/concurrency=8/connections=1-4         	   10000	    387162 ns/op	   2.64 MB/s	      2583 msg/s	    3624 B/op	      58 allocs/op
+BenchmarkConfirmedPublishWithLiveRabbitMQ/bytes=1024/concurrency=32/connections=1-4        	    9757	    382894 ns/op	   2.67 MB/s	      2612 msg/s	    3624 B/op	      58 allocs/op
+BenchmarkConfirmedPublishWithLiveRabbitMQ/bytes=1024/concurrency=32/connections=1-4        	   10000	    386029 ns/op	   2.65 MB/s	      2590 msg/s	    3624 B/op	      58 allocs/op
+BenchmarkConfirmedPublishWithLiveRabbitMQ/bytes=1024/concurrency=32/connections=1-4        	   10000	    383017 ns/op	   2.67 MB/s	      2611 msg/s	    3624 B/op	      58 allocs/op
+BenchmarkConfirmedPublishWithLiveRabbitMQ/bytes=1024/concurrency=32/connections=4-4        	   27834	    138057 ns/op	   7.42 MB/s	      7243 msg/s	    3623 B/op	      58 allocs/op
+BenchmarkConfirmedPublishWithLiveRabbitMQ/bytes=1024/concurrency=32/connections=4-4        	   25784	    134429 ns/op	   7.62 MB/s	      7439 msg/s	    3623 B/op	      58 allocs/op
+BenchmarkConfirmedPublishWithLiveRabbitMQ/bytes=1024/concurrency=32/connections=4-4        	   26402	    131968 ns/op	   7.76 MB/s	      7578 msg/s	    3623 B/op	      58 allocs/op
+BenchmarkConfirmedPublishWithLiveRabbitMQ/bytes=65536/concurrency=8/connections=1-4        	    7410	    536167 ns/op	 122.23 MB/s	      1865 msg/s	   68137 B/op	      58 allocs/op
+BenchmarkConfirmedPublishWithLiveRabbitMQ/bytes=65536/concurrency=8/connections=1-4        	    6830	    537399 ns/op	 121.95 MB/s	      1861 msg/s	   68137 B/op	      58 allocs/op
+BenchmarkConfirmedPublishWithLiveRabbitMQ/bytes=65536/concurrency=8/connections=1-4        	    6691	    524567 ns/op	 124.93 MB/s	      1906 msg/s	   68137 B/op	      58 allocs/op
+PASS
+ok  	github.com/prabhatdotdev/weave/transport/amqp	66.383s
