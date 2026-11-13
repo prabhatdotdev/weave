@@ -97,12 +97,20 @@ func RetryAttempt(ctx context.Context) int {
 
 // RetryHandler wraps a handler with bounded in-process retries. Use it when you
 // want consistent application-level retry semantics across transports.
+// Cancellation prevents new attempts and preserves the last handler error if
+// an attempt already failed.
 func RetryHandler(handler Handler, policy RetryPolicy) Handler {
 	normalized := normalizeRetryPolicy(policy)
 
 	return func(ctx context.Context, msg *Message) error {
 		var lastErr error
 		for attempt := 1; attempt <= normalized.MaxAttempts; attempt++ {
+			if err := ctx.Err(); err != nil {
+				if lastErr != nil {
+					return lastErr
+				}
+				return err
+			}
 			attemptCtx := context.WithValue(ctx, retryAttemptKey{}, attempt)
 			lastErr = handler(attemptCtx, msg)
 			if lastErr == nil {
@@ -137,7 +145,7 @@ func normalizeRetryPolicy(policy RetryPolicy) RetryPolicy {
 
 func sleepWithContext(ctx context.Context, delay time.Duration) error {
 	if delay <= 0 {
-		return nil
+		return ctx.Err()
 	}
 	timer := time.NewTimer(delay)
 	defer timer.Stop()

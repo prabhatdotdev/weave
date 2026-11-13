@@ -44,6 +44,10 @@ Subscribe options:
 - `WithHandlerErrorNoRetry`
 
 `core.RetryHandler` adds bounded, context-aware retries around a handler.
+Cancellation and expired deadlines prevent new attempts, including when backoff
+is omitted or zero. A context already done before the first attempt returns its
+context error without calling the handler. Interruption after a failed attempt
+preserves the last handler error.
 
 ## Codecs
 

@@ -64,14 +64,82 @@ func TestRetryHandler(t *testing.T) {
 }
 
 func TestRetryHandlerStopsWhenContextIsCancelled(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	handler := RetryHandler(func(_ context.Context, _ *Message) error {
-		cancel()
-		return errors.New("retry")
-	}, RetryPolicy{MaxAttempts: 3, Backoff: FixedBackoff(time.Second)})
+	for _, input := range []struct {
+		name    string
+		backoff BackoffStrategy
+	}{
+		{"omitted backoff", nil},
+		{"zero backoff", FixedBackoff(0)},
+		{"negative backoff", func(int) time.Duration { return -time.Second }},
+		{"positive backoff", FixedBackoff(time.Hour)},
+	} {
+		t.Run(input.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			attempts := 0
+			failure := errors.New("unfinished work")
+			handler := RetryHandler(func(context.Context, *Message) error {
+				attempts++
+				cancel()
+				return failure
+			}, RetryPolicy{MaxAttempts: 3, Backoff: input.backoff})
+			if err := handler(ctx, NewTextMessage("work")); !errors.Is(err, failure) {
+				t.Fatalf("retry error = %v, want last handler error", err)
+			}
+			if attempts != 1 {
+				t.Fatalf("handler attempts = %d, want 1 after cancellation", attempts)
+			}
+		})
+	}
+}
 
-	if err := handler(ctx, NewTextMessage("work")); err == nil {
-		t.Fatal("expected handler error")
+func TestRetryHandlerDoesNotStartAfterContextDone(t *testing.T) {
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	expired, expire := context.WithDeadline(context.Background(), time.Unix(0, 0))
+	defer expire()
+	for _, ctx := range []context.Context{canceled, expired} {
+		t.Run(ctx.Err().Error(), func(t *testing.T) {
+			attempts := 0
+			handler := RetryHandler(func(context.Context, *Message) error {
+				attempts++
+				return nil
+			}, RetryPolicy{MaxAttempts: 3})
+			if err := handler(ctx, NewTextMessage("work")); !errors.Is(err, ctx.Err()) {
+				t.Errorf("retry error = %v, want %v", err, ctx.Err())
+			}
+			if attempts != 0 {
+				t.Fatalf("handler attempts = %d, want 0 for a finished context", attempts)
+			}
+		})
+	}
+}
+
+func TestRetryHandlerPreservesSuccessAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	handler := RetryHandler(func(context.Context, *Message) error {
+		cancel()
+		return nil
+	}, RetryPolicy{MaxAttempts: 3})
+	if err := handler(ctx, NewTextMessage("completed work")); err != nil {
+		t.Fatalf("successful handler returned %v", err)
+	}
+}
+
+func TestSleepWithContextHonorsCancellation(t *testing.T) {
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	expired, expire := context.WithDeadline(context.Background(), time.Unix(0, 0))
+	defer expire()
+	for _, ctx := range []context.Context{canceled, expired} {
+		for _, delay := range []time.Duration{0, -time.Second, time.Hour} {
+			t.Run(ctx.Err().Error()+"/"+delay.String(), func(t *testing.T) {
+				if err := sleepWithContext(ctx, delay); !errors.Is(err, ctx.Err()) {
+					t.Fatalf("sleep error = %v, want %v", err, ctx.Err())
+				}
+			})
+		}
 	}
 }
 
