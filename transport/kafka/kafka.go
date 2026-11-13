@@ -1389,7 +1389,7 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 					return err
 				}
 				h.emitSubscribeFailure(kafkaMsg.Topic, err)
-				if route.policy == core.HandlerErrorRetry {
+				if route.policy == core.HandlerErrorRetry || core.IsDeadLetterFailed(err) {
 					if finishHandler != nil {
 						finishHandler()
 					}

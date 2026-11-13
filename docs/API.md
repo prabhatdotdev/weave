@@ -52,6 +52,48 @@ is omitted or zero. A context already done before the first attempt returns its
 context error without calling the handler. Interruption after a failed attempt
 preserves the last handler error.
 
+`core.DeadLetterHandler` composes retries with a confirmed dead-letter publish:
+
+```go
+handler, err := core.DeadLetterHandler(
+	processOrder,
+	core.RetryPolicy{MaxAttempts: 3, Backoff: core.FixedBackoff(100 * time.Millisecond)},
+	broker,
+	"orders.dead",
+	core.DeadLetterOptions{Backend: "amqp", Destination: "orders", Handler: "processOrder"},
+	core.WithTimeout(5 * time.Second),
+)
+if err != nil {
+	return err
+}
+return broker.Subscribe(ctx, "orders", handler) // manual acknowledgments are the default
+```
+
+Successful processing skips dead-letter publishing. Exhausted retries or an
+error rejected by `RetryPolicy.Retryable` publish a `NewDeadLetterEnvelope` with
+the last error, actual attempt count, and a snapshot of the original delivery.
+`DeadLetterOptions.Destination` identifies the source; the separate destination
+argument identifies the dead-letter target. `Details` must be JSON encodable and
+are snapshotted when the helper is constructed.
+
+The source is acknowledged or marked only after a successful handoff. Publish
+or encoding failures return `ErrDeadLetterFailed`; AMQP requeues the delivery
+and Kafka leaves it and later offsets unmarked, even under
+`WithHandlerErrorNoRetry()`. Cancellation preserves unfinished work without
+dead-lettering it. A panic also preserves the source. Each broker redelivery
+starts a new retry budget.
+
+Use manual acknowledgments; `WithAutoAck()` acknowledges too early for this
+guarantee. The helper always enables mandatory AMQP routing so a missing queue
+fails the handoff, and defaults to persistent publishes. Provision durable
+queues or Kafka topics and choose the appropriate broker durability settings.
+Publish options can select an AMQP exchange or Kafka key/partition.
+
+Dead-letter publishing and source acknowledgment are separate operations. A
+crash or uncertain publish result can produce duplicate envelopes; consumers
+should deduplicate using the original message ID or source topic, partition,
+and offset. This helper does not provide an atomic or exactly-once handoff.
+
 ## Codecs
 
 `codec.JSON` and `codec.Protobuf` implement the same `Codec` interface.
@@ -86,3 +128,7 @@ See [transport guarantees and deadlines](TRANSPORTS.md#deadlines-and-delivery-ou
 
 `ErrShuttingDown` rejects new work during graceful shutdown. `ErrClosed`
 identifies operations on a closed broker.
+
+`IsDeadLetterFailed` matches wrapped `ErrDeadLetterFailed` errors. The error
+unwraps both the processing failure and handoff failure for `errors.Is` and
+`errors.As`.

@@ -31,6 +31,10 @@ subscription context is canceled also requeues the message. A nil handler result
 acknowledges completed work. `WithAutoAck()` acknowledges delivery before handler
 completion, so interrupted work cannot be requeued by the handler.
 
+`core.DeadLetterHandler` also requeues a failed dead-letter handoff regardless of
+the ordinary handler error policy. It acknowledges the source only after the
+dead-letter publish is confirmed. See the [helper and its delivery limits](API.md#core).
+
 AMQP confirmations are currently serialized per broker connection. A timed-out
 publish retains its slot until the late receipt arrives or the channel closes,
 so another message cannot accidentally receive its acknowledgment.
@@ -97,6 +101,10 @@ If a handler returns an error after its subscription or consumer session is
 canceled, Kafka leaves that record and later offsets uncommitted, regardless
 of the handler error policy. Completed handlers and ordinary errors still
 follow the configured policy.
+
+`core.DeadLetterHandler` leaves failed handoffs and later offsets unmarked,
+regardless of the ordinary handler error policy. Successful dead-letter
+publishing allows the source offset to advance.
 
 SASL supports `PLAIN` (also the default for an empty mechanism),
 `SCRAM-SHA-256`, and `SCRAM-SHA-512`. Unknown enabled mechanisms return

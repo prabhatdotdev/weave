@@ -89,6 +89,25 @@ func (e *ErrPublishFailed) Unwrap() error {
 	return e.Cause
 }
 
+// ErrDeadLetterFailed means processing failed and a dead-letter handoff did not
+// succeed. Transports must preserve the original delivery for another attempt.
+type ErrDeadLetterFailed struct {
+	Destination string
+	Cause       error
+}
+
+func (e *ErrDeadLetterFailed) Error() string {
+	return fmt.Sprintf("dead-letter handoff to %s failed: %v", e.Destination, e.Cause)
+}
+
+func (e *ErrDeadLetterFailed) Unwrap() error { return e.Cause }
+
+// IsDeadLetterFailed reports whether the original delivery must be preserved.
+func IsDeadLetterFailed(err error) bool {
+	var e *ErrDeadLetterFailed
+	return errors.As(err, &e)
+}
+
 // ErrSubscribeFailed is returned when subscription fails.
 type ErrSubscribeFailed struct {
 	Backend     string

@@ -939,7 +939,7 @@ func (b *Broker) handleMessage(ctx context.Context, msg amqplib.Delivery, handle
 		if err != nil {
 			// Interrupted work is unfinished even when ordinary handler errors are not retried.
 			interrupted := b.work.IsClosed() || ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
-			msg.Nack(false, interrupted || policy == core.HandlerErrorRetry)
+			msg.Nack(false, interrupted || policy == core.HandlerErrorRetry || core.IsDeadLetterFailed(err))
 		} else {
 			msg.Ack(false)
 		}
