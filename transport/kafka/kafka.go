@@ -31,6 +31,7 @@ import (
 	"github.com/prabhatdotdev/weave/core"
 	"github.com/prabhatdotdev/weave/internal/connection"
 	"github.com/prabhatdotdev/weave/internal/lifecycle"
+	"github.com/prabhatdotdev/weave/internal/observability"
 	"github.com/prabhatdotdev/weave/internal/validation"
 )
 
@@ -100,6 +101,7 @@ func (p *pendingCall) complete(response *core.Message) {
 // Broker implements the core.MessageBroker interface for Apache Kafka.
 type Broker struct {
 	work        lifecycle.Group
+	metrics     observability.Metrics
 	config      *core.Config
 	kafkaConfig *core.KafkaConfig
 
@@ -142,6 +144,7 @@ func (b *Broker) emitEvent(ctx context.Context, event core.Event) {
 	if event.Component == "" {
 		event.Component = "transport"
 	}
+	b.metrics.Snapshot(&event)
 	b.config.EmitEvent(ctx, event)
 }
 
@@ -189,6 +192,7 @@ func (b *Broker) Backend() string {
 
 // Connect establishes a connection to the Kafka cluster.
 func (b *Broker) Connect(ctx context.Context) error {
+	started := time.Now()
 	if err := validation.Context(ctx); err != nil {
 		return err
 	}
@@ -256,6 +260,7 @@ func (b *Broker) Connect(ctx context.Context) error {
 		Level:     core.EventLevelInfo,
 		Name:      core.EventConnect,
 		Operation: "connect",
+		Duration:  time.Since(started),
 		Err:       err,
 		Fields:    map[string]any{"outcome": "success"},
 	}
@@ -455,6 +460,7 @@ func (b *Broker) Close() error {
 
 // Publish sends a message to the specified Kafka topic.
 func (b *Broker) Publish(ctx context.Context, destination string, msg *core.Message, opts ...core.PublishOption) error {
+	started := time.Now()
 	options, err := validation.Publish(ctx, destination, msg, opts...)
 	if err != nil {
 		return validation.ContextError(err, "Publish", "context deadline")
@@ -555,15 +561,19 @@ func (b *Broker) Publish(ctx context.Context, destination string, msg *core.Mess
 		return &core.ErrPublishFailed{Backend: backendName, Destination: destination, Cause: err}
 	}
 
+	b.emitEvent(ctx, core.Event{Level: core.EventLevelInfo, Name: core.EventPublishSucceeded, Operation: "publish", Destination: destination, CorrelationID: msg.CorrelationID, Duration: time.Since(started)})
 	return nil
 }
 
 // Subscribe registers a handler for messages from the specified Kafka topic.
 func (b *Broker) Subscribe(ctx context.Context, destination string, handler core.Handler, opts ...core.SubscribeOption) error {
+	started := time.Now()
+	handler = b.metrics.WrapHandler(handler, destination, b.emitEvent)
 	if err := b.subscribe(ctx, destination, handler, true, opts...); err != nil {
 		return err
 	}
 
+	b.emitEvent(ctx, core.Event{Level: core.EventLevelInfo, Name: core.EventSubscribeSucceeded, Operation: "subscribe", Destination: destination, Duration: time.Since(started)})
 	return nil
 }
 
@@ -767,7 +777,7 @@ func (b *Broker) runSubscriptionConsumer(changed <-chan struct{}) {
 					return
 				}
 				b.watchConsumerErrors(consumeCtx, "*", consumer)
-				handler := &consumerGroupHandler{routes: routes, closeChan: b.closeChan, pending: b.pending, pendingMu: &b.pendingMu, config: b.config, work: &b.work}
+				handler := &consumerGroupHandler{routes: routes, closeChan: b.closeChan, pending: b.pending, pendingMu: &b.pendingMu, config: b.config, work: &b.work, metrics: &b.metrics}
 				topics := make([]string, 0, len(routes))
 				for topic := range routes {
 					topics = append(topics, topic)
@@ -852,7 +862,8 @@ func (b *Broker) activeSubscriptionRoutes() ([]string, map[string]subscriptionRo
 }
 
 // Call implements request-response pattern using correlation IDs and reply topics.
-func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message, opts ...core.PublishOption) (*core.Message, error) {
+func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message, opts ...core.PublishOption) (_ *core.Message, resultErr error) {
+	started := time.Now()
 	options, err := validation.Publish(ctx, destination, msg, opts...)
 	if err != nil {
 		return nil, validation.ContextError(err, "Call", "context deadline")
@@ -893,10 +904,12 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 	b.pending[corrID] = pending
 	b.pendingMu.Unlock()
 
+	finishCall := b.metrics.StartCall(ctx, destination, corrID, started, b.emitEvent)
 	defer func() {
 		b.pendingMu.Lock()
 		delete(b.pending, corrID)
 		b.pendingMu.Unlock()
+		finishCall(resultErr)
 	}()
 
 	request.CorrelationID = corrID
@@ -1249,6 +1262,7 @@ func (b *Broker) watchConsumerErrors(ctx context.Context, destination string, co
 }
 
 type consumerGroupHandler struct {
+	metrics   *observability.Metrics
 	work      *lifecycle.Group
 	handler   core.Handler
 	routes    map[string]subscriptionRoute
@@ -1280,7 +1294,7 @@ func (h *consumerGroupHandler) emitSubscribeFailure(destination string, err erro
 	if h.config == nil {
 		return
 	}
-	h.config.EmitEvent(context.Background(), core.Event{
+	event := core.Event{
 		Level:       core.EventLevelError,
 		Name:        core.EventSubscribeFailed,
 		Backend:     backendName,
@@ -1288,7 +1302,11 @@ func (h *consumerGroupHandler) emitSubscribeFailure(destination string, err erro
 		Operation:   "handler",
 		Destination: destination,
 		Err:         err,
-	})
+	}
+	if h.metrics != nil {
+		h.metrics.Snapshot(&event)
+	}
+	h.config.EmitEvent(context.Background(), event)
 }
 
 func (h *consumerGroupHandler) Setup(sarama.ConsumerGroupSession) error {

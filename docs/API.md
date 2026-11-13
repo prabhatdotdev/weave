@@ -119,6 +119,36 @@ Set `Config.EventHook` to receive structured connection, publish, subscribe,
 timeout, and recovery events. Metrics and traces belong in the callback or in
 the application's existing observability stack.
 
+`Event.Duration` is a `time.Duration`. Both transports report it on completed
+connections, successful publishes and subscription registrations, and handler
+and RPC completions. A publish duration ends at broker acknowledgment; a call
+duration includes reply setup, publishing, and waiting for the response.
+Handler durations include the full callback, including in-process retries and
+dead-letter publishing if those wrappers are used.
+
+| Event | Duration | Meaning |
+| --- | --- | --- |
+| `EventConnect` with operation `connect` | connection attempt | Inspect `Err` for the outcome; an already-connected no-op emits no event. |
+| `EventPublishSucceeded` | confirmed publish | Successful broker acknowledgment, not consumer processing. |
+| `EventSubscribeSucceeded` | registration | Successful setup, not a guarantee that a Kafka partition is already assigned. |
+| `EventHandlerStarted` / `EventHandlerFinished` | finish only | One callback invocation; a finish with `Err == nil` records successful handling. |
+| `EventCallStarted` / `EventCallFinished` | finish only | One registered RPC; a finish with `Err == nil` records successful request/reply. |
+
+Transport events also carry `ActiveHandlers` and `PendingRPCs` snapshots for
+that broker instance. Handler counts cover executing user callbacks, excluding
+reply routing and queued messages. RPC counts start at correlation registration
+and end after cleanup on every return path, including publish failure, timeout,
+cancellation, and connection loss. Calls rejected before registration do not
+emit start/finish pairs. Forced closure interrupts work; a handler that ignores
+cancellation remains active until it actually returns.
+
+Hooks run synchronously outside broker locks and may execute concurrently.
+Return promptly, do not panic, and make collectors safe for concurrency. Events
+from different goroutines may arrive out of order, so their count fields are
+snapshots rather than an ordered stream of gauge updates. Use bounded metric
+labels; keep correlation IDs in logs or traces. The
+[observability example](../examples/observability) logs the metrics as JSON.
+
 ## Errors
 
 Transport errors use concrete types such as `ErrNotConnected`, `ErrTimeout`,

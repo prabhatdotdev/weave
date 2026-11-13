@@ -81,9 +81,13 @@ Transport events are available through one optional callback:
 
 ```go
 config.EventHook = func(ctx context.Context, event core.Event) {
-	log.Printf("%s: %v", event.Name, event.Err)
+	log.Printf("%s duration=%s active_handlers=%d pending_rpcs=%d error=%v",
+		event.Name, event.Duration, event.ActiveHandlers, event.PendingRPCs, event.Err)
 }
 ```
+
+See the runnable [observability example](examples/observability) for JSON logs
+and guidance on exporting durations and counts.
 
 See [docs/QUICKSTART.md](docs/QUICKSTART.md), [docs/API.md](docs/API.md), and
 [docs/TRANSPORTS.md](docs/TRANSPORTS.md).

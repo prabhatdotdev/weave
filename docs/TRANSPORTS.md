@@ -224,12 +224,15 @@ Both transports emit structured events through `Config.EventHook`:
 
 ```go
 config.EventHook = func(ctx context.Context, event core.Event) {
-	log.Printf("backend=%s operation=%s error=%v",
-		event.Backend, event.Operation, event.Err)
+	log.Printf("backend=%s operation=%s duration=%s active=%d pending=%d error=%v",
+		event.Backend, event.Operation, event.Duration,
+		event.ActiveHandlers, event.PendingRPCs, event.Err)
 }
 ```
 
-Derive metrics or traces in that callback if needed.
+Completed operations report durations, and handler/RPC start and finish events
+report broker-local work counts. See the [event contract](API.md#events) and
+[observability example](../examples/observability).
 
 Connection, recovery, and shutdown hooks run outside lifecycle locks, so they
 can inspect broker state. Connection and shutdown hooks may also call `Close`.

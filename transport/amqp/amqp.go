@@ -30,6 +30,7 @@ import (
 	"github.com/prabhatdotdev/weave/core"
 	"github.com/prabhatdotdev/weave/internal/connection"
 	"github.com/prabhatdotdev/weave/internal/lifecycle"
+	"github.com/prabhatdotdev/weave/internal/observability"
 	"github.com/prabhatdotdev/weave/internal/validation"
 )
 
@@ -134,6 +135,7 @@ func (p *pendingCall) complete(response *amqplib.Delivery) {
 // Broker implements the core.MessageBroker interface for AMQP/RabbitMQ.
 type Broker struct {
 	work       lifecycle.Group
+	metrics    observability.Metrics
 	config     *core.Config
 	amqpConfig *core.AMQPConfig
 	conn       amqpConnection
@@ -167,6 +169,7 @@ func (b *Broker) emitEvent(ctx context.Context, event core.Event) {
 	if event.Component == "" {
 		event.Component = "transport"
 	}
+	b.metrics.Snapshot(&event)
 	b.config.EmitEvent(ctx, event)
 }
 
@@ -206,6 +209,7 @@ func (b *Broker) Backend() string {
 
 // Connect establishes a connection to the AMQP broker.
 func (b *Broker) Connect(ctx context.Context) error {
+	started := time.Now()
 	if err := validation.Context(ctx); err != nil {
 		return err
 	}
@@ -266,6 +270,7 @@ func (b *Broker) Connect(ctx context.Context) error {
 		Level:     core.EventLevelInfo,
 		Name:      core.EventConnect,
 		Operation: "connect",
+		Duration:  time.Since(started),
 		Err:       err,
 		Fields:    map[string]any{"outcome": "success"},
 	}
@@ -627,6 +632,7 @@ func (b *Broker) Close() error {
 
 // Publish sends a message to the specified queue.
 func (b *Broker) Publish(ctx context.Context, destination string, msg *core.Message, opts ...core.PublishOption) error {
+	started := time.Now()
 	options, err := validation.Publish(ctx, destination, msg, opts...)
 	if err != nil {
 		return validation.ContextError(err, "Publish", "context deadline")
@@ -697,6 +703,7 @@ func (b *Broker) Publish(ctx context.Context, destination string, msg *core.Mess
 		return &core.ErrPublishFailed{Backend: backendName, Destination: destination, Cause: err}
 	}
 
+	b.emitEvent(ctx, core.Event{Level: core.EventLevelInfo, Name: core.EventPublishSucceeded, Operation: "publish", Destination: destination, CorrelationID: msg.CorrelationID, Duration: time.Since(started)})
 	return nil
 }
 
@@ -717,10 +724,13 @@ func validatePublishing(destination string, msg *core.Message, options *core.Pub
 
 // Subscribe registers a handler for messages from the specified queue.
 func (b *Broker) Subscribe(ctx context.Context, destination string, handler core.Handler, opts ...core.SubscribeOption) error {
+	started := time.Now()
+	handler = b.metrics.WrapHandler(handler, destination, b.emitEvent)
 	if err := b.subscribe(ctx, destination, handler, true, false, opts...); err != nil {
 		return err
 	}
 
+	b.emitEvent(ctx, core.Event{Level: core.EventLevelInfo, Name: core.EventSubscribeSucceeded, Operation: "subscribe", Destination: destination, Duration: time.Since(started)})
 	return nil
 }
 
@@ -947,7 +957,8 @@ func (b *Broker) handleMessage(ctx context.Context, msg amqplib.Delivery, handle
 }
 
 // Call implements the request-response pattern.
-func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message, opts ...core.PublishOption) (*core.Message, error) {
+func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message, opts ...core.PublishOption) (_ *core.Message, resultErr error) {
+	started := time.Now()
 	options, err := validation.Publish(ctx, destination, msg, opts...)
 	if err != nil {
 		return nil, validation.ContextError(err, "Call", "context deadline")
@@ -988,10 +999,12 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 	b.pending[corrID] = pending
 	b.pendingMu.Unlock()
 
+	finishCall := b.metrics.StartCall(ctx, destination, corrID, started, b.emitEvent)
 	defer func() {
 		b.pendingMu.Lock()
 		delete(b.pending, corrID)
 		b.pendingMu.Unlock()
+		finishCall(resultErr)
 	}()
 
 	request := msg.Clone()

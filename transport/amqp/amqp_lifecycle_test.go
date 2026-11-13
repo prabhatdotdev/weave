@@ -19,6 +19,9 @@ func TestLifecycleEventHooksCanInspectAndCloseBroker(t *testing.T) {
 			config.ConnectionRetry, config.RetryDelay = 1, time.Millisecond
 			var broker *Broker
 			config.EventHook = func(_ context.Context, event core.Event) {
+				if event.Name == core.EventConnect && event.Operation == "connect" && event.Duration <= 0 {
+					t.Errorf("connection duration missing: %+v", event)
+				}
 				_ = broker.IsConnected()
 				_ = broker.IsRecovering()
 				if event.Operation == "close" || scenario == "close from connect" && event.Name == core.EventConnect {
