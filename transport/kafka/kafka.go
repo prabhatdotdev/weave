@@ -360,6 +360,7 @@ func (b *Broker) buildSaramaConfig() *sarama.Config {
 	saramaConfig.Producer.Partitioner = newExplicitPartitioner
 	saramaConfig.Metadata.AllowAutoTopicCreation = false
 
+	saramaConfig.Consumer.Return.Errors = true
 	saramaConfig.Consumer.Group.Session.Timeout = b.kafkaConfig.SessionTimeout
 	saramaConfig.Consumer.Group.Heartbeat.Interval = b.kafkaConfig.HeartbeatInterval
 

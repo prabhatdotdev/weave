@@ -139,6 +139,9 @@ func TestSubscriptionOptionsSurviveReconnect(t *testing.T) {
 	}
 	created := map[consumerKey]int{}
 	broker.newConsumerGroup = func(_ []string, group string, cfg *sarama.Config) (sarama.ConsumerGroup, error) {
+		if !cfg.Consumer.Return.Errors {
+			t.Errorf("consumer group %q received disabled error reporting", group)
+		}
 		created[consumerKey{group: group, earliest: cfg.Consumer.Offsets.Initial == sarama.OffsetOldest}]++
 		return &fakeConsumerGroup{}, nil
 	}

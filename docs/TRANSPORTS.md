@@ -89,6 +89,10 @@ Subscriptions with the same group and starting-offset policy share a consumer
 loop. Different groups can independently consume the same topic, and their
 settings are preserved across reconnects.
 
+Asynchronous Kafka consumer failures reach `EventHook` as `subscribe_failed`
+events with operation `consumer_errors`. The broker attempts to reconnect and
+restore active subscriptions after these failures.
+
 If a handler returns an error after its subscription or consumer session is
 canceled, Kafka leaves that record and later offsets uncommitted, regardless
 of the handler error policy. Completed handlers and ordinary errors still

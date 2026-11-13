@@ -524,6 +524,17 @@ func TestCallRequiresConfiguredReplyTopic(t *testing.T) {
 	}
 }
 
+func TestSaramaConfigEnablesConsumerErrors(t *testing.T) {
+	broker := &Broker{kafkaConfig: core.DefaultKafkaConfig()}
+	config := broker.buildSaramaConfig()
+	if !config.Consumer.Return.Errors {
+		t.Fatal("Kafka consumer error reporting is disabled")
+	}
+	if err := config.Validate(); err != nil {
+		t.Fatalf("invalid Sarama config: %v", err)
+	}
+}
+
 func TestSaramaConfigDisablesAutoTopicCreation(t *testing.T) {
 	broker := &Broker{kafkaConfig: core.DefaultKafkaConfig()}
 	config := broker.buildSaramaConfig()
@@ -1351,63 +1362,106 @@ func TestSubscribeReconnectsAndResumesConsume(t *testing.T) {
 	}
 }
 
-func TestSubscribeConsumerErrorsTriggerDisconnectHandling(t *testing.T) {
-	errorEvents := make(chan core.Event, 4)
-	ctx, cancel := context.WithCancel(context.Background())
+func TestSubscribeConsumerErrorsTriggerRecovery(t *testing.T) {
+	errorEvents := make(chan core.Event, 1)
+	disconnectEvents := make(chan core.Event, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	group := &fakeConsumerGroup{errorsCh: make(chan error, 1)}
-	group.consumeFn = func(ctx context.Context, _ []string, _ sarama.ConsumerGroupHandler) error {
+	started := make(chan struct{})
+	firstGroup := &fakeConsumerGroup{errorsCh: make(chan error, 1)}
+	firstGroup.consumeFn = func(ctx context.Context, _ []string, _ sarama.ConsumerGroupHandler) error {
+		close(started)
 		<-ctx.Done()
 		return nil
 	}
-
-	broker := &Broker{
-		config: &core.Config{
-			EventHook: func(_ context.Context, event core.Event) {
-				select {
-				case errorEvents <- event:
-				default:
-				}
-			},
-		},
-		kafkaConfig: &core.KafkaConfig{ConsumerGroup: "workers"},
-		consumer:    group,
-		connected:   true,
-		pending:     make(map[string]*pendingCall),
-		watching:    make(map[sarama.ConsumerGroup]struct{}),
-		closeChan:   make(chan struct{}),
-	}
-
-	if err := broker.Subscribe(ctx, "users", func(context.Context, *core.Message) error { return nil }); err != nil {
-		t.Fatalf("Subscribe() error = %v", err)
-	}
-
-	group.errorsCh <- errors.New("consumer stream broken")
-
-	deadline := time.After(500 * time.Millisecond)
-	for broker.IsConnected() {
-		select {
-		case <-deadline:
-			t.Fatal("broker did not handle consumer error and mark connection lost")
-		default:
-			time.Sleep(10 * time.Millisecond)
+	secondGroup := &fakeConsumerGroup{errorsCh: make(chan error, 1)}
+	secondGroup.consumeFn = func(ctx context.Context, _ []string, handler sarama.ConsumerGroupHandler) error {
+		messages := make(chan *sarama.ConsumerMessage, 1)
+		messages <- &sarama.ConsumerMessage{Topic: "users", Value: []byte("after recovery")}
+		close(messages)
+		if err := handler.ConsumeClaim(&fakeSession{ctx: ctx}, &fakeClaim{messages: messages}); err != nil {
+			return err
 		}
+		<-ctx.Done()
+		return nil
 	}
-
-	found := false
-	for {
-		select {
-		case event := <-errorEvents:
-			if event.Operation == "consumer_errors" && event.Name == core.EventSubscribeFailed {
-				found = true
-			}
+	config := core.DefaultConfig()
+	config.RetryDelay = time.Millisecond
+	config.Kafka = core.DefaultKafkaConfig()
+	config.Kafka.ConsumerGroup = "workers"
+	config.EventHook = func(_ context.Context, event core.Event) {
+		var events chan core.Event
+		switch {
+		case event.Name == core.EventSubscribeFailed && event.Operation == "consumer_errors":
+			events = errorEvents
+		case event.Name == core.EventDisconnect && event.Operation == "connection_lost":
+			events = disconnectEvents
 		default:
-			if !found {
-				t.Fatal("expected subscribe failure event for consumer error")
-			}
 			return
 		}
+		select {
+		case events <- event:
+		default:
+		}
+	}
+	brokerAny, err := NewBroker(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker := brokerAny.(*Broker)
+	defer broker.Close()
+	broker.newProducer = func([]string, *sarama.Config) (messageProducer, error) {
+		return &fakeSyncProducer{}, nil
+	}
+	groups := make(chan sarama.ConsumerGroup, 2)
+	groups <- firstGroup
+	groups <- secondGroup
+	broker.newConsumerGroup = func(_ []string, _ string, cfg *sarama.Config) (sarama.ConsumerGroup, error) {
+		if !cfg.Consumer.Return.Errors {
+			return nil, errors.New("consumer factory received disabled error reporting")
+		}
+		select {
+		case group := <-groups:
+			return group, nil
+		default:
+			return nil, errors.New("unexpected consumer creation")
+		}
+	}
+	if err := broker.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	recovered := make(chan string, 1)
+	if err := broker.Subscribe(ctx, "users", func(_ context.Context, msg *core.Message) error {
+		recovered <- msg.BodyString()
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("consumer did not start")
+	}
+	failure := &sarama.ConsumerError{Topic: "users", Partition: 0, Err: errors.New("consumer stream broken")}
+	firstGroup.errorsCh <- failure
+	for _, events := range []<-chan core.Event{errorEvents, disconnectEvents} {
+		select {
+		case event := <-events:
+			if !errors.Is(event.Err, failure) || event.Backend != backendName {
+				t.Fatalf("consumer failure event = %+v", event)
+			}
+		case <-ctx.Done():
+			t.Fatal("consumer error did not emit failure and disconnect events")
+		}
+	}
+	select {
+	case body := <-recovered:
+		if body != "after recovery" || !broker.IsConnected() || broker.IsRecovering() {
+			t.Fatalf("recovered body=%q connected=%v recovering=%v", body, broker.IsConnected(), broker.IsRecovering())
+		}
+	case <-ctx.Done():
+		t.Fatal("subscription did not resume after the consumer error")
 	}
 }
 
