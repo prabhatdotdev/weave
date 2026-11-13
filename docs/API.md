@@ -29,6 +29,35 @@ the same logical event. No ID is generated automatically, and it is separate
 from the RPC `CorrelationID`. See the runnable
 [duplicate-handling example](../examples/deduplication).
 
+Set `Config.MaxPendingCalls` to cap concurrent RPCs on either transport:
+
+```go
+config := core.DefaultConfig()
+config.MaxPendingCalls = 128
+// Pass config to amqp.NewBroker or kafka.NewBroker.
+```
+
+Zero (the default) is unlimited; negative limits return `ErrInvalidConfig`.
+The limit is per broker across destinations and covers reply setup, publishing,
+and awaiting responses. Excess `Call` invocations wait before registering a
+correlation ID or publishing. Their context and `WithTimeout` cover that wait
+and all subsequent work; cancellation matches `context.Canceled`, and deadline
+expiry matches both `IsTimeout` and `context.DeadlineExceeded`.
+
+Slots are released on every return path, including setup/publish failure and
+connection loss. Duplicate in-flight correlation IDs are rejected immediately
+even when capacity is full. Shutdown rejects queued calls with
+`ErrShuttingDown`; immediate closure releases them with `ErrClosed`. Calls
+already holding capacity can drain. Admitted handlers may take immediately
+available capacity while draining, but cannot wait for more capacity then.
+
+Queued callers are excluded from `Event.PendingRPCs` and emit no RPC start or
+finish event unless admitted. A completed call's duration includes its capacity
+wait. The limit applies to `Call`, not `Publish` or handler concurrency. Bound
+caller goroutines and use deadlines as well: backpressure does not limit how
+many goroutines an application starts to invoke `Call`.
+It does not bound broker queues or cancel remote processing after a timeout.
+
 Publish options:
 
 - `WithTimeout`

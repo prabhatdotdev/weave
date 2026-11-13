@@ -163,6 +163,7 @@ func TestConstructorsRejectInvalidConfiguration(t *testing.T) {
 		change func(*core.Config)
 	}{
 		{"negative retries", func(c *core.Config) { c.ConnectionRetry = -1 }},
+		{"negative pending RPC limit", func(c *core.Config) { c.MaxPendingCalls = -1 }},
 		{"negative backoff", func(c *core.Config) { c.RetryDelay = -time.Second }},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {

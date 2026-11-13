@@ -13,6 +13,7 @@ func metricsTestBroker(t *testing.T, hook core.EventHook, publishErr error) (*Br
 	t.Helper()
 	config := core.DefaultConfig()
 	config.EventHook = hook
+	config.MaxPendingCalls = 1
 	brokerAny, err := NewBroker(config)
 	if err != nil {
 		t.Fatal(err)

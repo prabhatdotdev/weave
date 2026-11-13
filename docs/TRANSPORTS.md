@@ -192,9 +192,14 @@ the established connection; use `Close` to end its lifetime.
 ## Deadlines and delivery outcomes
 
 `WithTimeout(d)` bounds Publish and Call, including connection/reply setup,
-waiting for a publish slot, and broker acknowledgment. Call uses the same
-deadline while waiting for its reply. An earlier context deadline takes
+waiting for RPC capacity or a publish slot, and broker acknowledgment. Call uses
+the same deadline while waiting for its reply. An earlier context deadline takes
 precedence; zero uses only that context. Negative timeouts are invalid.
+
+`Config.MaxPendingCalls` optionally limits active RPCs across destinations on
+one broker. Zero is unlimited. Queued calls wait with their existing deadline
+and publish only after acquiring capacity; shutdown or closure interrupts
+that wait. See the [configuration and accounting contract](API.md#core).
 
 Deadline expiry matches both `core.IsTimeout(err)` and
 `errors.Is(err, context.DeadlineExceeded)`. Explicit cancellation matches

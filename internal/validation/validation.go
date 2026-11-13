@@ -34,6 +34,9 @@ func Config(config *core.Config) (*core.Config, error) {
 	if config.ConnectionRetry < 0 || config.RetryDelay < 0 {
 		return nil, invalid("connection retries and retry delay must not be negative")
 	}
+	if config.MaxPendingCalls < 0 {
+		return nil, invalid("pending RPC limit must not be negative")
+	}
 	copy := *config
 	if config.AMQP != nil {
 		amqp := *config.AMQP

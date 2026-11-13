@@ -25,6 +25,8 @@ type Config struct {
 	ConnectionRetry int
 	RetryDelay      time.Duration
 	EventHook       EventHook
+	// MaxPendingCalls bounds concurrent RPCs per broker; zero leaves them unlimited.
+	MaxPendingCalls int
 	AMQP            *AMQPConfig
 	Kafka           *KafkaConfig
 }

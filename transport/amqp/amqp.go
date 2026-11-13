@@ -31,6 +31,7 @@ import (
 	"github.com/prabhatdotdev/weave/internal/connection"
 	"github.com/prabhatdotdev/weave/internal/lifecycle"
 	"github.com/prabhatdotdev/weave/internal/observability"
+	"github.com/prabhatdotdev/weave/internal/rpclimit"
 	"github.com/prabhatdotdev/weave/internal/validation"
 )
 
@@ -136,6 +137,7 @@ func (p *pendingCall) complete(response *amqplib.Delivery) {
 type Broker struct {
 	work       lifecycle.Group
 	metrics    observability.Metrics
+	rpcSlots   rpclimit.Limiter
 	config     *core.Config
 	amqpConfig *core.AMQPConfig
 	conn       amqpConnection
@@ -189,6 +191,7 @@ func NewBroker(config *core.Config) (core.MessageBroker, error) {
 
 	return &Broker{
 		config:     config,
+		rpcSlots:   rpclimit.New(config.MaxPendingCalls),
 		amqpConfig: config.AMQP,
 		dial: func(connString string, config amqplib.Config) (amqpConnection, error) {
 			conn, err := amqplib.DialConfig(connString, config)
@@ -976,6 +979,19 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 		ctx, cancel = context.WithTimeout(ctx, options.Timeout)
 		defer cancel()
 	}
+	if msg.CorrelationID != "" {
+		b.pendingMu.RLock()
+		_, duplicate := b.pending[msg.CorrelationID]
+		b.pendingMu.RUnlock()
+		if duplicate {
+			return nil, fmt.Errorf("%w: %q", core.ErrDuplicateCorrelationID, msg.CorrelationID)
+		}
+	}
+	releaseSlot, err := b.rpcSlots.Acquire(ctx, &b.work)
+	if err != nil {
+		return nil, validation.ContextError(err, "Call", options.Timeout.String())
+	}
+	defer releaseSlot()
 	channel, err := b.currentChannel(false)
 	if err != nil {
 		return nil, err
