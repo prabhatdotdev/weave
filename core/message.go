@@ -21,6 +21,8 @@ import (
 )
 
 // Message represents a message to be sent or received from a message broker.
+// MessageID is an application-owned identity preserved by both transports.
+// Reuse it when retrying the same logical message; it is not generated automatically.
 type Message struct {
 	Body          []byte
 	CorrelationID string

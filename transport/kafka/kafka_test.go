@@ -210,6 +210,7 @@ func TestPublishBuildsKafkaMessageAndErrors(t *testing.T) {
 	msg.CorrelationID = "corr-1"
 	msg.ReplyTo = "reply-topic"
 	msg.ContentType = "application/json"
+	msg.MessageID = "message-1"
 
 	if err := broker.Publish(context.Background(), "users", msg); err != nil {
 		t.Fatalf("Publish() error = %v", err)
@@ -237,6 +238,9 @@ func TestPublishBuildsKafkaMessageAndErrors(t *testing.T) {
 	}
 	if got := headerValue(producer.lastMsg, "content-type"); got != "application/json" {
 		t.Fatalf("content-type header = %q, want %q", got, "application/json")
+	}
+	if got := headerValue(producer.lastMsg, "message-id"); got != "message-1" {
+		t.Fatalf("message-id header = %q, want message-1", got)
 	}
 	if err := broker.Publish(context.Background(), "users", msg, core.WithPartition(2)); err != nil {
 		t.Fatalf("Publish(WithPartition) error = %v", err)
@@ -424,6 +428,7 @@ func TestCallDoesNotMutateRequest(t *testing.T) {
 			}
 
 			request := core.NewTextMessage("request").WithReplyTo("caller-reply").WithHeader("trace-id", "abc")
+			request.MessageID = "request-1"
 			original := request.Clone()
 			_, err := broker.Call(context.Background(), "users.get", request, core.WithTimeout(test.timeout))
 			if !test.checkErr(err) {
@@ -438,6 +443,9 @@ func TestCallDoesNotMutateRequest(t *testing.T) {
 				}
 				if got := headerValue(producer.lastMsg, "reply-to"); got != "reply-topic" {
 					t.Fatalf("published reply topic = %q, want reply-topic", got)
+				}
+				if got := headerValue(producer.lastMsg, "message-id"); got != "request-1" {
+					t.Fatalf("published message ID = %q, want request-1", got)
 				}
 			}
 		})
@@ -770,7 +778,10 @@ func TestConsumerGroupHandlerRoutesResponsesAndInvokesHandlers(t *testing.T) {
 			Topic:     "users",
 			Partition: 0,
 			Offset:    3,
-			Headers:   []*sarama.RecordHeader{{Key: []byte("correlation-id"), Value: []byte("corr-1")}},
+			Headers: []*sarama.RecordHeader{
+				{Key: []byte("correlation-id"), Value: []byte("corr-1")},
+				{Key: []byte("message-id"), Value: []byte("response-1")},
+			},
 		}
 		close(claim.messages)
 
@@ -782,6 +793,9 @@ func TestConsumerGroupHandlerRoutesResponsesAndInvokesHandlers(t *testing.T) {
 		case response := <-pending["corr-1"].response:
 			if response.CorrelationID != "corr-1" {
 				t.Fatalf("response.CorrelationID = %q, want %q", response.CorrelationID, "corr-1")
+			}
+			if response.MessageID != "response-1" {
+				t.Fatalf("response.MessageID = %q, want response-1", response.MessageID)
 			}
 		default:
 			t.Fatal("pending response channel did not receive a message")
@@ -817,6 +831,7 @@ func TestConsumerGroupHandlerRoutesResponsesAndInvokesHandlers(t *testing.T) {
 			Headers: []*sarama.RecordHeader{
 				{Key: []byte("reply-to"), Value: []byte("reply-topic")},
 				{Key: []byte("content-type"), Value: []byte("application/json")},
+				{Key: []byte("message-id"), Value: []byte("message-1")},
 				{Key: []byte("trace-id"), Value: []byte("abc")},
 			},
 		}
@@ -829,7 +844,7 @@ func TestConsumerGroupHandlerRoutesResponsesAndInvokesHandlers(t *testing.T) {
 		if got == nil {
 			t.Fatal("handler was not called")
 		}
-		if got.Subject != "subject" || got.ReplyTo != "reply-topic" || got.ContentType != "application/json" || got.GetHeader("trace-id") != "abc" || got.Partition != 1 || got.Offset != 8 {
+		if got.Subject != "subject" || got.ReplyTo != "reply-topic" || got.ContentType != "application/json" || got.MessageID != "message-1" || got.GetHeader("trace-id") != "abc" || got.Partition != 1 || got.Offset != 8 {
 			t.Fatalf("unexpected converted message: %#v", got)
 		}
 		if len(session.marked) != 1 {

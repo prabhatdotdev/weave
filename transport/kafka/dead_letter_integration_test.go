@@ -57,7 +57,9 @@ func TestDeadLetterDestinationFailureWithLiveKafka(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := broker.Publish(ctx, source, core.NewTextMessage("original")); err != nil {
+	sourceMessage := core.NewTextMessage("original")
+	sourceMessage.MessageID = "original-id"
+	if err := broker.Publish(ctx, source, sourceMessage); err != nil {
 		t.Fatal(err)
 	}
 	if err := broker.Subscribe(ctx, source, handler); err != nil {
@@ -113,7 +115,7 @@ func TestDeadLetterDestinationFailureWithLiveKafka(t *testing.T) {
 	select {
 	case record := <-partition.Messages():
 		envelope, err := core.DecodeDeadLetterMessage(&core.Message{Body: record.Value})
-		if err != nil || envelope.Attempt != 3 || envelope.Original.Offset != original.Offset || envelope.Original.Partition != original.Partition || string(envelope.Original.Body) != "original" {
+		if err != nil || envelope.Attempt != 3 || envelope.Original.Offset != original.Offset || envelope.Original.Partition != original.Partition || envelope.Original.MessageID != "original-id" || string(envelope.Original.Body) != "original" {
 			t.Fatalf("unexpected dead letter: %+v err=%v", envelope, err)
 		}
 	case <-ctx.Done():

@@ -419,12 +419,15 @@ func TestCallPreservesRequestWithLiveKafka(t *testing.T) {
 	broker, responder, requestTopic, ctx := newLiveKafkaRPCPair(t, "fix-011")
 	if err := responder.Subscribe(ctx, requestTopic, func(_ context.Context, request *core.Message) error {
 		response := core.NewTextMessage("response").WithCorrelationID(request.CorrelationID)
+		response.MessageID = "response-1"
+		response.WithHeader("request-message-id", request.MessageID)
 		return responder.Publish(ctx, request.ReplyTo, response)
 	}); err != nil {
 		t.Fatalf("Subscribe(%s) error = %v", requestTopic, err)
 	}
 
 	request := core.NewTextMessage("request").WithReplyTo("caller-reply").WithHeader("trace-id", "abc")
+	request.MessageID = "request-1"
 	original := request.Clone()
 	response, err := broker.Call(ctx, requestTopic, request, core.WithTimeout(10*time.Second))
 	if err != nil {
@@ -432,6 +435,9 @@ func TestCallPreservesRequestWithLiveKafka(t *testing.T) {
 	}
 	if response.BodyString() != "response" {
 		t.Fatalf("Call() response = %q, want response", response.BodyString())
+	}
+	if response.MessageID != "response-1" || response.GetHeader("request-message-id") != "request-1" {
+		t.Fatalf("request/reply lost message identity: %+v", response)
 	}
 	if !reflect.DeepEqual(request, original) {
 		t.Fatalf("request after Call() = %#v, want %#v", request, original)

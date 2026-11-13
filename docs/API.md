@@ -20,7 +20,14 @@ closing. Existing `MessageBroker` implementations do not need a new method.
 msg := core.NewMessage(body).
 	WithCorrelationID("request-1").
 	WithHeader("source", "api")
+msg.MessageID = "order-created-42"
 ```
+
+`MessageID` is an optional, application-assigned identity preserved through
+publish/subscribe and request/reply by both transports. Reuse it when retrying
+the same logical event. No ID is generated automatically, and it is separate
+from the RPC `CorrelationID`. See the runnable
+[duplicate-handling example](../examples/deduplication).
 
 Publish options:
 

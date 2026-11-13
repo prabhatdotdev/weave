@@ -79,6 +79,14 @@ broker, err := kafka.NewBroker(config)
 Kafka supports keys, explicit partitions, consumer groups, offset selection,
 request/reply, SASL configuration, and connection recovery.
 
+`Message.MessageID` is preserved as the reserved `message-id` record header on
+publishes, subscriptions, and RPC requests/replies, matching AMQP's native
+message ID property. Set `MessageID` rather than an application header of that
+name; the field takes precedence if both are supplied. External Kafka producers
+can set the same header for interoperability. Missing IDs remain empty.
+Identity does not suppress duplicates automatically; see the
+[duplicate-handling example](../examples/deduplication).
+
 Kafka Publish waits for the configured broker acknowledgment. `RequiredAcks=1`
 (the default) waits for the leader; `RequiredAcks=-1` waits for all in-sync
 replicas and should be combined with an appropriate broker

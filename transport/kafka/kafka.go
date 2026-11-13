@@ -496,11 +496,21 @@ func (b *Broker) Publish(ctx context.Context, destination string, msg *core.Mess
 
 	if len(msg.Headers) > 0 {
 		for k, v := range msg.Headers {
+			if k == "message-id" && msg.MessageID != "" {
+				continue
+			}
 			kafkaMsg.Headers = append(kafkaMsg.Headers, sarama.RecordHeader{
 				Key:   []byte(k),
 				Value: []byte(v),
 			})
 		}
+	}
+
+	if msg.MessageID != "" {
+		kafkaMsg.Headers = append(kafkaMsg.Headers, sarama.RecordHeader{
+			Key:   []byte("message-id"),
+			Value: []byte(msg.MessageID),
+		})
 	}
 
 	if msg.CorrelationID != "" {
@@ -1313,6 +1323,8 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 				key := string(header.Key)
 				value := string(header.Value)
 				switch key {
+				case "message-id":
+					msg.MessageID = value
 				case "correlation-id":
 					correlationID = value
 					msg.CorrelationID = value
