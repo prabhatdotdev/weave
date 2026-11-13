@@ -1022,7 +1022,10 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 	finishCall := b.metrics.StartCall(ctx, destination, corrID, started, b.emitEvent)
 	defer func() {
 		b.pendingMu.Lock()
-		delete(b.pending, corrID)
+		// A reconnect may have registered a newer call with the same ID.
+		if b.pending[corrID] == pending {
+			delete(b.pending, corrID)
+		}
 		b.pendingMu.Unlock()
 		finishCall(resultErr)
 	}()

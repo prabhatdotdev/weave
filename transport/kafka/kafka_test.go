@@ -679,9 +679,10 @@ func TestConcurrentResponseDeliveryAndDisconnect(t *testing.T) {
 		pending := newPendingCall()
 		broker.pending["corr-1"] = pending
 		handler := &consumerGroupHandler{
-			closeChan: make(chan struct{}),
-			pending:   broker.pending,
-			pendingMu: &broker.pendingMu,
+			closeChan:  make(chan struct{}),
+			replyTopic: "reply-topic",
+			pending:    broker.pending,
+			pendingMu:  &broker.pendingMu,
 		}
 		claim := &fakeClaim{messages: make(chan *sarama.ConsumerMessage, 1)}
 		claim.messages <- &sarama.ConsumerMessage{
@@ -722,6 +723,50 @@ func TestConcurrentResponseDeliveryAndDisconnect(t *testing.T) {
 }
 
 func TestConsumerGroupHandlerRoutesResponsesAndInvokesHandlers(t *testing.T) {
+	t.Run("request cannot complete a pending RPC", func(t *testing.T) {
+		pending := newPendingCall()
+		called := false
+		handler := &consumerGroupHandler{
+			routes: map[string]subscriptionRoute{
+				"requests": {handler: func(_ context.Context, msg *core.Message) error {
+					called = true
+					if msg.CorrelationID != "shared-id" || msg.ReplyTo != "replies" {
+						t.Errorf("request metadata = %#v", msg)
+					}
+					return nil
+				}},
+			},
+			closeChan:  make(chan struct{}),
+			replyTopic: "replies",
+			pending:    map[string]*pendingCall{"shared-id": pending},
+			pendingMu:  &sync.RWMutex{},
+		}
+		claim := &fakeClaim{messages: make(chan *sarama.ConsumerMessage, 1)}
+		claim.messages <- &sarama.ConsumerMessage{
+			Topic: "requests", Value: []byte("request"),
+			Headers: []*sarama.RecordHeader{
+				{Key: []byte("correlation-id"), Value: []byte("shared-id")},
+				{Key: []byte("reply-to"), Value: []byte("replies")},
+			},
+		}
+		close(claim.messages)
+		session := &fakeSession{}
+		if err := handler.ConsumeClaim(session, claim); err != nil {
+			t.Fatal(err)
+		}
+		if !called {
+			t.Error("request bypassed its handler")
+		}
+		select {
+		case reply := <-pending.response:
+			t.Fatalf("request completed the RPC: %#v", reply)
+		default:
+		}
+		if len(session.marked) != 1 {
+			t.Fatalf("processed request marked %d times, want 1", len(session.marked))
+		}
+	})
+
 	t.Run("routes messages to handlers by topic", func(t *testing.T) {
 		called := make(map[string]int)
 		handler := &consumerGroupHandler{
@@ -768,14 +813,15 @@ func TestConsumerGroupHandlerRoutesResponsesAndInvokesHandlers(t *testing.T) {
 				handlerCalled = true
 				return nil
 			},
-			closeChan: make(chan struct{}),
-			pending:   pending,
-			pendingMu: &sync.RWMutex{},
+			closeChan:  make(chan struct{}),
+			replyTopic: "replies",
+			pending:    pending,
+			pendingMu:  &sync.RWMutex{},
 		}
 
 		claim := &fakeClaim{messages: make(chan *sarama.ConsumerMessage, 1)}
 		claim.messages <- &sarama.ConsumerMessage{
-			Topic:     "users",
+			Topic:     "replies",
 			Partition: 0,
 			Offset:    3,
 			Headers: []*sarama.RecordHeader{

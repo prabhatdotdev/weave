@@ -40,7 +40,7 @@ func TestBrokerContract(t *testing.T) {
 		consume := func(ctx context.Context, wire *sarama.ConsumerMessage) error {
 			_, routes := broker.activeSubscriptionRoutes()
 			handler := &consumerGroupHandler{routes: routes, closeChan: broker.closeChan, pending: broker.pending,
-				pendingMu: &broker.pendingMu, config: broker.config, work: &broker.work, metrics: &broker.metrics}
+				pendingMu: &broker.pendingMu, replyTopic: broker.kafkaConfig.ReplyTopic, config: broker.config, work: &broker.work, metrics: &broker.metrics}
 			messages := make(chan *sarama.ConsumerMessage, 1)
 			messages <- wire
 			close(messages)

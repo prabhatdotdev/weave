@@ -781,7 +781,10 @@ func (b *Broker) runSubscriptionConsumer(changed <-chan struct{}) {
 					return
 				}
 				b.watchConsumerErrors(consumeCtx, "*", consumer)
-				handler := &consumerGroupHandler{routes: routes, closeChan: b.closeChan, pending: b.pending, pendingMu: &b.pendingMu, config: b.config, work: &b.work, metrics: &b.metrics}
+				handler := &consumerGroupHandler{
+					routes: routes, closeChan: b.closeChan, replyTopic: b.kafkaConfig.ReplyTopic,
+					pending: b.pending, pendingMu: &b.pendingMu, config: b.config, work: &b.work, metrics: &b.metrics,
+				}
 				topics := make([]string, 0, len(routes))
 				for topic := range routes {
 					topics = append(topics, topic)
@@ -924,7 +927,10 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 	finishCall := b.metrics.StartCall(ctx, destination, corrID, started, b.emitEvent)
 	defer func() {
 		b.pendingMu.Lock()
-		delete(b.pending, corrID)
+		// A reconnect may have registered a newer call with the same ID.
+		if b.pending[corrID] == pending {
+			delete(b.pending, corrID)
+		}
 		b.pendingMu.Unlock()
 		finishCall(resultErr)
 	}()
@@ -1279,16 +1285,17 @@ func (b *Broker) watchConsumerErrors(ctx context.Context, destination string, co
 }
 
 type consumerGroupHandler struct {
-	metrics   *observability.Metrics
-	work      *lifecycle.Group
-	handler   core.Handler
-	routes    map[string]subscriptionRoute
-	closeChan chan struct{}
-	workers   chan struct{}
-	pending   map[string]*pendingCall
-	pendingMu *sync.RWMutex
-	config    *core.Config
-	policy    core.HandlerErrorPolicy
+	metrics    *observability.Metrics
+	work       *lifecycle.Group
+	handler    core.Handler
+	routes     map[string]subscriptionRoute
+	closeChan  chan struct{}
+	replyTopic string
+	workers    chan struct{}
+	pending    map[string]*pendingCall
+	pendingMu  *sync.RWMutex
+	config     *core.Config
+	policy     core.HandlerErrorPolicy
 }
 
 func (h *consumerGroupHandler) route(topic string) (subscriptionRoute, bool) {
@@ -1372,7 +1379,7 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 				}
 			}
 
-			if correlationID != "" {
+			if h.replyTopic != "" && kafkaMsg.Topic == h.replyTopic && correlationID != "" {
 				h.pendingMu.RLock()
 				pending, exists := h.pending[correlationID]
 				h.pendingMu.RUnlock()

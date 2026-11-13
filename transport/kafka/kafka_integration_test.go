@@ -191,6 +191,35 @@ func TestSubscriptionCancellationStopsActiveHandlerWithLiveKafka(t *testing.T) {
 	}
 }
 
+func TestCallOwnSubscriptionWithLiveKafka(t *testing.T) {
+	broker, topics, ctx := newLiveKafkaBroker(t, "rpc-own-subscription", 1)
+	requestTopic := topics[0]
+	handled := make(chan *core.Message, 1)
+	if err := broker.Subscribe(ctx, requestTopic, func(handlerCtx context.Context, request *core.Message) error {
+		handled <- request
+		response := core.NewTextMessage("processed response").WithCorrelationID(request.CorrelationID)
+		return broker.Publish(handlerCtx, request.ReplyTo, response)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	response, err := broker.Call(ctx, requestTopic, core.NewTextMessage("original request").WithCorrelationID("own-request"), core.WithTimeout(10*time.Second))
+	if err != nil {
+		t.Fatalf("Call() error = %v", err)
+	}
+	if response.BodyString() != "processed response" || response.CorrelationID != "own-request" {
+		t.Fatalf("Call() returned %#v, want the handler's response", response)
+	}
+	select {
+	case request := <-handled:
+		if request.BodyString() != "original request" || request.ReplyTo != broker.kafkaConfig.ReplyTopic {
+			t.Fatalf("handler received %#v", request)
+		}
+	default:
+		t.Fatal("Call() completed without running the request handler")
+	}
+}
+
 func TestRPCResponseDeliveryAndCloseWithLiveKafka(t *testing.T) {
 	broker, responder, requestTopic, ctx := newLiveKafkaRPCPair(t, "fix-006")
 
