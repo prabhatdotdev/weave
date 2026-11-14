@@ -142,9 +142,10 @@ func testReplicatedKafka(t *testing.T, partition bool) {
 		}
 		return true
 	})
-	if err := directClusterProduce(clusterKafkaAddresses[0], topics[3]); err != nil {
-		t.Fatalf("healthy direct-produce baseline failed: %v", err)
-	}
+	// Leader metadata can converge before the restarted broker can confirm writes.
+	brokerstress.Eventually(t, ctx, "confirmed direct write before cluster disruption", func() bool {
+		return directClusterProduce(clusterKafkaAddresses[0], topics[3]) == nil
+	})
 	config := core.DefaultConfig()
 	config.Kafka = core.DefaultKafkaConfig()
 	config.Kafka.Brokers = slices.Clone(clusterKafkaAddresses)
