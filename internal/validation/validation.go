@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/prabhatdotdev/weave/core"
@@ -40,6 +41,7 @@ func Config(config *core.Config) (*core.Config, error) {
 	copy := *config
 	if config.AMQP != nil {
 		amqp := *config.AMQP
+		amqp.Endpoints = append([]string(nil), amqp.Endpoints...)
 		amqp.TLS = cloneTLS(amqp.TLS)
 		copy.AMQP = &amqp
 	}
@@ -84,16 +86,26 @@ func validateTLS(config *tls.Config) error {
 }
 
 func AMQP(config *core.AMQPConfig) error {
-	if strings.TrimSpace(config.Host) == "" || strings.ContainsAny(config.Host, " /@\t\r\n") {
-		return invalid("AMQP host must be a hostname or IP address")
-	}
-	if strings.Contains(config.Host, ":") {
-		if _, err := netip.ParseAddr(config.Host); err != nil {
-			return invalid("AMQP host must not include a port or invalid IPv6 address")
+	if len(config.Endpoints) == 0 {
+		if err := amqpHost(config.Host); err != nil {
+			return err
+		}
+		if config.Port < 1 || config.Port > 65535 {
+			return invalid("AMQP port must be between 1 and 65535")
 		}
 	}
-	if config.Port < 1 || config.Port > 65535 {
-		return invalid("AMQP port must be between 1 and 65535")
+	for _, endpoint := range config.Endpoints {
+		host, port, err := net.SplitHostPort(endpoint)
+		if err != nil || amqpHost(host) != nil {
+			return invalid("AMQP endpoints must use host:port addresses")
+		}
+		if port == "" || strings.IndexFunc(port, func(r rune) bool { return r < '0' || r > '9' }) >= 0 {
+			return invalid("AMQP endpoint ports must be numeric")
+		}
+		number, err := strconv.Atoi(port)
+		if err != nil || number < 1 || number > 65535 {
+			return invalid("AMQP endpoint ports must be between 1 and 65535")
+		}
 	}
 	if config.Heartbeat < 0 {
 		return invalid("AMQP heartbeat must not be negative")
@@ -102,6 +114,20 @@ func AMQP(config *core.AMQPConfig) error {
 		return err
 	}
 	return validateTLS(config.TLS)
+}
+
+func amqpHost(host string) error {
+	if !utf8.ValidString(host) || host == "" || strings.ContainsAny(host, "/@\\?#") || strings.IndexFunc(host, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
+		return invalid("AMQP host must be a hostname or IP address")
+	}
+	if strings.Contains(host, ":") {
+		if _, err := netip.ParseAddr(host); err != nil {
+			return invalid("AMQP host must not include a port or invalid IPv6 address")
+		}
+	} else if strings.Contains(host, "%") {
+		return invalid("AMQP hostname must not contain percent escapes")
+	}
+	return nil
 }
 
 func Kafka(config *core.KafkaConfig) error {

@@ -38,9 +38,12 @@ type Config struct {
 // AMQPConfig holds AMQP/RabbitMQ-specific configuration.
 type AMQPConfig struct {
 	// TLS enables AMQPS when non-nil. Certificates are verified by default.
-	TLS             *tls.Config
-	Host            string
-	Port            int
+	TLS  *tls.Config
+	Host string
+	Port int
+	// Endpoints is an ordered list of host:port addresses, overriding Host/Port.
+	// Empty preserves the single-host behavior. All endpoints share credentials and TLS.
+	Endpoints       []string
 	Username        string
 	Password        string
 	VHost           string

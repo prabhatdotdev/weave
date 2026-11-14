@@ -47,7 +47,7 @@ for backend in "${backends[@]}"; do
     export WEAVE_CLUSTER_KAFKA_CONTAINERS="$container_ids"
   fi
   go test -race -count=1 -timeout="${WEAVE_CLUSTER_TIMEOUT:-12m}" -v "./transport/$backend" \
-    -run '^Test(ReplicatedFailover|NetworkPartition)WithCluster'
+    -run '^Test(ReplicatedFailover|NetworkPartition|EndpointFailover)WithCluster'
   # Keep peak memory bounded by running one three-node cluster at a time.
   "${compose[@]}" down --volumes --remove-orphans
 done

@@ -149,6 +149,13 @@ deterministic exponential delay until explicitly wrapped with jitter. Kafka's
 `RetryBackoff` continues to control Sarama's internal producer retries.
 Custom strategies must return promptly and support concurrent calls if shared.
 
+`AMQPConfig.Endpoints` optionally supplies ordered `host:port` addresses for
+startup and automatic failover. It overrides `Host`/`Port`; an empty list retains
+the legacy address. All entries share credentials, vhost, and TLS configuration.
+Each AMQP retry round tries the whole list before backoff. After a successful
+connection is lost, the next connection starts at the following entry. See
+[AMQP failover and delivery limits](TRANSPORTS.md#amqp).
+
 `core.DeadLetterHandler` composes retries with a confirmed dead-letter publish:
 
 ```go

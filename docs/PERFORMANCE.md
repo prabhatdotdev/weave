@@ -67,9 +67,18 @@ management API on 25682. Business queues are explicitly provisioned as quorum
 queues with three members. The fixture enables RabbitMQ's documented
 [queue-type redeclaration compatibility setting](https://www.rabbitmq.com/docs/quorum-queues#relaxed-property-equivalence)
 because the library's subscription declarations omit queue-type arguments.
-RPC reply queues remain connection-local classic queues. The library connects
-to node 2 while node 1 initially leads the quorum queues, so this tests replicated
-queue failover through a surviving connection, not AMQP endpoint selection.
+RPC reply queues remain connection-local classic queues. The leader-crash and
+peer-partition cases connect to node 2 while node 1 initially leads the quorum
+queues, exercising queue failover through a surviving connection. A third AMQP
+case configures all three endpoints, verifies the actual socket is connected to
+node 1, and kills that connected node. It requires a connection to a different
+configured endpoint, restored subscriptions, confirmed delivery, readiness, and
+working RPCs while node 1 stays stopped. RPC reply consumers must be recreated
+on the new connection. Healing must preserve the healthy replacement connection.
+This case allows 90 seconds to drain confirmed events because RabbitMQ's
+[disconnected-consumer timeout](https://www.rabbitmq.com/docs/quorum-queues#disconnected-consumer-node-timeout)
+can retain outstanding deliveries for 60 seconds after a consumer node is lost.
+It still requires every confirmed event to complete before restarting that node.
 
 Kafka uses three combined KRaft broker/controller nodes and exposes client
 listeners on loopback ports 29091–29093. Event, request,
@@ -78,7 +87,7 @@ reply, and probe topics each have one partition, three replicas, and
 replica placement makes node 1 the initial partition leader, and internal
 consumer offsets are also replicated across three brokers.
 
-Each transport runs two failures under concurrent publish/RPC traffic:
+Both transports run these failures under concurrent publish/RPC traffic:
 
 1. Kill the actual initial leader with SIGKILL and leave it stopped while the
    remaining two members elect leaders and process confirmed work.
@@ -89,7 +98,7 @@ Each transport runs two failures under concurrent publish/RPC traffic:
    network. Kafka's minority probe sends directly to the isolated broker so
    metadata routing cannot send the probe to a healthy member.
 
-Both cases retain a confirmed pre-fault marker behind a paused handler, then
+All cases retain a confirmed pre-fault marker behind a paused handler, then
 require its delivery, intact identity and payload, new confirmed business
 publishes, successful RPCs, consumer readiness, delivery of all confirmed events,
 and zero pending RPCs and active handlers

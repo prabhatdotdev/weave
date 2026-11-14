@@ -20,6 +20,8 @@ type Fixture struct {
 	Broker           core.MessageBroker
 	Events, Requests string
 	Idle             func() bool
+	// DrainTimeout bounds delivery of confirmed events; zero uses 30 seconds.
+	DrainTimeout time.Duration
 }
 
 func Enabled(t testing.TB) {
@@ -342,7 +344,11 @@ func (w *workload) drain(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("traffic workers did not finish within operation deadlines")
 	}
-	wait(t, w.ctx, 30*time.Second, "delivery of all confirmed publishes", func() bool { return w.ledger.count() == 0 })
+	drainTimeout := w.DrainTimeout
+	if drainTimeout <= 0 {
+		drainTimeout = 30 * time.Second
+	}
+	wait(t, w.ctx, drainTimeout, "delivery of all confirmed publishes", func() bool { return w.ledger.count() == 0 })
 	wait(t, w.ctx, 15*time.Second, "pending RPC and handler cleanup before shutdown", w.Idle)
 	select {
 	case err := <-w.unexpected:

@@ -43,8 +43,18 @@ func clusterQuorumState(ctx context.Context, queue string) (quorumState, error) 
 	return state, err
 }
 
-func testReplicatedRabbitMQ(t *testing.T, partition bool) {
+func clusterConnectedAMQPEndpoint(broker *Broker) string {
+	broker.closeMu.RLock()
+	defer broker.closeMu.RUnlock()
+	if adapter, ok := broker.conn.(*amqpConnectionAdapter); ok {
+		return adapter.conn.RemoteAddr().String()
+	}
+	return ""
+}
+
+func testReplicatedRabbitMQ(t *testing.T, failure string) {
 	t.Helper()
+	partition, endpointFailover := failure == "partition", failure == "endpoint"
 	brokerstress.ClusterEnabled(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	t.Cleanup(cancel)
@@ -52,6 +62,9 @@ func testReplicatedRabbitMQ(t *testing.T, partition bool) {
 	config.AMQP = core.DefaultAMQPConfig()
 	config.AMQP.Host, config.AMQP.Port = "127.0.0.1", 25672
 	config.AMQP.QueueDurable, config.AMQP.Heartbeat = true, time.Second
+	if endpointFailover {
+		config.AMQP.Endpoints = []string{"127.0.0.1:25671", "127.0.0.1:25672", "127.0.0.1:25673"}
+	}
 	config.MaxPendingCalls = 16
 	config.ConnectionBackoff = core.JitteredBackoff(core.ExponentialBackoff(50*time.Millisecond, time.Second, 2))
 	prefix := "weave-cluster-" + rand.Text()
@@ -60,6 +73,7 @@ func testReplicatedRabbitMQ(t *testing.T, partition bool) {
 	leaderConfig := *config
 	leaderAMQP := *config.AMQP
 	leaderAMQP.Port = 25671
+	leaderAMQP.Endpoints = nil
 	leaderConfig.AMQP = &leaderAMQP
 	admin := stressAMQPAdmin(t, &leaderConfig)
 	for _, queue := range queues {
@@ -105,6 +119,9 @@ func testReplicatedRabbitMQ(t *testing.T, partition bool) {
 	if err := broker.Connect(ctx); err != nil {
 		t.Fatal(err)
 	}
+	if endpointFailover && clusterConnectedAMQPEndpoint(broker) != config.AMQP.Endpoints[0] {
+		t.Fatalf("expected connection to the node being killed, got %s", clusterConnectedAMQPEndpoint(broker))
+	}
 	node := brokerstress.NewClusterNode(t, "rabbitmq", 1)
 	fixture := brokerstress.Fixture{Broker: broker, Events: queues[0], Requests: queues[1], Idle: func() bool {
 		broker.pendingMu.RLock()
@@ -114,6 +131,10 @@ func testReplicatedRabbitMQ(t *testing.T, partition bool) {
 		broker.metrics.Snapshot(&event)
 		return pending == 0 && event.PendingRPCs == 0 && event.ActiveHandlers == 0
 	}}
+	if endpointFailover {
+		// RabbitMQ may hold deliveries owned by the disconnected node for 60 seconds.
+		fixture.DrainTimeout = 90 * time.Second
+	}
 	brokerstress.ReplicatedFailure(t, fixture, func(ctx context.Context) {
 		var err error
 		if partition {
@@ -125,6 +146,13 @@ func testReplicatedRabbitMQ(t *testing.T, partition bool) {
 			t.Fatal(err)
 		}
 		brokerstress.Eventually(t, ctx, "quorum leaders on the surviving majority", func() bool { return checkQueues(false) })
+		if endpointFailover {
+			brokerstress.Eventually(t, ctx, "connection and subscriptions on a different live endpoint", func() bool {
+				address := clusterConnectedAMQPEndpoint(broker)
+				return slices.Contains(config.AMQP.Endpoints[1:], address) && broker.IsReady()
+			})
+			t.Logf("connected_node_killed=true recovered_endpoint=%s", clusterConnectedAMQPEndpoint(broker))
+		}
 		if partition {
 			connection, err := net.DialTimeout("tcp", "127.0.0.1:25671", time.Second)
 			if err != nil {
@@ -147,8 +175,12 @@ func testReplicatedRabbitMQ(t *testing.T, partition bool) {
 			t.Fatal(err)
 		}
 		brokerstress.Eventually(t, ctx, "all quorum replicas rejoining after healing", func() bool { return checkQueues(true) })
+		if endpointFailover && clusterConnectedAMQPEndpoint(broker) == config.AMQP.Endpoints[0] {
+			t.Fatal("healing unnecessarily moved a healthy connection back to the failed endpoint")
+		}
 	})
 }
 
-func TestReplicatedFailoverWithClusterRabbitMQ(t *testing.T) { testReplicatedRabbitMQ(t, false) }
-func TestNetworkPartitionWithClusterRabbitMQ(t *testing.T)   { testReplicatedRabbitMQ(t, true) }
+func TestReplicatedFailoverWithClusterRabbitMQ(t *testing.T) { testReplicatedRabbitMQ(t, "leader") }
+func TestNetworkPartitionWithClusterRabbitMQ(t *testing.T)   { testReplicatedRabbitMQ(t, "partition") }
+func TestEndpointFailoverWithClusterRabbitMQ(t *testing.T)   { testReplicatedRabbitMQ(t, "endpoint") }

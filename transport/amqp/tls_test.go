@@ -22,7 +22,7 @@ func TestTLSConfigurationAndEscapedConnectionAddress(t *testing.T) {
 	}
 	broker := brokerAny.(*Broker)
 	defer broker.Close()
-	address, err := amqplib.ParseURI(broker.connectionString())
+	address, err := amqplib.ParseURI(broker.connectionString(broker.endpoints[0]))
 	if err != nil {
 		t.Fatal(err)
 	}

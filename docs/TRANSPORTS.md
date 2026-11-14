@@ -18,6 +18,39 @@ AMQP supports exchange routing, mandatory delivery, persistence, priority,
 expiration, queue binding, prefetch, exclusive consumers, request/reply, and
 connection recovery.
 
+For automatic endpoint failover, supply addresses from the same RabbitMQ cluster:
+
+```go
+config.AMQP.Endpoints = []string{"rabbit-1:5672", "rabbit-2:5672", "rabbit-3:5672"}
+```
+
+The ordered list overrides `Host` and `Port`; leaving it empty preserves their
+existing behavior. Use explicit numeric ports and brackets around IPv6 addresses.
+Endpoints share the configured credentials, vhost, heartbeat, and TLS settings.
+The constructor copies the list. Successful `connect` events include the selected
+endpoint in `Fields["address"]`, without credentials.
+
+Initial connection starts at the first endpoint. After connection loss, recovery
+starts at the next endpoint, wraps around, and restores active subscriptions and
+bindings. Each retry round tries every endpoint before waiting for `RetryDelay`
+or `ConnectionBackoff`; `ConnectionRetry` counts additional rounds. Its existing
+zero-value default remains three retries. A healthy connection stays on its
+current endpoint when another node returns.
+
+Cancellation, closure, and shutdown stop further endpoint attempts. TCP dialing
+retains its existing 30-second timeout; an earlier caller deadline can end the
+operation before every endpoint is tried. Pending RPCs fail on connection loss,
+and new calls create a reply queue on the new connection. Recovery does not replay
+in-flight publishes or RPC requests; callers must account for uncertain outcomes
+and possible duplicates when retrying them.
+RPC requests stay on the channel that owns their reply queue; a concurrent
+connection change fails the call instead of sending an empty or stale reply address
+through the replacement connection.
+
+Queue availability still depends on broker topology. Provision replicated quorum
+queues for messages that must remain available after their original node fails;
+switching endpoints cannot make an unavailable single-node classic queue available.
+
 Publish waits for a RabbitMQ publisher confirmation. With `WithMandatory()`,
 an unroutable message returns `ErrPublishFailed` wrapping `ErrUnroutable`;
 a negative confirmation wraps `ErrPublishRejected`. Without the mandatory
@@ -58,6 +91,12 @@ TLS defaults to a minimum of TLS 1.2 and verifies certificates and hostnames;
 failed verification never falls back to plaintext. Kafka TLS composes with
 SASL. Constructors copy configuration, including broker addresses, SASL,
 and TLS settings, before applying defaults.
+
+AMQP endpoint lists use the same TLS policy for every address. Include the TLS
+port in each entry; `Port` is ignored when the list is set. With an empty
+`TLS.ServerName`, each connection verifies its own endpoint hostname. An explicit
+`ServerName` applies to every endpoint. TLS settings are isolated per attempt so
+hostname selection from a failed connection cannot affect the next one.
 
 The verified TLS fixtures cover both transports, untrusted certificates,
 hostname mismatches, and Kafka SCRAM over TLS. See

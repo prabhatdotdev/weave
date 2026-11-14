@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -137,15 +138,17 @@ func (p *pendingCall) complete(response *amqplib.Delivery) {
 
 // Broker implements the core.MessageBroker interface for AMQP/RabbitMQ.
 type Broker struct {
-	work       lifecycle.Group
-	ready      readiness.Signal
-	metrics    observability.Metrics
-	rpcSlots   rpclimit.Limiter
-	config     *core.Config
-	amqpConfig *core.AMQPConfig
-	conn       amqpConnection
-	channel    amqpChannel
-	dial       func(string, amqplib.Config) (amqpConnection, error)
+	work         lifecycle.Group
+	ready        readiness.Signal
+	metrics      observability.Metrics
+	rpcSlots     rpclimit.Limiter
+	config       *core.Config
+	amqpConfig   *core.AMQPConfig
+	conn         amqpConnection
+	channel      amqpChannel
+	dial         func(string, amqplib.Config) (amqpConnection, error)
+	endpoints    []string
+	nextEndpoint int // guarded by closeMu
 
 	replyQueue        string
 	replyConsumerStop chan struct{}
@@ -192,11 +195,16 @@ func NewBroker(config *core.Config) (core.MessageBroker, error) {
 	if err := validation.AMQP(config.AMQP); err != nil {
 		return nil, err
 	}
+	endpoints := config.AMQP.Endpoints
+	if len(endpoints) == 0 {
+		endpoints = []string{net.JoinHostPort(config.AMQP.Host, fmt.Sprint(config.AMQP.Port))}
+	}
 
 	return &Broker{
 		config:     config,
 		rpcSlots:   rpclimit.New(config.MaxPendingCalls),
 		amqpConfig: config.AMQP,
+		endpoints:  endpoints,
 		dial: func(connString string, config amqplib.Config) (amqpConnection, error) {
 			conn, err := amqplib.DialConfig(connString, config)
 			if err != nil {
@@ -286,7 +294,9 @@ func (b *Broker) Connect(ctx context.Context) error {
 	if err != nil {
 		event.Level = core.EventLevelError
 		event.Fields["outcome"] = "failure"
-		event.Fields["address"] = fmt.Sprintf("%s:%d", b.amqpConfig.Host, b.amqpConfig.Port)
+		event.Fields["address"] = strings.Join(b.endpoints, ", ")
+	} else {
+		event.Fields["address"] = client.address
 	}
 	b.emitEvent(ctx, event)
 	return err
@@ -295,12 +305,12 @@ func (b *Broker) Connect(ctx context.Context) error {
 type openedConnection struct {
 	conn    amqpConnection
 	channel amqpChannel
+	address string
 }
 
 func (c *openedConnection) Close() error { return c.conn.Close() }
 
 func (b *Broker) open(ctx context.Context) (*openedConnection, error) {
-	connString := b.connectionString()
 	retries := b.config.ConnectionRetry
 	if retries <= 0 {
 		retries = 3
@@ -308,40 +318,22 @@ func (b *Broker) open(ctx context.Context) (*openedConnection, error) {
 
 	var err error
 	for i := 0; i <= retries; i++ {
-		var client *openedConnection
-		client, err = connection.Open(ctx, b.closeChan, net.Dialer{Timeout: 30 * time.Second}, func(dialer *connection.Dialer) (*openedConnection, error) {
-			tlsConfig := b.amqpConfig.TLS
-			if tlsConfig != nil {
-				tlsConfig = tlsConfig.Clone()
+		for range b.endpoints {
+			if waitErr := connection.Wait(ctx, b.closeChan, b.work.Stopping(), 0); waitErr != nil {
+				return nil, waitErr
 			}
-			conn, err := b.dial(connString, amqplib.Config{
-				Heartbeat:       b.amqpConfig.Heartbeat,
-				TLSClientConfig: tlsConfig,
-				Properties:      amqplib.Table{"connection_name": b.config.ConnectionName},
-				Dial: func(network, address string) (net.Conn, error) {
-					conn, err := dialer.Dial(network, address)
-					if err != nil {
-						return nil, err
-					}
-					if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
-						_ = conn.Close()
-						return nil, err
-					}
-					return conn, nil
-				},
-			})
-			if err != nil {
-				return nil, err
+			b.closeMu.Lock()
+			address := b.endpoints[b.nextEndpoint]
+			b.nextEndpoint = (b.nextEndpoint + 1) % len(b.endpoints)
+			b.closeMu.Unlock()
+			var client *openedConnection
+			client, err = b.openEndpoint(ctx, address)
+			if err == nil {
+				return client, nil
 			}
-			channel, err := conn.Channel()
-			if err != nil {
-				_ = conn.Close()
-				return nil, fmt.Errorf("failed to open channel: %w", err)
+			if waitErr := connection.Wait(ctx, b.closeChan, b.work.Stopping(), 0); waitErr != nil {
+				return nil, waitErr
 			}
-			return &openedConnection{conn: conn, channel: channel}, nil
-		})
-		if err == nil {
-			return client, nil
 		}
 		if i < retries {
 			delay := connection.Backoff(b.config, i+1, 2*time.Second)
@@ -351,14 +343,44 @@ func (b *Broker) open(ctx context.Context) (*openedConnection, error) {
 		}
 	}
 
-	return nil, &core.ErrConnectionFailed{
-		Backend: backendName,
-		Address: fmt.Sprintf("%s:%d", b.amqpConfig.Host, b.amqpConfig.Port),
-		Cause:   err,
-	}
+	return nil, &core.ErrConnectionFailed{Backend: backendName, Address: strings.Join(b.endpoints, ", "), Cause: err}
 }
 
-func (b *Broker) connectionString() string {
+func (b *Broker) openEndpoint(ctx context.Context, address string) (*openedConnection, error) {
+	return connection.Open(ctx, b.closeChan, net.Dialer{Timeout: 30 * time.Second}, func(dialer *connection.Dialer) (*openedConnection, error) {
+		tlsConfig := b.amqpConfig.TLS
+		if tlsConfig != nil {
+			tlsConfig = tlsConfig.Clone()
+		}
+		conn, err := b.dial(b.connectionString(address), amqplib.Config{
+			Heartbeat:       b.amqpConfig.Heartbeat,
+			TLSClientConfig: tlsConfig,
+			Properties:      amqplib.Table{"connection_name": b.config.ConnectionName},
+			Dial: func(network, address string) (net.Conn, error) {
+				conn, err := dialer.Dial(network, address)
+				if err != nil {
+					return nil, err
+				}
+				if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+					_ = conn.Close()
+					return nil, err
+				}
+				return conn, nil
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+		channel, err := conn.Channel()
+		if err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("failed to open channel: %w", err)
+		}
+		return &openedConnection{conn: conn, channel: channel, address: address}, nil
+	})
+}
+
+func (b *Broker) connectionString(endpoint string) string {
 	scheme := "amqp"
 	if b.amqpConfig.TLS != nil {
 		scheme = "amqps"
@@ -370,7 +392,7 @@ func (b *Broker) connectionString() string {
 	address := url.URL{
 		Scheme:  scheme,
 		User:    url.UserPassword(b.amqpConfig.Username, b.amqpConfig.Password),
-		Host:    net.JoinHostPort(b.amqpConfig.Host, fmt.Sprint(b.amqpConfig.Port)),
+		Host:    endpoint,
 		Path:    "/" + vhost,
 		RawPath: "/" + url.PathEscape(vhost),
 	}
@@ -643,6 +665,11 @@ func (b *Broker) Close() error {
 
 // Publish sends a message to the specified queue.
 func (b *Broker) Publish(ctx context.Context, destination string, msg *core.Message, opts ...core.PublishOption) error {
+	return b.publish(ctx, destination, msg, nil, opts...)
+}
+
+// RPC requests must stay on the channel that owns their exclusive reply queue.
+func (b *Broker) publish(ctx context.Context, destination string, msg *core.Message, replyChannel amqpChannel, opts ...core.PublishOption) error {
 	started := time.Now()
 	options, err := validation.Publish(ctx, destination, msg, opts...)
 	if err != nil {
@@ -662,6 +689,9 @@ func (b *Broker) Publish(ctx context.Context, destination string, msg *core.Mess
 		defer cancel()
 	}
 	channel, err := b.currentChannel(false)
+	if replyChannel != nil && (err != nil || channel != replyChannel) {
+		return &core.ErrConnectionLost{Backend: backendName}
+	}
 	if err != nil {
 		return err
 	}
@@ -1073,8 +1103,15 @@ func (b *Broker) Call(ctx context.Context, destination string, msg *core.Message
 	}()
 
 	request := msg.Clone()
-	request.CorrelationID, request.ReplyTo = corrID, b.currentReplyQueue()
-	if err := b.Publish(ctx, destination, request, opts...); err != nil {
+	b.closeMu.RLock()
+	replyQueue := b.replyQueue
+	validReply := b.connected && !b.recovering && !b.closed && b.channel == channel && replyQueue != ""
+	b.closeMu.RUnlock()
+	if !validReply {
+		return nil, &core.ErrConnectionLost{Backend: backendName}
+	}
+	request.CorrelationID, request.ReplyTo = corrID, replyQueue
+	if err := b.publish(ctx, destination, request, channel, opts...); err != nil {
 		return nil, err
 	}
 
