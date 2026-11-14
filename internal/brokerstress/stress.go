@@ -334,7 +334,7 @@ func (w *workload) pause() (func(), <-chan struct{}) {
 	return func() { once.Do(func() { close(gate) }) }, entered
 }
 
-func (w *workload) finish(t *testing.T) {
+func (w *workload) drain(t *testing.T) {
 	t.Helper()
 	w.stopOnce.Do(func() { close(w.stop) })
 	select {
@@ -349,6 +349,11 @@ func (w *workload) finish(t *testing.T) {
 		t.Fatal(err)
 	default:
 	}
+}
+
+func (w *workload) finish(t *testing.T) {
+	t.Helper()
+	w.drain(t)
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := w.Broker.(core.Shutdowner).Shutdown(shutdownCtx); err != nil {

@@ -46,6 +46,65 @@ the race detector. These single-node process crashes preserve container data;
 they do not test host power loss, disk loss, replication failover, or a network
 partition between cluster members.
 
+## Replicated-cluster failover and network partitions
+
+```sh
+./scripts/test_clusters.sh
+# Run one transport:
+./scripts/test_clusters.sh amqp
+./scripts/test_clusters.sh kafka
+```
+
+These opt-in tests create a separately labeled, three-node cluster per transport
+using RabbitMQ 4.3.4 and Kafka 4.3.1. The runner requires Docker Compose 2.33.1
+or later, runs the clusters sequentially to bound memory, and removes their
+containers, networks, and fixture volumes on exit. CI runs each transport as a
+separate matrix job with the race detector. Unit tests skip these fixtures unless
+`WEAVE_CLUSTER_E2E=1`; use the runner to supply their ownership and network IDs.
+
+RabbitMQ exposes AMQP on loopback ports 25671–25673 and its majority-side
+management API on 25682. Business queues are explicitly provisioned as quorum
+queues with three members. The fixture enables RabbitMQ's documented
+[queue-type redeclaration compatibility setting](https://www.rabbitmq.com/docs/quorum-queues#relaxed-property-equivalence)
+because the library's subscription declarations omit queue-type arguments.
+RPC reply queues remain connection-local classic queues. The library connects
+to node 2 while node 1 initially leads the quorum queues, so this tests replicated
+queue failover through a surviving connection, not AMQP endpoint selection.
+
+Kafka uses three combined KRaft broker/controller nodes and exposes client
+listeners on loopback ports 29091–29093. Event, request,
+reply, and probe topics each have one partition, three replicas, and
+`min.insync.replicas=2`. The library publishes with `RequiredAcks=-1`. Explicit
+replica placement makes node 1 the initial partition leader, and internal
+consumer offsets are also replicated across three brokers.
+
+Each transport runs two failures under concurrent publish/RPC traffic:
+
+1. Kill the actual initial leader with SIGKILL and leave it stopped while the
+   remaining two members elect leaders and process confirmed work.
+2. Disconnect that leader only from the dedicated peer network. Its process
+   stays running, and its separate client network and published port remain
+   reachable. Verify majority leadership and replication, reject a minority
+   write, and require majority traffic to recover before reconnecting the peer
+   network. Kafka's minority probe sends directly to the isolated broker so
+   metadata routing cannot send the probe to a healthy member.
+
+Both cases retain a confirmed pre-fault marker behind a paused handler, then
+require its delivery, intact identity and payload, new confirmed business
+publishes, successful RPCs, consumer readiness, delivery of all confirmed events,
+and zero pending RPCs and active handlers
+before healing. The restarted or reconnected member must then rejoin every
+quorum queue or return to every topic's in-sync replica set. A fresh publish
+and RPC must succeed after healing, followed by graceful shutdown.
+Failure cleanup restores disrupted nodes even when an assertion fails. Docker
+control refuses containers or networks without the fixture label and matching
+Compose project/service ownership.
+
+This covers one failed or isolated member with a surviving majority. It does
+not cover majority loss, asymmetric packet loss, disk/host loss, or TLS during
+cluster faults. Process-crash fixtures retain broker data. The single-node load
+and benchmark results below describe their original fixtures, not these clusters.
+
 ## AMQP publisher benchmark
 
 ```sh

@@ -1,0 +1,147 @@
+x-rabbit: &rabbit
+  image: weave-cluster-rabbitmq:local
+  build:
+    context: .
+    dockerfile: Dockerfile.rabbitmq
+  labels:
+    dev.weave.cluster: "true"
+  mem_limit: 512m
+  healthcheck:
+    test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+    interval: 2s
+    timeout: 5s
+    retries: 45
+
+x-rabbit-env: &rabbit-env
+  RABBITMQ_ERLANG_COOKIE: weave-isolated-cluster-fixture
+  RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "+S 2:2 +SDcpu 1 +SDio 1"
+
+x-kafka: &kafka
+  image: apache/kafka:4.3.1
+  labels:
+    dev.weave.cluster: "true"
+  mem_limit: 1g
+  healthcheck:
+    test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+    interval: 3s
+    timeout: 10s
+    retries: 45
+
+x-kafka-env: &kafka-env
+  CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+  KAFKA_HEAP_OPTS: "-Xms256m -Xmx512m"
+  KAFKA_PROCESS_ROLES: broker,controller
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CLIENT:PLAINTEXT,INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+  KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+  KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+  KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka1-peer:9093,2@kafka2-peer:9093,3@kafka3-peer:9093
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "3"
+  KAFKA_OFFSETS_TOPIC_NUM_PARTITIONS: "3"
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "3"
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "2"
+  KAFKA_MIN_INSYNC_REPLICAS: "2"
+  KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE: "false"
+  KAFKA_REPLICA_LAG_TIME_MAX_MS: "5000"
+  KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+
+services:
+  rabbit1:
+    <<: *rabbit
+    hostname: rabbit1
+    environment:
+      <<: *rabbit-env
+      RABBITMQ_NODENAME: rabbit@rabbit1-peer
+    ports:
+      - "127.0.0.1:25671:5672"
+    networks:
+      clients:
+        gw_priority: 1
+      peers:
+        aliases: [rabbit1-peer]
+
+  rabbit2:
+    <<: *rabbit
+    hostname: rabbit2
+    environment:
+      <<: *rabbit-env
+      RABBITMQ_NODENAME: rabbit@rabbit2-peer
+    ports:
+      - "127.0.0.1:25672:5672"
+      - "127.0.0.1:25682:15672"
+    networks:
+      clients:
+        gw_priority: 1
+      peers:
+        aliases: [rabbit2-peer]
+
+  rabbit3:
+    <<: *rabbit
+    hostname: rabbit3
+    environment:
+      <<: *rabbit-env
+      RABBITMQ_NODENAME: rabbit@rabbit3-peer
+    ports:
+      - "127.0.0.1:25673:5672"
+    networks:
+      clients:
+        gw_priority: 1
+      peers:
+        aliases: [rabbit3-peer]
+
+  kafka1:
+    <<: *kafka
+    hostname: kafka1
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: "1"
+      KAFKA_LISTENERS: CLIENT://:29091,INTERNAL://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: CLIENT://127.0.0.1:29091,INTERNAL://kafka1-peer:9092
+    ports:
+      - "127.0.0.1:29091:29091"
+    networks:
+      clients:
+        gw_priority: 1
+      peers:
+        aliases: [kafka1-peer]
+
+  kafka2:
+    <<: *kafka
+    hostname: kafka2
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: "2"
+      KAFKA_LISTENERS: CLIENT://:29092,INTERNAL://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: CLIENT://127.0.0.1:29092,INTERNAL://kafka2-peer:9092
+    ports:
+      - "127.0.0.1:29092:29092"
+    networks:
+      clients:
+        gw_priority: 1
+      peers:
+        aliases: [kafka2-peer]
+
+  kafka3:
+    <<: *kafka
+    hostname: kafka3
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: "3"
+      KAFKA_LISTENERS: CLIENT://:29093,INTERNAL://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: CLIENT://127.0.0.1:29093,INTERNAL://kafka3-peer:9092
+    ports:
+      - "127.0.0.1:29093:29093"
+    networks:
+      clients:
+        gw_priority: 1
+      peers:
+        aliases: [kafka3-peer]
+
+networks:
+  clients:
+    labels:
+      dev.weave.cluster: "true"
+  peers:
+    internal: true
+    labels:
+      dev.weave.cluster: "true"

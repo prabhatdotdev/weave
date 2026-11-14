@@ -14,6 +14,27 @@ permissions:
   contents: read
 
 jobs:
+  clusters:
+    name: Replicated Cluster (${{ matrix.transport }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        transport: [amqp, kafka]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run replicated failover and peer-network partition tests
+        run: ./scripts/test_clusters.sh "${{ matrix.transport }}"
+
   vulnerabilities:
     name: Vulnerability Check
     runs-on: ubuntu-latest

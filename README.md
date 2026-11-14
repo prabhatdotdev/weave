@@ -108,5 +108,7 @@ packages. Runnable examples live in [`examples`](examples).
 
 See [load tests and throughput measurements](docs/PERFORMANCE.md) for sustained
 traffic, repeated broker crashes, and confirmed AMQP publishing benchmarks.
+The same guide documents three-node replicated-cluster failover and peer-network
+partition tests for both transports: `./scripts/test_clusters.sh`.
 
 Apache-2.0 licensed.
