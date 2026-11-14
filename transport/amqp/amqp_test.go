@@ -79,7 +79,28 @@ func (c *fakeAMQPChannel) QueueDeclare(name string, durable, autoDelete, exclusi
 	if _, ok := c.consumerStreams[name]; !ok {
 		c.consumerStreams[name] = make(chan amqplib.Delivery)
 	}
-	return amqplib.Queue{Name: name}, nil
+	consumers := 0
+	for _, stream := range c.consumerTags {
+		if stream == c.consumerStreams[name] {
+			consumers++
+		}
+	}
+	return amqplib.Queue{Name: name, Consumers: consumers}, nil
+}
+
+func (c *fakeAMQPChannel) QueueDelete(name string, _, _, _ bool) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if stream, ok := c.consumerStreams[name]; ok {
+		delete(c.consumerStreams, name)
+		for tag, current := range c.consumerTags {
+			if current == stream {
+				delete(c.consumerTags, tag)
+			}
+		}
+		close(stream)
+	}
+	return 0, nil
 }
 
 func (c *fakeAMQPChannel) QueueBind(name, key, exchange string, noWait bool, args amqplib.Table) error {
@@ -309,6 +330,7 @@ func TestHandleResponsesRoutesByCorrelationID(t *testing.T) {
 	msgs <- amqplib.Delivery{CorrelationId: "corr-1", Body: []byte("reply")}
 	close(msgs)
 	stop := make(chan struct{})
+	broker.replyConsumerStop = stop
 
 	done := make(chan struct{})
 	go func() {
@@ -424,12 +446,14 @@ func TestConcurrentResponseDeliveryAndDisconnect(t *testing.T) {
 		msgs := make(chan amqplib.Delivery, 1)
 		msgs <- amqplib.Delivery{CorrelationId: "corr-1", Body: []byte("reply")}
 		close(msgs)
+		stop := make(chan struct{})
+		broker.replyConsumerStop = stop
 
 		start := make(chan struct{})
 		done := make(chan struct{}, 2)
 		go func() {
 			<-start
-			broker.handleResponses(msgs, make(chan struct{}))
+			broker.handleResponses(msgs, stop)
 			done <- struct{}{}
 		}()
 		go func() {

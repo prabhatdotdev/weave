@@ -3,6 +3,7 @@ package amqp
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,10 +16,11 @@ type blockedReplySetupChannel struct {
 	*fakeAMQPChannel
 	entered chan struct{}
 	release chan struct{}
+	started sync.Once
 }
 
 func (c *blockedReplySetupChannel) QueueDeclare(name string, durable, autoDelete, exclusive, noWait bool, args amqplib.Table) (amqplib.Queue, error) {
-	close(c.entered)
+	c.started.Do(func() { close(c.entered) })
 	<-c.release
 	return c.fakeAMQPChannel.QueueDeclare(name, durable, autoDelete, exclusive, noWait, args)
 }

@@ -136,6 +136,34 @@ func TestPublishTimeoutDoesNotReuseLateConfirmation(t *testing.T) {
 	}
 }
 
+func TestPublishTimeoutWhileTopologyOwnsChannelDoesNotWriteLater(t *testing.T) {
+	broker, channel := publisherTestBroker(t)
+	publisher := broker.channel.(*amqpChannelAdapter).publisher
+	publisher.wireMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			publisher.wireMu.Unlock()
+		}
+	}()
+	err := broker.Publish(context.Background(), "orders", core.NewTextMessage("expired"), core.WithTimeout(20*time.Millisecond))
+	if !core.IsTimeout(err) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Publish blocked by topology returned %v", err)
+	}
+	publisher.wireMu.Unlock()
+	locked = false
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := publisher.flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-channel.writes:
+		t.Fatal("expired publish wrote after topology released the channel")
+	default:
+	}
+}
+
 func TestPublishTimeoutBoundsBlockedSocketWrite(t *testing.T) {
 	broker, channel := publisherTestBroker(t)
 	release := make(chan struct{})

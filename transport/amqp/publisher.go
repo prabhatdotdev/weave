@@ -3,6 +3,7 @@ package amqp
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	amqplib "github.com/rabbitmq/amqp091-go"
 
@@ -22,6 +23,8 @@ type confirmedPublisher struct {
 	confirms <-chan amqplib.Confirmation
 	returns  <-chan amqplib.Return
 	closed   <-chan *amqplib.Error
+	// Topology methods must not interrupt a publish's sequence of content frames.
+	wireMu sync.Mutex
 	// shortcut: one outstanding publish per channel; pipeline receipts when measured throughput requires it.
 	gate chan struct{}
 }
@@ -70,10 +73,12 @@ func (p *confirmedPublisher) publish(ctx context.Context, exchange, key string, 
 	result := make(chan error, 1)
 	go func() {
 		defer func() { <-p.gate }()
+		p.wireMu.Lock()
 		err := ctx.Err()
 		if err == nil {
 			err = p.channel.PublishWithContext(ctx, exchange, key, mandatory, immediate, message)
 		}
+		p.wireMu.Unlock()
 		if err == nil {
 			// Keep the gate until the receipt arrives, even after caller cancellation,
 			// so late confirms and returns cannot be attributed to the next publish.

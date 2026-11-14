@@ -179,3 +179,136 @@ func TestEndpointCallPublishesOnlyOnItsReplyChannel(t *testing.T) {
 		t.Fatalf("old call used a replacement channel with stale reply queue %q", secondChannel.published[0].ReplyTo)
 	}
 }
+
+func TestCallRepairsReplyQueueLostWithoutConsumerNotification(t *testing.T) {
+	broker, sent := limitedTestBroker(t, 2, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	first := startLimitedCall(broker, ctx, "first")
+	awaitLimitedPublish(t, sent, "first")
+	queue := broker.currentReplyQueue()
+	channel := broker.channel.(*limitedChannel)
+	channel.mu.Lock()
+	oldStream := channel.consumerStreams[queue]
+	delete(channel.consumerStreams, queue)
+	for tag, stream := range channel.consumerTags {
+		if stream == oldStream {
+			delete(channel.consumerTags, tag)
+		}
+	}
+	// The cluster lost the queue, but the client never received basic.cancel.
+	channel.mu.Unlock()
+	second := startLimitedCall(broker, ctx, "second")
+	awaitLimitedPublish(t, sent, "second")
+	if err := awaitLimitedCall(t, first); !core.IsConnectionLost(err) {
+		t.Fatalf("call using the lost reply queue returned %v", err)
+	}
+	if broker.currentReplyQueue() == queue {
+		t.Fatal("reply-queue repair reused an address that can receive late responses")
+	}
+	channel.mu.Lock()
+	stream := channel.consumerStreams[broker.currentReplyQueue()]
+	consumers := len(channel.consumerTags)
+	_, oldQueueExists := channel.consumerStreams[queue]
+	channel.mu.Unlock()
+	if oldQueueExists {
+		t.Fatal("reply-queue repair left the stale queue behind")
+	}
+	if stream == nil || stream == oldStream || consumers != 1 {
+		t.Fatalf("reply consumer was not repaired: stream=%p old=%p consumers=%d", stream, oldStream, consumers)
+	}
+	select {
+	case stream <- amqplib.Delivery{CorrelationId: "second", Body: []byte("recovered")}:
+	case <-ctx.Done():
+		t.Fatal("replacement reply consumer did not receive a response")
+	}
+	if err := awaitLimitedCall(t, second); err != nil {
+		t.Fatalf("call after reply-queue repair failed: %v", err)
+	}
+	if !broker.IsConnected() || broker.IsRecovering() {
+		t.Fatal("reply-queue repair unnecessarily replaced the healthy connection")
+	}
+}
+
+func TestReplyConsumerClosureFailsPendingCalls(t *testing.T) {
+	broker, sent := limitedTestBroker(t, 1, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	call := startLimitedCall(broker, ctx, "first")
+	awaitLimitedPublish(t, sent, "first")
+	channel := broker.channel.(*limitedChannel)
+	channel.mu.Lock()
+	close(channel.consumerStreams[broker.currentReplyQueue()])
+	channel.mu.Unlock()
+	if err := awaitLimitedCall(t, call); !core.IsConnectionLost(err) {
+		t.Fatalf("lost reply consumer left a pending call: %v", err)
+	}
+	if queue := broker.currentReplyQueue(); queue != "" {
+		t.Fatalf("closed reply consumer retained queue %q", queue)
+	}
+}
+
+func TestOldReplyConsumerCannotInvalidateReplacement(t *testing.T) {
+	brokerAny, err := NewBroker(core.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker := brokerAny.(*Broker)
+	t.Cleanup(func() { _ = broker.Close() })
+	oldStop, currentStop := make(chan struct{}), make(chan struct{})
+	broker.replyQueue, broker.replyConsumerStop = "replacement", currentStop
+	pending := newPendingCall()
+	broker.pending["replacement-call"] = pending
+	oldStream := make(chan amqplib.Delivery)
+	close(oldStream)
+	broker.handleResponses(oldStream, oldStop)
+	if broker.currentReplyQueue() != "replacement" || broker.pending["replacement-call"] != pending {
+		t.Fatal("old reply consumer invalidated the replacement generation")
+	}
+	select {
+	case <-pending.response:
+		t.Fatal("old reply consumer failed the replacement call")
+	default:
+	}
+}
+
+func TestHealthyReplyConsumerIsReused(t *testing.T) {
+	broker, sent := limitedTestBroker(t, 2, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	for _, id := range []string{"first", "second"} {
+		call := startLimitedCall(broker, ctx, id)
+		awaitLimitedPublish(t, sent, id)
+		completeLimitedCall(t, broker, id)
+		if err := awaitLimitedCall(t, call); err != nil {
+			t.Fatal(err)
+		}
+	}
+	channel := broker.channel.(*limitedChannel)
+	channel.mu.Lock()
+	defer channel.mu.Unlock()
+	if len(channel.consumers) != 1 || len(channel.consumerTags) != 1 {
+		t.Fatalf("healthy calls recreated reply consumers: registrations=%d active=%d", len(channel.consumers), len(channel.consumerTags))
+	}
+}
+
+func TestOldReplyConsumerCannotRouteToReplacement(t *testing.T) {
+	brokerAny, err := NewBroker(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker := brokerAny.(*Broker)
+	t.Cleanup(func() { _ = broker.Close() })
+	broker.replyQueue, broker.replyConsumerStop = "replacement", make(chan struct{})
+	pending := newPendingCall()
+	broker.pending["reused-id"] = pending
+	oldStream := make(chan amqplib.Delivery, 1)
+	oldStream <- amqplib.Delivery{CorrelationId: "reused-id", Body: []byte("stale response")}
+	close(oldStream)
+	broker.handleResponses(oldStream, make(chan struct{}))
+	select {
+	case response := <-pending.response:
+		t.Fatalf("stale reply consumer completed the replacement call: %+v", response)
+	default:
+	}
+}

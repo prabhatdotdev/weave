@@ -740,6 +740,7 @@ adopting the new operational APIs:
 | Assuming `Close` drains active work | Call optional `Shutdown(ctx)` with a deadline; use `Close` for immediate cleanup |
 | Treating `Publish` as fire-and-forget | Budget for broker acknowledgment; handle uncertain timeout/disconnect outcomes and duplicates |
 | Kafka RPC without a provisioned reply topic | Provision `ReplyTopic`; give each concurrent caller its own reply topic and consumer group |
+| AMQP RPC permissions restricted to server-generated queue names | Allow the caller to declare/consume `weave.rpc.reply-*` queues and responders to publish to them; these unique temporary queues support repair after cluster healing |
 | Kafka `RequiredAcks=0` | Select `1` or `-1`; unacknowledged publishing is rejected |
 | Reusing an in-flight RPC correlation ID | Let Weave generate IDs or assign unique pending-call IDs |
 | Depending on permissive input handling | Handle `ErrInvalidConfig`; invalid addresses, nil options, negative limits/timeouts, and unsupported settings are rejected |

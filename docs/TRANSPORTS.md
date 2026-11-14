@@ -47,6 +47,18 @@ RPC requests stay on the channel that owns their reply queue; a concurrent
 connection change fails the call instead of sending an empty or stale reply address
 through the replacement connection.
 
+Each AMQP call reasserts its temporary reply queue before publishing, including
+when the connection is healthy. This repairs a reply queue or consumer lost
+during cluster healing without a cancellation notification. Losing the reply
+consumer fails its pending calls; later calls create a fresh reply queue so late
+responses cannot reach calls that reuse correlation IDs. Healthy calls reuse
+the consumer, with one queue-declaration round trip to verify it. Requests are
+not replayed automatically.
+Reply queues use unique `weave.rpc.reply-*` names so they can be redeclared;
+RabbitMQ reserves the server-generated `amq.*` namespace. Broker permissions
+must allow declaring and consuming these reply queues and publishing responses
+to them.
+
 Queue availability still depends on broker topology. Provision replicated quorum
 queues for messages that must remain available after their original node fails;
 switching endpoints cannot make an unavailable single-node classic queue available.

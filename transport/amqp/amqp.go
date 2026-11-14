@@ -48,6 +48,7 @@ type amqpConnection interface {
 type amqpChannel interface {
 	PublishWithContext(context.Context, string, string, bool, bool, amqplib.Publishing) error
 	QueueDeclare(string, bool, bool, bool, bool, amqplib.Table) (amqplib.Queue, error)
+	QueueDelete(string, bool, bool, bool) (int, error)
 	QueueBind(string, string, string, bool, amqplib.Table) error
 	Qos(int, int, bool) error
 	Consume(string, string, bool, bool, bool, bool, amqplib.Table) (<-chan amqplib.Delivery, error)
@@ -90,22 +91,38 @@ func (a *amqpChannelAdapter) PublishWithContext(ctx context.Context, exchange, k
 }
 
 func (a *amqpChannelAdapter) QueueDeclare(name string, durable, autoDelete, exclusive, noWait bool, args amqplib.Table) (amqplib.Queue, error) {
+	a.publisher.wireMu.Lock()
+	defer a.publisher.wireMu.Unlock()
 	return a.channel.QueueDeclare(name, durable, autoDelete, exclusive, noWait, args)
 }
 
+func (a *amqpChannelAdapter) QueueDelete(name string, ifUnused, ifEmpty, noWait bool) (int, error) {
+	a.publisher.wireMu.Lock()
+	defer a.publisher.wireMu.Unlock()
+	return a.channel.QueueDelete(name, ifUnused, ifEmpty, noWait)
+}
+
 func (a *amqpChannelAdapter) QueueBind(name, key, exchange string, noWait bool, args amqplib.Table) error {
+	a.publisher.wireMu.Lock()
+	defer a.publisher.wireMu.Unlock()
 	return a.channel.QueueBind(name, key, exchange, noWait, args)
 }
 
 func (a *amqpChannelAdapter) Qos(prefetchCount, prefetchSize int, global bool) error {
+	a.publisher.wireMu.Lock()
+	defer a.publisher.wireMu.Unlock()
 	return a.channel.Qos(prefetchCount, prefetchSize, global)
 }
 
 func (a *amqpChannelAdapter) Consume(queue, consumer string, autoAck, exclusive, noLocal, noWait bool, args amqplib.Table) (<-chan amqplib.Delivery, error) {
+	a.publisher.wireMu.Lock()
+	defer a.publisher.wireMu.Unlock()
 	return a.channel.Consume(queue, consumer, autoAck, exclusive, noLocal, noWait, args)
 }
 
 func (a *amqpChannelAdapter) Cancel(consumer string, noWait bool) error {
+	a.publisher.wireMu.Lock()
+	defer a.publisher.wireMu.Unlock()
 	return a.channel.Cancel(consumer, noWait)
 }
 
@@ -152,6 +169,7 @@ type Broker struct {
 
 	replyQueue        string
 	replyConsumerStop chan struct{}
+	replyConsumerTag  string
 	replyGate         chan struct{}
 	pending           map[string]*pendingCall
 	pendingMu         sync.RWMutex
@@ -1166,18 +1184,44 @@ func (b *Broker) ensureReplyQueue(ctx context.Context, channel amqpChannel) erro
 
 func (b *Broker) initReplyQueue(channel amqpChannel) error {
 	b.closeMu.RLock()
-	if b.replyQueue != "" {
+	if b.closed || b.channel != channel {
 		b.closeMu.RUnlock()
-		return nil
+		return &core.ErrConnectionLost{Backend: backendName}
 	}
+	queue, previousStop, previousTag := b.replyQueue, b.replyConsumerStop, b.replyConsumerTag
 	b.closeMu.RUnlock()
 
-	q, err := channel.QueueDeclare("", false, true, true, false, nil)
+	// A healed cluster can lose a temporary queue without notifying its consumer.
+	name := queue
+	if name == "" {
+		name = "weave.rpc.reply-" + rand.Text()
+	}
+	q, err := channel.QueueDeclare(name, false, true, true, false, nil)
 	if err != nil {
 		return fmt.Errorf("failed to declare reply queue: %w", err)
 	}
+	if queue != "" && q.Consumers > 0 {
+		return nil
+	}
+	if queue != "" {
+		b.resetReplyConsumer(previousStop)
+		if previousTag != "" {
+			if err := channel.Cancel(previousTag, false); err != nil {
+				return fmt.Errorf("failed to cancel stale reply consumer: %w", err)
+			}
+		}
+		if _, err := channel.QueueDelete(q.Name, false, false, false); err != nil {
+			return fmt.Errorf("failed to delete stale reply queue: %w", err)
+		}
+		// A fresh address keeps late responses out of calls that reuse correlation IDs.
+		q, err = channel.QueueDeclare("weave.rpc.reply-"+rand.Text(), false, true, true, false, nil)
+		if err != nil {
+			return fmt.Errorf("failed to declare replacement reply queue: %w", err)
+		}
+	}
 
-	msgs, err := channel.Consume(q.Name, "", true, false, false, false, nil)
+	tag := "weave-rpc-" + rand.Text()
+	msgs, err := channel.Consume(q.Name, tag, true, false, false, false, nil)
 	if err != nil {
 		return fmt.Errorf("failed to consume reply queue: %w", err)
 	}
@@ -1195,6 +1239,7 @@ func (b *Broker) initReplyQueue(channel amqpChannel) error {
 	}
 	b.replyQueue = q.Name
 	b.replyConsumerStop = stop
+	b.replyConsumerTag = tag
 	b.closeMu.Unlock()
 
 	go b.handleResponses(msgs, stop)
@@ -1203,6 +1248,7 @@ func (b *Broker) initReplyQueue(channel amqpChannel) error {
 }
 
 func (b *Broker) handleResponses(msgs <-chan amqplib.Delivery, stop <-chan struct{}) {
+	defer b.resetReplyConsumer(stop)
 	for {
 		select {
 		case <-stop:
@@ -1213,15 +1259,33 @@ func (b *Broker) handleResponses(msgs <-chan amqplib.Delivery, stop <-chan struc
 			}
 
 			corrID := msg.CorrelationId
+			b.closeMu.RLock()
+			if b.replyConsumerStop != stop {
+				b.closeMu.RUnlock()
+				return
+			}
 			b.pendingMu.RLock()
 			pending, exists := b.pending[corrID]
 			b.pendingMu.RUnlock()
+			b.closeMu.RUnlock()
 
 			if exists {
 				pending.complete(&msg)
 			}
 		}
 	}
+}
+
+func (b *Broker) resetReplyConsumer(stop <-chan struct{}) {
+	b.closeMu.Lock()
+	defer b.closeMu.Unlock()
+	if b.replyConsumerStop != stop {
+		return
+	}
+	b.stopReplyConsumerLocked()
+	b.replyQueue = ""
+	// Invalidate this generation before another call can register on a replacement.
+	b.cancelAllPending()
 }
 
 func (b *Broker) cancelAllPending() {
@@ -1257,4 +1321,5 @@ func (b *Broker) stopReplyConsumerLocked() {
 		close(b.replyConsumerStop)
 		b.replyConsumerStop = nil
 	}
+	b.replyConsumerTag = ""
 }
