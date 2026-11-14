@@ -110,9 +110,13 @@ func runServer(cfg config) error {
 	}
 	defer broker.Close()
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	signals, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	if err := broker.Connect(ctx); err != nil {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startupCtx, stopStartup := context.WithTimeout(signals, cfg.timeout)
+	defer stopStartup()
+	if err := broker.Connect(startupCtx); err != nil {
 		return err
 	}
 
@@ -122,13 +126,18 @@ func runServer(cfg config) error {
 		}
 		response := core.NewMessage(request.Body)
 		response.CorrelationID = request.CorrelationID
-		return broker.Publish(ctx, request.ReplyTo, response)
+		return broker.Publish(ctx, request.ReplyTo, response, core.WithMandatory(), core.WithTimeout(cfg.timeout))
 	}, core.WithWorkerCount(cfg.workers)); err != nil {
 		return err
 	}
+	if err := broker.(core.ConsumerReadiness).WaitReady(startupCtx); err != nil {
+		return err
+	}
 	fmt.Printf("ready queue=%s workers=%d\n", cfg.queue, cfg.workers)
-	<-ctx.Done()
-	return nil
+	<-signals.Done()
+	shutdownCtx, stopShutdown := context.WithTimeout(context.Background(), cfg.timeout)
+	defer stopShutdown()
+	return broker.(core.Shutdowner).Shutdown(shutdownCtx)
 }
 
 func runClient(cfg config) error {
@@ -138,8 +147,11 @@ func runClient(cfg config) error {
 	}
 	defer client.Close()
 
-	ctx := context.Background()
-	if err := client.Connect(ctx); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	startupCtx, stopStartup := context.WithTimeout(ctx, cfg.timeout)
+	defer stopStartup()
+	if err := client.Connect(startupCtx); err != nil {
 		return err
 	}
 
@@ -152,6 +164,9 @@ func runClient(cfg config) error {
 		warmup := runStage(ctx, client, cfg.queue, payload, cfg.concurrency, cfg.warmup, cfg.timeout)
 		if warmup.failures > 0 {
 			return fmt.Errorf("warm-up failed: %d of %d requests", warmup.failures, warmup.attempts)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 	}
 
@@ -171,6 +186,12 @@ func runClient(cfg config) error {
 		percentile(measured.latencies, 0.99),
 		measured.elapsed.Round(time.Millisecond),
 	)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if measured.failures > 0 {
+		return fmt.Errorf("measurement failed: %d of %d requests", measured.failures, measured.attempts)
+	}
 	return nil
 }
 
@@ -192,7 +213,7 @@ func runStage(
 	for i := range concurrency {
 		go func(worker *result) {
 			defer wg.Done()
-			for time.Now().Before(stopAt) {
+			for ctx.Err() == nil && time.Now().Before(stopAt) {
 				start := time.Now()
 				err := call(ctx, client, queue, payload, timeout)
 				worker.attempts++

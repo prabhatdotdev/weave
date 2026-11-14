@@ -1,66 +1,122 @@
-# AMQP and Kafka
+[← All examples](../README.md) · [Library guide](../../README.md)
 
-Start the brokers:
+# One interface, two transports
+
+Run the same two-destination pub/sub and request/reply flow against RabbitMQ or
+Kafka. The example also demonstrates bounded handler retries, message identity,
+Kafka keys and explicit partitions, consumer readiness, and graceful shutdown.
+
+## Setup
+
+Use Go 1.25+ and Docker Compose. This directory is a separate Go module whose
+`replace` directive points to the library in this checkout. From the repository
+root, enter it and start the brokers:
 
 ```sh
-docker compose up -d
-docker compose exec kafka sh -c 'for topic in weave.example.users weave.example.orders weave.example.rpc weave.example.client.replies; do /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --if-not-exists --partitions 3 --topic "$topic"; done'
+cd examples/amqp-kafka
+docker compose up -d --wait
 ```
 
-The Kafka transport disables topic auto-creation requests, so the example
-provisions every topic it uses explicitly.
+RabbitMQ listens on `localhost:5672` with `guest` / `guest`; Kafka listens on
+`localhost:9092`. The fixture ports bind to loopback.
 
-Run the same two-destination publish/subscribe example against either transport:
+Before using Kafka, provision the topics:
+
+```sh
+docker compose exec kafka sh -c '
+  for topic in weave.example.users weave.example.orders weave.example.rpc weave.example.client.replies; do
+    /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+      --create --if-not-exists --topic "$topic" --partitions 3 --replication-factor 1
+  done'
+```
+
+Weave does not auto-create topics. `weave.example.orders` needs at least two
+partitions because the example publishes explicitly to partition 1.
+
+## Run
+
+Run these commands from this directory, one at a time:
 
 ```sh
 go run . -backend amqp
 go run . -backend kafka
 ```
 
-Each command prints one independently consumed message for
-`weave.example.users` and `weave.example.orders` (the order may vary). The
-Kafka's users handler intentionally panics once, while the orders handler
-returns an error once for both transports. Both use `WithHandlerErrorRetry` to
-demonstrate contained failures and safe redelivery before later messages are
-processed. Handlers also select on their context so subscription cancellation,
-deadlines, and tracing values propagate into active work.
-
-Both messages use a stable Kafka key. The orders message also uses
-`WithPartition(1)`, so its Kafka output starts with `partition=1`; the users
-message demonstrates the normal key-based fallback. AMQP ignores these
-Kafka-specific publish options.
-
-Each run also completes the same request/reply round trip through `Call`:
+AMQP output:
 
 ```text
+weave.example.users: {"destination":"weave.example.users","status":"ok"}
+weave.example.orders: {"destination":"weave.example.orders","status":"ok"}
 weave.example.rpc: pong: request
 weave.example.rpc: pong: request
 ```
 
-Kafka initializes its reply consumer on the first call. If that initialization
-fails, no reply topic is retained and the next call retries it. Later calls
-reuse the same reply consumer; after a reconnect, Kafka restores that one
-registration instead of accumulating obsolete reply-topic loops.
+Kafka output includes `partition=N` before each JSON body. The users key
+selects its partition; orders always prints `partition=1`.
 
-The two calls reuse the same request instance. Kafka adds correlation and reply
-metadata to an internal clone, so caller-owned messages remain unchanged.
+The program checks setup, waits for actual deliveries and RPC responses, then
+drains both broker instances with a fresh deadline. Any failure returns a
+nonzero exit status. `log.Fatal` runs only after `run` has returned and its
+cleanup has executed.
 
-`KafkaConfig.ReplyTopic` is required for `Call`. Applications own that topic:
-provision it before starting the broker, use a unique topic and consumer group
-per concurrently running caller, and delete the topic when that caller retires.
+## Patterns to reuse
 
-AMQP and Kafka calls that are in flight while the broker disconnects or closes
-complete once: either with the response that won the race or with
-`ErrConnectionLost`. Callers can handle shutdown without risking a stranded
-call. Caller-supplied correlation IDs must also be unique among in-flight
-calls; duplicates are rejected before publishing:
+| Pattern | Where to look |
+| --- | --- |
+| Shared interface | `newBroker` selects the transport; `run` uses `core.MessageBroker` |
+| Readiness | `WaitReady` follows subscription registration for the event consumer and RPC responder |
+| Bounded retry | `eventHandler` wraps processing with three total attempts and jittered backoff |
+| Identity | Each event has a `MessageID`; the application reuses it for the same logical delivery |
+| Kafka routing | `WithKey` selects a stable key; `WithPartition(1)` selects the orders partition |
+| RPC | `rpcHandler` publishes to `ReplyTo` and preserves `CorrelationID`; failed response publishing returns an error |
+| Backpressure | `MaxPendingCalls=16` bounds registered calls; workers and operation deadlines are explicit |
+| Shutdown | A fresh context drains the responder before closing the caller |
 
-```go
-response, err := broker.Call(ctx, "weave.example.rpc", request)
-switch {
-case errors.Is(err, core.ErrDuplicateCorrelationID):
-	// Wait for the existing call or choose a different correlation ID.
-case core.IsConnectionLost(err):
-	// Retry after reconnecting, if the operation is safe to repeat.
-}
+The orders handler fails once to demonstrate an in-process retry on either
+transport. Transport-level retry remains enabled if the wrapper exhausts its
+budget; each redelivery gets a new budget. Permanent errors need a terminal
+policy such as [retry → dead-letter handling](../../docs/API.md#core).
+
+AMQP uses durable queues, persistent messages, mandatory routing, and publisher
+confirmations. Kafka uses all-in-sync-replica acknowledgments. The development
+fixture has one replica, so this is not a replicated durability demonstration.
+Neither path provides exactly-once effects.
+
+## Reruns and reply destinations
+
+Kafka uses a fresh consumer group per broker instance and starts from the
+earliest available offset. Handlers check the per-run `example-run` header so
+retained records from an earlier demonstration do not fill the result channels
+or trigger obsolete RPC responses. This filter is specific to this demo;
+production consumers should process their backlog normally.
+
+Run one copy at a time with the default shared destinations. For a different
+preprovisioned Kafka reply topic:
+
+```sh
+go run . -backend kafka -reply-topic my.app.client-1.replies
 ```
+
+The flag does not create that topic or isolate the other demo destinations.
+Real concurrently running callers need unique reply topics and consumer groups.
+The application owns reply-topic provisioning and cleanup. A publish/call
+timeout after submission can leave delivery uncertain, so retry only with an
+appropriate idempotency policy.
+
+The two calls reuse one request without modifying caller-owned metadata.
+Correlation IDs are generated internally when absent; caller-supplied IDs must
+be unique among pending calls on the broker, or `ErrDuplicateCorrelationID` is
+returned before publishing.
+
+## Check and clean up
+
+```sh
+go test -race ./...
+go vet ./...
+WEAVE_EXAMPLES_E2E=1 go test -race ./... -count=1
+docker compose down --volumes
+```
+
+The first two commands need no broker. After provisioning both brokers/topics,
+the opt-in live regression runs each transport twice and verifies deliveries,
+partition selection, both RPC replies, and successful draining.

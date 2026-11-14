@@ -31,6 +31,9 @@ func deduplicate(next core.Handler) core.Handler {
 	return func(ctx context.Context, msg *core.Message) error {
 		id := msg.MessageID
 		if id == "" {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			return next(ctx, msg)
 		}
 		// Hold the lock through processing so concurrent copies cannot both run.

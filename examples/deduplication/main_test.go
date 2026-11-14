@@ -115,6 +115,22 @@ func TestDeduplicateCancellationDoesNotRememberUnfinishedWork(t *testing.T) {
 	}
 }
 
+func TestDeduplicateCanceledMessageWithoutIdentity(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	called := false
+	handler := deduplicate(func(context.Context, *core.Message) error {
+		called = true
+		return nil
+	})
+	if err := handler(ctx, core.NewTextMessage("no identity")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled delivery error=%v", err)
+	}
+	if called {
+		t.Fatal("canceled message without an ID repeated a side effect")
+	}
+}
+
 func Example() {
 	main()
 	// Output: processed order-created-42: order created

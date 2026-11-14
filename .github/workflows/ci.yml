@@ -106,6 +106,20 @@ jobs:
           docker compose -f examples/amqp-kafka/compose.yaml up -d --wait rabbitmq
           go test -race ./transport/amqp -run 'WithLiveRabbitMQ$' -count=1
 
+      - name: Run broker-backed examples
+        timeout-minutes: 3
+        env:
+          WEAVE_EXAMPLES_E2E: "1"
+        run: |
+          docker compose -f examples/amqp-kafka/compose.yaml exec -T kafka sh -c '
+            for topic in weave.example.users weave.example.orders weave.example.rpc \
+              weave.example.client.replies weave.example.observability weave.example.observability.replies; do
+              /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+                --create --if-not-exists --topic "$topic" --partitions 3 --replication-factor 1
+            done'
+          go test -race ./examples/json ./examples/observability -count=1
+          (cd examples/amqp-kafka && go test -race ./... -count=1)
+
       - name: Run sustained load and broker failure tests
         timeout-minutes: 15
         env:

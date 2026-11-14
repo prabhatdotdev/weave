@@ -1,0 +1,63 @@
+{
+  "brand": "Weave",
+  "primary": "weave-logo.png",
+  "provenance": {
+    "approved_design": "Single-crossing, two intertwined bundles of three colored strings each.",
+    "primary_source": "Approved weave-logo-variant-01.png, renamed without changing its PNG bytes.",
+    "export_method": "Direct pixel conversion using macOS CoreGraphics and ImageIO. Transparent exports remove the source white background; monochrome versions recolor the same alpha mask.",
+    "new_image_generation": false
+  },
+  "validation": {
+    "canvas_preserved": true,
+    "transparent_exports_share_identical_alpha": true,
+    "opaque_color_pixels_match_source": true,
+    "monochrome_foregrounds_are_pure_white_or_black": true,
+    "light_dark_and_checkerboard_previews_reviewed": true
+  },
+  "files": [
+    {
+      "file": "weave-logo.png",
+      "format": "PNG",
+      "width": 1254,
+      "height": 1254,
+      "foreground": "Original six colors",
+      "background": "White",
+      "usage": "Primary logo",
+      "bytes": 1057829,
+      "sha256": "716597d2dae7426b1401671331d3da5ce7c4adccafea6270c4189f7699b65ffd"
+    },
+    {
+      "file": "weave-logo-transparent.png",
+      "format": "PNG",
+      "width": 1254,
+      "height": 1254,
+      "foreground": "Original six colors",
+      "background": "Transparent",
+      "usage": "Color logo on custom backgrounds",
+      "bytes": 353310,
+      "sha256": "1f6fc2fd46a6a8c32fc3451bc4f7a06470d23477a67e423e61bb72789f605c92"
+    },
+    {
+      "file": "weave-logo-white.png",
+      "format": "PNG",
+      "width": 1254,
+      "height": 1254,
+      "foreground": "#FFFFFF",
+      "background": "Transparent",
+      "usage": "White logo for dark backgrounds",
+      "bytes": 86370,
+      "sha256": "20627c90dc330adb5b6a1102904b4dd56b48896aa5a61b92d044b2c9db3f08c4"
+    },
+    {
+      "file": "weave-logo-black.png",
+      "format": "PNG",
+      "width": 1254,
+      "height": 1254,
+      "foreground": "#000000",
+      "background": "Transparent",
+      "usage": "Black logo for light backgrounds",
+      "bytes": 82213,
+      "sha256": "770501779c3d75ba7d3911054763e89b137dfb0bb0afe68e619b08a88a9ebcb2"
+    }
+  ]
+}

@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
+
+	"github.com/prabhatdotdev/weave/core"
 )
 
 func TestPercentileNearestRank(t *testing.T) {
@@ -31,5 +35,49 @@ func TestPercentileNearestRank(t *testing.T) {
 				t.Fatalf("percentile() = %s, want %s", got, tt.want)
 			}
 		})
+	}
+}
+
+type callerFunc func(context.Context, *core.Message) (*core.Message, error)
+
+func (call callerFunc) Call(ctx context.Context, _ string, msg *core.Message, _ ...core.PublishOption) (*core.Message, error) {
+	return call(ctx, msg)
+}
+
+func TestRunStageStopsWhenCanceled(t *testing.T) {
+	for _, canceledBeforeStart := range []bool{false, true} {
+		ctx, cancel := context.WithCancel(context.Background())
+		calls := 0
+		if canceledBeforeStart {
+			cancel()
+		}
+		caller := callerFunc(func(ctx context.Context, _ *core.Message) (*core.Message, error) {
+			calls++
+			cancel()
+			return nil, ctx.Err()
+		})
+		got := runStage(ctx, caller, "rpc", []byte("payload"), 1, time.Second, time.Second)
+		cancel()
+		want := 1
+		if canceledBeforeStart {
+			want = 0
+		}
+		if calls != want || got.attempts != want || got.failures != want {
+			t.Fatalf("pre-canceled=%v calls=%d result=%+v", canceledBeforeStart, calls, got)
+		}
+	}
+}
+
+func TestCallRejectsCorruptResponse(t *testing.T) {
+	caller := callerFunc(func(context.Context, *core.Message) (*core.Message, error) {
+		return core.NewTextMessage("changed payload"), nil
+	})
+	if err := call(context.Background(), caller, "rpc", []byte("original"), time.Second); err == nil {
+		t.Fatal("corrupt response counted as success")
+	}
+	want := errors.New("broker unavailable")
+	caller = func(context.Context, *core.Message) (*core.Message, error) { return nil, want }
+	if err := call(context.Background(), caller, "rpc", nil, time.Second); !errors.Is(err, want) {
+		t.Fatalf("lost broker error: %v", err)
 	}
 }

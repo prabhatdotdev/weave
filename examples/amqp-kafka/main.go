@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"os"
 	"sync/atomic"
 	"time"
 
@@ -17,99 +20,141 @@ import (
 
 func main() {
 	backend := flag.String("backend", "amqp", "amqp or kafka")
+	replyTopic := flag.String("reply-topic", "weave.example.client.replies", "provisioned Kafka reply topic")
 	flag.Parse()
 
-	broker, err := newBroker(*backend, "client")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	err := run(ctx, *backend, *replyTopic, os.Stdout)
+	cancel()
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer broker.Close()
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+func run(ctx context.Context, backend, replyTopic string, output io.Writer) error {
+	runID := rand.Text()
+	broker, err := newBroker(backend, "client", runID, replyTopic)
+	if err != nil {
+		return err
+	}
+	defer broker.Close()
 	if err := broker.Connect(ctx); err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	destinations := []string{"weave.example.users", "weave.example.orders"}
 	received := make(map[string]chan string, len(destinations))
-	var panicUsers atomic.Bool
-	var retryOrders atomic.Bool
 	for _, destination := range destinations {
 		received[destination] = make(chan string, 1)
-		handler := func(handlerCtx context.Context, msg *core.Message) error {
-			if *backend == "kafka" && destination == "weave.example.users" && !panicUsers.Swap(true) {
-				panic("temporary user handler panic")
-			}
-			if destination == "weave.example.orders" && !retryOrders.Swap(true) {
-				return errors.New("temporary order handler failure")
-			}
-			body := msg.BodyString()
-			if *backend == "kafka" {
-				body = fmt.Sprintf("partition=%d %s", msg.Partition, body)
-			}
-			select {
-			case received[destination] <- body:
-				return nil
-			case <-handlerCtx.Done():
-				return handlerCtx.Err()
-			}
+		handler := eventHandler(runID, destination, backend, received[destination])
+		if err := broker.Subscribe(ctx, destination, handler, core.WithHandlerErrorRetry(), core.WithWorkerCount(4)); err != nil {
+			return err
 		}
-		if err := broker.Subscribe(ctx, destination, handler, core.WithHandlerErrorRetry()); err != nil {
-			log.Fatal(err)
-		}
+	}
+	if err := broker.(core.ConsumerReadiness).WaitReady(ctx); err != nil {
+		return err
 	}
 
 	for _, destination := range destinations {
 		msg, err := codec.MarshalMessage(codec.JSON, map[string]string{"destination": destination, "status": "ok"})
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
-		publishOptions := []core.PublishOption{core.WithKey(destination)}
-		if *backend == "kafka" && destination == "weave.example.orders" {
+		msg.MessageID = runID + "/" + destination
+		msg.WithHeader("example-run", runID)
+		publishOptions := []core.PublishOption{core.WithKey(destination), core.WithPersistent(), core.WithMandatory(), core.WithTimeout(5 * time.Second)}
+		if backend == "kafka" && destination == "weave.example.orders" {
 			publishOptions = append(publishOptions, core.WithPartition(1))
 		}
 		if err := broker.Publish(ctx, destination, msg, publishOptions...); err != nil {
-			log.Fatal(err)
+			return err
 		}
 	}
-
 	for _, destination := range destinations {
 		select {
 		case body := <-received[destination]:
-			fmt.Printf("%s: %s\n", destination, body)
+			if _, err := fmt.Fprintf(output, "%s: %s\n", destination, body); err != nil {
+				return err
+			}
 		case <-ctx.Done():
-			log.Fatal(ctx.Err())
+			return ctx.Err()
 		}
 	}
 
-	rpcDestination := "weave.example.rpc"
-	responder, err := newBroker(*backend, "responder")
+	responder, err := newBroker(backend, "responder", runID, "")
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	defer responder.Close()
 	if err := responder.Connect(ctx); err != nil {
-		log.Fatal(err)
+		return err
 	}
-	if err := responder.Subscribe(ctx, rpcDestination, func(handlerCtx context.Context, request *core.Message) error {
-		response := core.NewTextMessage("pong: " + request.BodyString()).WithCorrelationID(request.CorrelationID)
-		return responder.Publish(handlerCtx, request.ReplyTo, response)
-	}); err != nil {
-		log.Fatal(err)
+	if err := responder.Subscribe(ctx, "weave.example.rpc", rpcHandler(runID, responder), core.WithHandlerErrorRetry()); err != nil {
+		return err
 	}
-	request := core.NewTextMessage("request").WithHeader("trace-id", "example")
+	if err := responder.(core.ConsumerReadiness).WaitReady(ctx); err != nil {
+		return err
+	}
+	request := core.NewTextMessage("request").WithHeader("example-run", runID)
+	request.MessageID = runID + "/rpc"
 	for range 2 {
-		response, err := broker.Call(ctx, rpcDestination, request, core.WithTimeout(5*time.Second))
+		response, err := broker.Call(ctx, "weave.example.rpc", request, core.WithTimeout(10*time.Second), core.WithMandatory())
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
-		fmt.Printf("%s: %s\n", rpcDestination, response.BodyString())
+		if _, err := fmt.Fprintf(output, "weave.example.rpc: %s\n", response.BodyString()); err != nil {
+			return err
+		}
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := responder.(core.Shutdowner).Shutdown(shutdownCtx); err != nil {
+		return err
+	}
+	return broker.(core.Shutdowner).Shutdown(shutdownCtx)
+}
+
+func eventHandler(runID, destination, backend string, received chan<- string) core.Handler {
+	var failed atomic.Bool
+	policy := core.DefaultRetryPolicy()
+	policy.Backoff = core.JitteredBackoff(core.ExponentialBackoff(10*time.Millisecond, 100*time.Millisecond, 2))
+	return core.RetryHandler(func(ctx context.Context, msg *core.Message) error {
+		// Demo topics retain records; earlier runs must not fill this run's result channel.
+		if msg.GetHeader("example-run") != runID {
+			return nil
+		}
+		if destination == "weave.example.orders" && !failed.Swap(true) {
+			return errors.New("temporary order handler failure")
+		}
+		body := msg.BodyString()
+		if backend == "kafka" {
+			body = fmt.Sprintf("partition=%d %s", msg.Partition, body)
+		}
+		select {
+		case received <- body:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}, policy)
+}
+
+func rpcHandler(runID string, publisher core.Publisher) core.Handler {
+	return func(ctx context.Context, request *core.Message) error {
+		if request.GetHeader("example-run") != runID {
+			return nil
+		}
+		if request.ReplyTo == "" {
+			return core.ErrNoReplyTo
+		}
+		response := core.NewTextMessage("pong: " + request.BodyString()).WithCorrelationID(request.CorrelationID)
+		return publisher.Publish(ctx, request.ReplyTo, response, core.WithTimeout(5*time.Second), core.WithMandatory())
 	}
 }
 
-func newBroker(backend, instance string) (core.MessageBroker, error) {
+func newBroker(backend, instance, runID, replyTopic string) (core.MessageBroker, error) {
 	config := core.DefaultConfig()
+	config.MaxPendingCalls = 16
 	switch backend {
 	case "amqp":
 		config.AMQP = core.DefaultAMQPConfig()
@@ -117,9 +162,10 @@ func newBroker(backend, instance string) (core.MessageBroker, error) {
 		return amqp.NewBroker(config)
 	case "kafka":
 		config.Kafka = core.DefaultKafkaConfig()
-		config.Kafka.ClientID = "weave-example-" + instance
-		config.Kafka.ConsumerGroup = "weave-example-" + instance
-		config.Kafka.ReplyTopic = "weave.example." + instance + ".replies"
+		config.Kafka.ClientID = "weave-example-" + instance + "-" + runID
+		config.Kafka.ConsumerGroup = config.Kafka.ClientID
+		config.Kafka.ReplyTopic = replyTopic
+		config.Kafka.RequiredAcks = -1
 		config.Kafka.AutoOffsetReset = "earliest"
 		return kafka.NewBroker(config)
 	default:
