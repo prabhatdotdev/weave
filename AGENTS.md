@@ -31,25 +31,104 @@ The library and its separate example module require Go 1.25 or newer.
   `replace github.com/prabhatdotdev/weave => ../..` to exercise this checkout.
   Root-level Go commands do not traverse this module boundary.
 
+## Planning and Approval
+
+- Require a formal implementation plan for new features; public API or
+  compatibility changes; shared AMQP/Kafka behavior; concurrency, recovery, or
+  delivery semantics; multi-package refactoring; and dependency changes with
+  meaningful compatibility, security, or operational risk.
+- Each plan must identify the goal and scope, affected components, architecture
+  and compatibility considerations, risks and trade-offs, testing strategy, and
+  acceptance criteria. Present the plan for review before implementation.
+- Use [implementation-plan template](docs/IMPLEMENTATION_PLAN_TEMPLATE.md)
+  for formal plans, including plans kept in Codex Plan mode. Persist a plan as
+  `docs/PLAN-{topic}.md` when it needs cross-chat continuation, team review or
+  handoff, or a durable design or approval record; otherwise keep it in the chat.
+- Documentation-only changes and simple isolated fixes that meet none of these
+  triggers need only a brief scope and validation summary. Existing engineering
+  and testing requirements still apply.
+- Read-only investigation may proceed before approval. Obtain explicit user
+  approval of the plan before significant implementation and explicit approval
+  before any architecture or public API change; the plan approval may cover
+  these changes when clearly identified.
+- Within the approved scope, proceed with relevant local tests and fixes
+  without repeated approval. If scope or design materially changes, revise the
+  plan and obtain approval before implementing the change.
+- Obtain explicit user approval before commits and PR creation; implementation
+  approval does not authorize either.
+- Obtain separate explicit approval for each push, merge, deployment,
+  destructive operation, external write, or other consequential external side
+  effect. Approval of a plan, commit, or PR does not authorize these actions.
+  An explicit user request counts as approval for the named action only.
+
 ## Development Workflow
 
 1. Read the affected package, its tests, and relevant documentation before editing.
    Trace callers, configuration, and examples that depend on the behavior.
-2. Make the smallest complete change. For shared behavior, account for AMQP,
-   Kafka, and `testkit.MockBroker`; keep unrelated refactors out of the diff.
-3. Add or update a focused regression test before or alongside runtime, recovery,
-   or error-handling changes. Follow the Testing section for validation.
+2. For behavior changes, prefer Red-Green-Refactor: add or update a
+   focused test and verify it fails for the intended reason before
+   implementation when feasible. Defect regressions should reproduce
+   the reported failure. If this is impractical, explain why and add
+   appropriate tests alongside implementation.
+3. Make the smallest complete change to pass the tests. Refactor only
+   as needed, keeping tests passing. For shared behavior, account
+   for AMQP, Kafka, and `testkit.MockBroker`; keep unrelated refactors
+   out of the diff. Follow the Testing section for validation.
 4. Format changed Go files with `gofmt`. When dependencies change, run
    `go mod tidy` in the affected module roots and include the matching `go.mod`
    and `go.sum` updates.
 5. Update `README.md`, `docs/API.md`, `docs/TRANSPORTS.md`, and affected example
    code/READMEs when public behavior changes. Keep examples short and runnable.
 6. Review the final diff for unintended changes. Summarize the problem, resulting
-   behavior, checks run, and any skipped checks or environmental limits.
+   behavior, checks run, any skipped checks or environmental limits, and
+   unresolved risks.
 
 Run commands from the repository root unless stated otherwise. Use
 `go mod download` to install existing dependencies. For release work, follow
 [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md).
+
+## Git and Pull Requests
+
+- Use `feature/{topic}` branches with short, descriptive kebab-case topics.
+  Confirm the branch, worktree, base commit, and working-tree state before edits;
+  use separate worktrees when concurrent work needs isolation.
+- Stage only intended paths or hunks. Review `git diff --cached` and run
+  `git diff --cached --check` before committing; preserve unrelated work.
+- Use concise imperative commit subjects matching recent history. Add a body
+  when rationale, compatibility impact, or risks need explanation.
+- Prepare PRs using [.github/pull_request_template.md](.github/pull_request_template.md)
+  and contributor guidance. Verify the target branch, commit list, and full diff
+  from the merge base; disclose inherited unpushed commits that expand PR scope.
+- Treat remote-tracking refs as cached observations, not current remote state;
+  refresh them only within the task's authorized remote access.
+- Merge only after required CI passes for the latest PR revision. Existing
+  review and approval gates still apply.
+- Retain the existing `release/v{version}` branch and `v{version}` tag naming,
+  release checklist, and tagged-commit CI gate.
+
+## Code Review and Quality Gates
+
+- Before requesting commit or PR approval, review the final diff and affected
+  code against the approved scope.
+- Independent Codex review is recommended for significant runtime, concurrency,
+  public API, or security changes when available. If unavailable for such a
+  change, perform self-review and disclose the limitation. Self-review is
+  sufficient for smaller changes.
+- Apply Architecture, Coding Standards, Testing, and Restriction as review
+  criteria: correctness and regressions, concurrency and resource lifecycles,
+  AMQP/Kafka delivery and recovery, public API compatibility, input validation,
+  and dependency security.
+- List findings in descending severity with file/line, concrete impact, and a
+  recommended fix. Substantiated defects, contract violations, security issues,
+  and missing required regressions are blocking; style and optional improvements
+  are non-blocking suggestions.
+- Reuse the Testing section's required local checks and select opt-in suites by
+  affected behavior; preserve all CI requirements.
+- Fix blocking findings within the approved scope, rerun affected tests and
+  applicable required gates, and review the updated diff.
+- Unresolved blocking findings and failed required checks block readiness.
+  Report unavailable or pending required checks as incomplete, with reasons and
+  remaining risks; never record them as passed or Not Applicable.
 
 ## Coding Standards
 
