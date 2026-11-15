@@ -136,8 +136,13 @@ func Kafka(config *core.KafkaConfig) error {
 	}
 	for _, address := range config.Brokers {
 		host, port, err := net.SplitHostPort(address)
-		if err != nil || strings.TrimSpace(host) == "" || strings.ContainsAny(host, " /@\t\r\n") {
+		if err != nil || !utf8.ValidString(host) || host == "" || strings.ContainsAny(host, "/@") || strings.IndexFunc(host, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
 			return invalid("Kafka brokers must use host:port addresses")
+		}
+		if strings.Contains(host, ":") {
+			if _, err := netip.ParseAddr(host); err != nil {
+				return invalid("Kafka brokers must use host:port addresses")
+			}
 		}
 		number, err := strconv.Atoi(port)
 		if err != nil || number < 1 || number > 65535 {

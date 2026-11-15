@@ -230,3 +230,64 @@ func TestConstructorsRejectInvalidConfiguration(t *testing.T) {
 		})
 	}
 }
+
+func TestKafkaBrokerAddresses(t *testing.T) {
+	for _, scenario := range []struct {
+		name    string
+		address string
+		invalid bool
+	}{
+		{"invalid IPv6 text", "[not::ipv6]:9092", true},
+		{"invalid hexadecimal IPv6 group", "[2001:db8::gg]:9092", true},
+		{"empty IPv6 zone", "[fe80::1%]:9092", true},
+		{"NUL character", "bad\x00host:9092", true},
+		{"control character", "bad\x1fhost:9092", true},
+		{"DEL character", "bad\x7fhost:9092", true},
+		{"Unicode whitespace", "bad\u00a0host:9092", true},
+		{"invalid UTF-8", string([]byte{0xff}) + ":9092", true},
+		{"localhost", "localhost:9092", false},
+		{"DNS hostname", "broker-1.example.com:9092", false},
+		{"trailing DNS dot", "broker.example.com.:9092", false},
+		{"underscore hostname", "broker_internal:9092", false},
+		{"IPv4 address", "127.0.0.1:9092", false},
+		{"IPv6 loopback", "[::1]:9092", false},
+		{"IPv6 address", "[2001:db8::1]:9092", false},
+		{"named IPv6 zone", "[fe80::1%eth0]:9092", false},
+		{"numeric IPv6 zone", "[fe80::1%3]:9092", false},
+		{"minimum port", "localhost:1", false},
+		{"maximum port", "localhost:65535", false},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			config := core.DefaultConfig()
+			config.Kafka = core.DefaultKafkaConfig()
+			config.Kafka.Brokers = []string{scenario.address}
+			if scenario.invalid {
+				config.Kafka.Brokers = []string{"valid:9092", scenario.address}
+			}
+
+			broker, err := kafka.NewBroker(config)
+			if broker != nil {
+				t.Cleanup(func() {
+					if err := broker.Close(); err != nil {
+						t.Errorf("Close() = %v", err)
+					}
+				})
+			}
+			if scenario.invalid {
+				if broker != nil {
+					t.Errorf("NewBroker() returned a non-nil broker for malformed address %q", scenario.address)
+				}
+				if !errors.Is(err, core.ErrInvalidConfig) {
+					t.Errorf("NewBroker() for %q = %v, want ErrInvalidConfig", scenario.address, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NewBroker() for %q = %v", scenario.address, err)
+			}
+			if broker == nil {
+				t.Fatal("NewBroker() returned a nil broker without an error")
+			}
+		})
+	}
+}
