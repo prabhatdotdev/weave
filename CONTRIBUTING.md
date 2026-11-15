@@ -12,6 +12,12 @@ The library and example module require Go 1.25 or newer.
 
 ## Validate
 
+Documentation-only changes may skip local runtime tests and coverage checks only
+when no executable examples or commands change. Verify paths, commands,
+documentation links, and the diff. Mark each skipped check **Not Applicable** in
+the PR and explain why. All testing and coverage requirements for source-code
+changes and all CI requirements remain unchanged.
+
 ```sh
 go fmt ./...
 go vet ./...
