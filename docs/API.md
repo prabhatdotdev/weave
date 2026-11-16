@@ -275,6 +275,12 @@ match `ErrPublishRejected`. Publish and RPC deadline errors match both `IsTimeou
 `context.DeadlineExceeded`; explicit cancellation matches `context.Canceled`.
 See [transport guarantees and deadlines](TRANSPORTS.md#deadlines-and-delivery-outcomes).
 
+`kafka.NewBroker` rejects malformed IPv6 broker hosts and hosts containing invalid
+UTF-8, whitespace, or control characters before connection attempts. Use
+`errors.Is(err, core.ErrInvalidConfig)` to identify these errors. See
+[broker address validation](TRANSPORTS.md#invalid-inputs) for accepted forms and
+compatibility implications.
+
 `ErrShuttingDown` rejects new work during graceful shutdown. `ErrClosed`
 identifies operations on a closed broker.
 

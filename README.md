@@ -745,6 +745,11 @@ adopting the new operational APIs:
 | Reusing an in-flight RPC correlation ID | Let Weave generate IDs or assign unique pending-call IDs |
 | Depending on permissive input handling | Handle `ErrInvalidConfig`; invalid addresses, nil options, negative limits/timeouts, and unsupported settings are rejected |
 
+Kafka broker hosts containing invalid UTF-8, whitespace, control characters, or
+malformed IPv6 now fail construction with `ErrInvalidConfig` instead of reaching
+connection setup. Correct previously accepted malformed addresses when upgrading;
+see [accepted Kafka address forms](docs/TRANSPORTS.md#invalid-inputs).
+
 `core.MessageBroker` keeps its core method set. Shutdown and readiness are
 optional interfaces, so custom brokers can adopt them separately. Review the
 [delivery policies](#delivery-guarantees): ordinary handler errors need an

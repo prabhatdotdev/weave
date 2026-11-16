@@ -314,6 +314,15 @@ unknown handler policies before touching a broker. AMQP short strings and Kafka
 topic names are also checked. Invalid inputs match `ErrInvalidConfig`;
 unsupported AMQP immediate publishing returns `ErrUnsupportedOperation`.
 
+`KafkaConfig.Brokers` accepts hostnames, IPv4, and bracketed IPv6 in `host:port`
+addresses. Trailing DNS dots and underscores in hostnames remain accepted.
+IPv6 zones may be named or numeric, such as `[fe80::1%eth0]:9092` or
+`[fe80::1%3]:9092`. Constructor validation is syntactic and performs no DNS
+resolution or interface lookup. `kafka.NewBroker` rejects invalid UTF-8, Unicode
+whitespace/control characters, and malformed IPv6 hosts before connection
+attempts. The errors match `core.ErrInvalidConfig` through `errors.Is`.
+Previously accepted malformed addresses must be corrected when upgrading.
+
 ## Events
 
 Both transports emit structured events through `Config.EventHook`:
